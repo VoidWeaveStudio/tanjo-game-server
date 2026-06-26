@@ -1,4 +1,3 @@
-//game-server\server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -15,143 +14,193 @@ const io = new Server(server, {
   }
 });
 
-const MAX_LOBBY_PLAYERS = 50;
-const MAX_GAME_ROOMS = 10;
-const PLAYERS_PER_TEAM = 5;
-const PLAYERS_PER_GAME = PLAYERS_PER_TEAM * 2; // 10
-const KILLS_TO_WIN = 50;
+// Константы режимов
+const MODES = {
+  '5v5': { maxPlayers: 10, playersPerTeam: 5, killsToWin: 50, teamBased: true, waitForFull: true },
+  'ffa': { maxPlayers: 20, playersPerTeam: 1, killsToWin: 50, teamBased: false, waitForFull: false }
+};
 
-const lobbies = new Map(); 
+// Структуры данных
+const lobbies = new Map();
 const gameRooms = new Map();
-const queue = []; 
+const queues = {
+  '5v5': [],
+  'ffa': []
+};
 
-for (let i = 1; i <= MAX_GAME_ROOMS; i++) {
-  const roomId = `game_room_${i}`;
-  gameRooms.set(roomId, {
-    id: roomId,
-    players: new Map(),
-    status: 'waiting', 
-    scores: { 1: 0, 2: 0 },
-    createdAt: Date.now()
-  });
+let roomCounter = 1;
+
+// Инициализация лобби
+function getOrCreateLobby() {
+  for (const [lobbyId, lobby] of lobbies.entries()) {
+    if (lobby.players.size < 50) return lobbyId;
+  }
+  const lobbyId = `lobby_${lobbies.size + 1}`;
+  lobbies.set(lobbyId, { id: lobbyId, players: new Map() });
+  console.log(`Lobby created: ${lobbyId}`);
+  return lobbyId;
 }
 
-function findAvailableLobby() {
-  for (const [lobbyId, lobby] of lobbies.entries()) {
-    if (lobby.players.size < MAX_LOBBY_PLAYERS) {
-      return lobbyId;
+// Получить статус очередей
+function getQueuesStatus() {
+  return {
+    '5v5': { count: queues['5v5'].length, max: MODES['5v5'].maxPlayers },
+    'ffa': { count: queues['ffa'].length, max: MODES['ffa'].maxPlayers }
+  };
+}
+
+// Получить статус игровых комнат
+function getGameRoomsStatus() {
+  return Array.from(gameRooms.values()).map(room => ({
+    id: room.id,
+    mode: room.mode,
+    playersCount: room.players.size,
+    maxPlayers: MODES[room.mode].maxPlayers,
+    status: room.status,
+    scores: room.scores,
+    acceptingPlayers: room.players.size < MODES[room.mode].maxPlayers
+  }));
+}
+
+// Найти FFA комнату, которая принимает игроков
+function findAvailableFFARoom() {
+  for (const [roomId, room] of gameRooms.entries()) {
+    if (room.mode === 'ffa' && room.status === 'playing' && room.players.size < MODES['ffa'].maxPlayers) {
+      return room;
     }
   }
   return null;
 }
 
-function createLobby() {
-  const lobbyId = `lobby_${lobbies.size + 1}`;
-  lobbies.set(lobbyId, {
-    id: lobbyId,
-    players: new Map()
-  });
-  console.log(`Lobby created: ${lobbyId}`);
-  return lobbyId;
-}
-
-function getOrCreateLobby() {
-  let lobbyId = findAvailableLobby();
-  if (!lobbyId) {
-    lobbyId = createLobby();
+// Добавить игрока в FFA комнату
+function addPlayerToFFARoom(playerData, room) {
+  const socket = io.sockets.sockets.get(playerData.socketId);
+  if (!socket) return false;
+  
+  // Убираем из лобби
+  if (socket.lobbyId) {
+    const lobby = lobbies.get(socket.lobbyId);
+    if (lobby) {
+      lobby.players.delete(playerData.socketId);
+      socket.leave(socket.lobbyId);
+      socket.to(socket.lobbyId).emit('playerLeftLobby', playerData.socketId);
+    }
   }
-  return lobbyId;
-}
-
-function tryStartGame(roomId) {
-  const room = gameRooms.get(roomId);
-  if (!room || room.status !== 'waiting') return;
   
-  if (room.players.size === PLAYERS_PER_GAME) {
-    room.status = 'playing';
-    
-    const players = Array.from(room.players.values());
-    players.forEach((player, index) => {
-      player.team = index < PLAYERS_PER_TEAM ? 1 : 2;
-      player.position = { 
-        x: player.team === 1 ? -20 : 20, 
-        y: 1, 
-        z: 0 
-      };
-      player.rotation = { 
-        x: 0, 
-        y: player.team === 1 ? 0 : Math.PI, 
-        z: 0 
-      };
-    });
-    
-    io.to(roomId).emit('gameStarted', {
-      players: Array.from(room.players.values()),
-      scores: room.scores
-    });
-    
-    console.log(`Game started in ${roomId}`);
+  // Убираем из очереди
+  const queueIndex = queues['ffa'].findIndex(p => p.socketId === playerData.socketId);
+  if (queueIndex !== -1) {
+    queues['ffa'].splice(queueIndex, 1);
   }
-}
-
-function handleGameEnd(roomId, winningTeam) {
-  const room = gameRooms.get(roomId);
-  if (!room) return;
   
-  console.log(`Game ended in ${roomId}, team ${winningTeam} won`);
+  // Позиция по кругу
+  const index = room.players.size;
+  const angle = (index / MODES['ffa'].maxPlayers) * Math.PI * 2;
+  const radius = 25;
+  const position = { x: Math.cos(angle) * radius, y: 1, z: Math.sin(angle) * radius };
+  const rotation = { x: 0, y: -angle + Math.PI, z: 0 };
   
-  io.to(roomId).emit('gameEnded', {
-    winningTeam,
+  const player = {
+    id: playerData.socketId,
+    wallet: playerData.wallet,
+    username: playerData.username,
+    team: 0,
+    position,
+    rotation,
+    health: 100,
+    kills: 0,
+    deaths: 0,
+    isAlive: true
+  };
+  
+  room.players.set(player.id, player);
+  socket.join(room.id);
+  socket.roomId = room.id;
+  socket.lobbyId = null;
+  
+  // Отправляем игроку состояние игры
+  socket.emit('joinedFFAGame', {
+    roomId: room.id,
+    mode: 'ffa',
+    player,
+    players: Array.from(room.players.values()),
     scores: room.scores
   });
   
-  const players = Array.from(room.players.values());
-  room.players.clear();
-  room.status = 'waiting';
-  room.scores = { 1: 0, 2: 0 };
+  // Уведомляем других игроков
+  socket.to(room.id).emit('playerJoinedFFAGame', player);
   
-  players.forEach(player => {
-    const socket = io.sockets.sockets.get(player.id);
-    if (socket) {
-      socket.leave(roomId);
-      
-      const lobbyId = getOrCreateLobby();
-      const lobby = lobbies.get(lobbyId);
-      
-      player.position = { x: 0, y: 1, z: 0 };
-      player.rotation = { x: 0, y: 0, z: 0 };
-      player.health = 100;
-      player.kills = 0;
-      player.deaths = 0;
-      player.isAlive = true;
-      player.team = 0;
-      
-      lobby.players.set(player.id, player);
-      socket.join(lobbyId);
-      socket.lobbyId = lobbyId;
-      socket.roomId = null;
-      
-      socket.emit('returnedToLobby', {
-        lobbyId,
-        player
-      });
-      
-      socket.to(lobbyId).emit('playerJoinedLobby', player);
-    }
-  });
+  console.log(`Player ${player.username} joined FFA room ${room.id} (${room.players.size}/${MODES['ffa'].maxPlayers})`);
   
-  processQueue(roomId);
+  return true;
 }
 
-function processQueue(roomId) {
-  if (queue.length < PLAYERS_PER_GAME) return;
+// Попытаться начать игру из очереди
+function tryStartGame(mode) {
+  const queue = queues[mode];
+  const modeConfig = MODES[mode];
   
-  const room = gameRooms.get(roomId);
-  if (!room || room.status !== 'waiting' || room.players.size > 0) return;
+  if (mode === 'ffa') {
+    // Для FFA - проверяем, есть ли уже идущая комната
+    const existingRoom = findAvailableFFARoom();
+    
+    if (existingRoom && queue.length > 0) {
+      // Добавляем игроков в существующую комнату
+      while (queue.length > 0 && existingRoom.players.size < modeConfig.maxPlayers) {
+        const playerData = queue.shift();
+        addPlayerToFFARoom(playerData, existingRoom);
+      }
+      broadcastQueuesStatus();
+      return;
+    }
+    
+    // Создаём новую комнату даже с 1 игроком
+    if (queue.length > 0) {
+      const roomId = `room_${roomCounter++}`;
+      const room = {
+        id: roomId,
+        mode: 'ffa',
+        players: new Map(),
+        status: 'playing',
+        scores: {},
+        killsToWin: modeConfig.killsToWin,
+        createdAt: Date.now()
+      };
+      
+      gameRooms.set(roomId, room);
+      console.log(`FFA game started: ${roomId} with ${Math.min(queue.length, modeConfig.maxPlayers)} players`);
+      
+      // Добавляем игроков (до maxPlayers)
+      const playersToAdd = Math.min(queue.length, modeConfig.maxPlayers);
+      for (let i = 0; i < playersToAdd; i++) {
+        const playerData = queue.shift();
+        addPlayerToFFARoom(playerData, room);
+      }
+      
+      broadcastQueuesStatus();
+    }
+    return;
+  }
   
-  console.log(`Processing queue for ${roomId}, taking ${PLAYERS_PER_GAME} players`);
+  // Для 5v5 - ждём полного заполнения
+  if (queue.length < modeConfig.maxPlayers) return;
   
-  const playersToMove = queue.splice(0, PLAYERS_PER_GAME);
+  const playersToMove = queue.splice(0, modeConfig.maxPlayers);
+  
+  const roomId = `room_${roomCounter++}`;
+  const room = {
+    id: roomId,
+    mode,
+    players: new Map(),
+    status: 'playing',
+    scores: { 1: 0, 2: 0 },
+    killsToWin: modeConfig.killsToWin,
+    createdAt: Date.now()
+  };
+  
+  gameRooms.set(roomId, room);
+  
+  console.log(`Game started: ${roomId} (${mode}) with ${playersToMove.length} players`);
   
   playersToMove.forEach((playerData, index) => {
     const socket = io.sockets.sockets.get(playerData.socketId);
@@ -166,14 +215,17 @@ function processQueue(roomId) {
       }
     }
     
-    const team = index < PLAYERS_PER_TEAM ? 1 : 2;
+    const team = index < modeConfig.playersPerTeam ? 1 : 2;
+    const position = { x: team === 1 ? -20 : 20, y: 1, z: (index % 5) * 2 - 4 };
+    const rotation = { x: 0, y: team === 1 ? 0 : Math.PI, z: 0 };
+    
     const player = {
       id: playerData.socketId,
       wallet: playerData.wallet,
       username: playerData.username,
       team,
-      position: { x: team === 1 ? -20 : 20, y: 1, z: 0 },
-      rotation: { x: 0, y: team === 1 ? 0 : Math.PI, z: 0 },
+      position,
+      rotation,
       health: 100,
       kills: 0,
       deaths: 0,
@@ -185,23 +237,92 @@ function processQueue(roomId) {
     socket.roomId = roomId;
     socket.lobbyId = null;
     
-    socket.emit('joinedGameRoom', {
+    socket.emit('gameStarted', {
       roomId,
+      mode,
       player,
-      players: Array.from(room.players.values())
+      players: Array.from(room.players.values()),
+      scores: room.scores
     });
     
-    socket.to(roomId).emit('playerJoinedGameRoom', player);
+    socket.to(roomId).emit('playerJoinedGame', player);
   });
   
-  queue.forEach((p, i) => {
-    const socket = io.sockets.sockets.get(p.socketId);
-    if (socket) {
-      socket.emit('queuePositionUpdate', { position: i + 1 });
-    }
+  broadcastQueuesStatus();
+}
+
+// Обработать конец игры
+function handleGameEnd(roomId, winnerData) {
+  const room = gameRooms.get(roomId);
+  if (!room) return;
+  
+  console.log(`Game ended: ${roomId}, winner:`, winnerData);
+  
+  io.to(roomId).emit('gameEnded', {
+    winner: winnerData,
+    scores: room.scores,
+    players: Array.from(room.players.values())
   });
   
-  tryStartGame(roomId);
+  setTimeout(() => {
+    const players = Array.from(room.players.values());
+    room.players.clear();
+    gameRooms.delete(roomId);
+    
+    players.forEach(player => {
+      const socket = io.sockets.sockets.get(player.id);
+      if (!socket) return;
+      
+      socket.leave(roomId);
+      socket.roomId = null;
+      
+      const lobbyId = getOrCreateLobby();
+      const lobby = lobbies.get(lobbyId);
+      
+      const resetPlayer = {
+        ...player,
+        position: { x: Math.random() * 20 - 10, y: 1, z: Math.random() * 20 - 10 },
+        rotation: { x: 0, y: 0, z: 0 },
+        health: 100,
+        kills: 0,
+        deaths: 0,
+        team: 0,
+        isAlive: true
+      };
+      
+      lobby.players.set(player.id, resetPlayer);
+      socket.join(lobbyId);
+      socket.lobbyId = lobbyId;
+      
+      socket.emit('returnedToLobby', {
+        lobbyId,
+        player: resetPlayer,
+        players: Array.from(lobby.players.values()),
+        queues: getQueuesStatus(),
+        gameRooms: getGameRoomsStatus()
+      });
+      
+      socket.to(lobbyId).emit('playerJoinedLobby', resetPlayer);
+    });
+    
+    broadcastQueuesStatus();
+  }, 5000);
+}
+
+// Отправить статус очередей всем в лобби
+function broadcastQueuesStatus() {
+  const queuesStatus = getQueuesStatus();
+  const roomsStatus = getGameRoomsStatus();
+  
+  lobbies.forEach(lobby => {
+    lobby.players.forEach((p, pid) => {
+      const s = io.sockets.sockets.get(pid);
+      if (s) {
+        s.emit('queuesStatusUpdate', queuesStatus);
+        s.emit('gameRoomsStatusUpdate', roomsStatus);
+      }
+    });
+  });
 }
 
 io.on('connection', (socket) => {
@@ -229,20 +350,27 @@ io.on('connection', (socket) => {
     socket.lobbyId = lobbyId;
     socket.roomId = null;
     
-    console.log(`Player ${player.username} joined lobby ${lobbyId}`);
+    let queuePosition = null;
+    let queueMode = null;
+    for (const [mode, queue] of Object.entries(queues)) {
+      const idx = queue.findIndex(p => p.socketId === socket.id);
+      if (idx !== -1) {
+        queuePosition = idx + 1;
+        queueMode = mode;
+        break;
+      }
+    }
     
-    const gameRoomsStatus = Array.from(gameRooms.entries()).map(([id, room]) => ({
-      id,
-      playersCount: room.players.size,
-      status: room.status
-    }));
+    console.log(`Player ${player.username} joined lobby ${lobbyId}`);
     
     socket.emit('lobbyJoined', {
       lobbyId,
       player,
       players: Array.from(lobby.players.values()),
-      gameRooms: gameRoomsStatus,
-      queuePosition: queue.findIndex(p => p.socketId === socket.id) + 1 || null
+      queues: getQueuesStatus(),
+      gameRooms: getGameRoomsStatus(),
+      queuePosition,
+      queueMode
     });
     
     socket.to(lobbyId).emit('playerJoinedLobby', player);
@@ -267,114 +395,56 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('enterGameRoom', (data) => {
-    if (!socket.lobbyId) return;
-    
-    const roomId = data.roomId;
-    const room = gameRooms.get(roomId);
-    
-    if (!room) {
-      socket.emit('enterGameRoomError', 'Room not found');
-      return;
-    }
-    
-    if (room.status !== 'waiting') {
-      socket.emit('enterGameRoomError', 'Game already in progress');
-      return;
-    }
-    
-    if (room.players.size >= PLAYERS_PER_GAME) {
-      socket.emit('enterGameRoomError', 'Room is full');
-      return;
-    }
-    
-    const lobby = lobbies.get(socket.lobbyId);
-    if (!lobby) return;
-    
-    const playerData = lobby.players.get(socket.id);
-    if (!playerData) return;
-    
-    lobby.players.delete(socket.id);
-    socket.leave(socket.lobbyId);
-    socket.to(socket.lobbyId).emit('playerLeftLobby', socket.id);
-    
-    const team1Count = Array.from(room.players.values()).filter(p => p.team === 1).length;
-    const team2Count = Array.from(room.players.values()).filter(p => p.team === 2).length;
-    const team = team1Count <= team2Count ? 1 : 2;
-    
-    const player = {
-      id: socket.id,
-      wallet: playerData.wallet,
-      username: playerData.username,
-      team,
-      position: { x: team === 1 ? -20 : 20, y: 1, z: 0 },
-      rotation: { x: 0, y: team === 1 ? 0 : Math.PI, z: 0 },
-      health: 100,
-      kills: 0,
-      deaths: 0,
-      isAlive: true
-    };
-    
-    room.players.set(player.id, player);
-    socket.join(roomId);
-    socket.roomId = roomId;
-    socket.lobbyId = null;
-    
-    console.log(`Player ${player.username} entered game room ${roomId} (Team ${team})`);
-    
-    socket.emit('joinedGameRoom', {
-      roomId,
-      player,
-      players: Array.from(room.players.values())
-    });
-    
-    socket.to(roomId).emit('playerJoinedGameRoom', player);
-    
-    const gameRoomsStatus = Array.from(gameRooms.entries()).map(([id, room]) => ({
-      id,
-      playersCount: room.players.size,
-      status: room.status
-    }));
-    
-    lobbies.forEach(lobby => {
-      lobby.players.forEach((p, pid) => {
-        const s = io.sockets.sockets.get(pid);
-        if (s) s.emit('gameRoomsStatusUpdate', gameRoomsStatus);
-      });
-    });
-    
-    tryStartGame(roomId);
-  });
-
   socket.on('joinQueue', (data) => {
-    if (queue.some(p => p.socketId === socket.id)) {
-      socket.emit('queueError', 'You are already in the queue');
+    const mode = data.mode;
+    if (!MODES[mode]) {
+      socket.emit('queueError', 'Invalid game mode');
       return;
     }
     
-    queue.push({
+    for (const [m, queue] of Object.entries(queues)) {
+      if (queue.some(p => p.socketId === socket.id)) {
+        socket.emit('queueError', `You are already in ${m} queue`);
+        return;
+      }
+    }
+    
+    if (socket.roomId) {
+      socket.emit('queueError', 'You are already in a game');
+      return;
+    }
+    
+    queues[mode].push({
       socketId: socket.id,
       wallet: data.wallet,
       username: data.username
     });
     
-    const position = queue.length;
-    socket.emit('joinedQueue', { position });
+    const position = queues[mode].length;
+    socket.emit('joinedQueue', { mode, position });
     
-    console.log(`Player ${data.username} joined queue at position ${position}`);
+    console.log(`Player ${data.username} joined ${mode} queue at position ${position}`);
+    
+    tryStartGame(mode);
+    broadcastQueuesStatus();
   });
 
   socket.on('leaveQueue', () => {
-    const index = queue.findIndex(p => p.socketId === socket.id);
-    if (index !== -1) {
-      queue.splice(index, 1);
-      
-      queue.forEach((p, i) => {
-        const s = io.sockets.sockets.get(p.socketId);
-        if (s) s.emit('queuePositionUpdate', { position: i + 1 });
-      });
-      
-      socket.emit('leftQueue');
+    for (const [mode, queue] of Object.entries(queues)) {
+      const index = queue.findIndex(p => p.socketId === socket.id);
+      if (index !== -1) {
+        queue.splice(index, 1);
+        socket.emit('leftQueue');
+        
+        queue.forEach((p, i) => {
+          const s = io.sockets.sockets.get(p.socketId);
+          if (s) s.emit('queuePositionUpdate', { position: i + 1 });
+        });
+        
+        console.log(`Player left ${mode} queue`);
+        broadcastQueuesStatus();
+        return;
+      }
     }
   });
 
@@ -414,66 +484,99 @@ io.on('connection', (socket) => {
     
     const hitPlayer = room.players.get(data.targetId);
     
-    if (hitPlayer && hitPlayer.isAlive && hitPlayer.team !== shooter.team) {
-      hitPlayer.health -= data.damage || 25;
+    if (hitPlayer && hitPlayer.isAlive) {
+      const isFriendlyFire = room.mode === '5v5' && hitPlayer.team === shooter.team;
       
-      if (hitPlayer.health <= 0) {
-        hitPlayer.health = 0;
-        hitPlayer.isAlive = false;
-        hitPlayer.deaths++;
-        shooter.kills++;
+      if (!isFriendlyFire) {
+        hitPlayer.health -= data.damage || 25;
         
-        room.scores[shooter.team]++;
-        
-        io.to(socket.roomId).emit('playerKilled', {
-          killerId: shooter.id,
-          killerName: shooter.username,
-          victimId: hitPlayer.id,
-          victimName: hitPlayer.username,
-          scores: room.scores
-        });
-        
-        if (room.scores[shooter.team] >= KILLS_TO_WIN) {
-          handleGameEnd(socket.roomId, shooter.team);
-          return;
+        if (hitPlayer.health <= 0) {
+          hitPlayer.health = 0;
+          hitPlayer.isAlive = false;
+          hitPlayer.deaths++;
+          shooter.kills++;
+          
+          if (room.mode === '5v5') {
+            room.scores[shooter.team]++;
+          } else {
+            room.scores[shooter.id] = shooter.kills;
+          }
+          
+          io.to(socket.roomId).emit('playerKilled', {
+            killerId: shooter.id,
+            killerName: shooter.username,
+            victimId: hitPlayer.id,
+            victimName: hitPlayer.username,
+            scores: room.scores,
+            killerKills: shooter.kills
+          });
+          
+          let winner = null;
+          if (room.mode === '5v5') {
+            if (room.scores[shooter.team] >= room.killsToWin) {
+              winner = { type: 'team', team: shooter.team };
+            }
+          } else {
+            if (shooter.kills >= room.killsToWin) {
+              winner = { type: 'player', playerId: shooter.id, username: shooter.username };
+            }
+          }
+          
+          if (winner) {
+            handleGameEnd(socket.roomId, winner);
+            return;
+          }
+          
+          setTimeout(() => {
+            if (!room.players.has(hitPlayer.id)) return;
+            
+            hitPlayer.health = 100;
+            hitPlayer.isAlive = true;
+            
+            if (room.mode === '5v5') {
+              hitPlayer.position = { 
+                x: hitPlayer.team === 1 ? -20 : 20, 
+                y: 1, 
+                z: Math.random() * 10 - 5 
+              };
+            } else {
+              const angle = Math.random() * Math.PI * 2;
+              const radius = 20 + Math.random() * 10;
+              hitPlayer.position = { 
+                x: Math.cos(angle) * radius, 
+                y: 1, 
+                z: Math.sin(angle) * radius 
+              };
+            }
+            
+            io.to(socket.roomId).emit('playerRespawned', {
+              id: hitPlayer.id,
+              position: hitPlayer.position
+            });
+          }, 3000);
         }
         
-        setTimeout(() => {
-          if (!room.players.has(hitPlayer.id)) return;
-          
-          hitPlayer.health = 100;
-          hitPlayer.isAlive = true;
-          hitPlayer.position = { 
-            x: hitPlayer.team === 1 ? -20 : 20, 
-            y: 1, 
-            z: Math.random() * 10 - 5 
-          };
-          
-          io.to(socket.roomId).emit('playerRespawned', {
-            id: hitPlayer.id,
-            position: hitPlayer.position
-          });
-        }, 3000);
+        io.to(socket.roomId).emit('playerHit', {
+          targetId: hitPlayer.id,
+          damage: data.damage || 25,
+          health: hitPlayer.health
+        });
       }
-      
-      io.to(socket.roomId).emit('playerHit', {
-        targetId: hitPlayer.id,
-        damage: data.damage || 25,
-        health: hitPlayer.health
-      });
     }
   });
 
   socket.on('disconnect', () => {
     console.log(`Player disconnected: ${socket.id}`);
     
-    const queueIndex = queue.findIndex(p => p.socketId === socket.id);
-    if (queueIndex !== -1) {
-      queue.splice(queueIndex, 1);
-      queue.forEach((p, i) => {
-        const s = io.sockets.sockets.get(p.socketId);
-        if (s) s.emit('queuePositionUpdate', { position: i + 1 });
-      });
+    for (const [mode, queue] of Object.entries(queues)) {
+      const index = queue.findIndex(p => p.socketId === socket.id);
+      if (index !== -1) {
+        queue.splice(index, 1);
+        queue.forEach((p, i) => {
+          const s = io.sockets.sockets.get(p.socketId);
+          if (s) s.emit('queuePositionUpdate', { position: i + 1 });
+        });
+      }
     }
     
     if (socket.lobbyId) {
@@ -494,8 +597,15 @@ io.on('connection', (socket) => {
       if (room) {
         room.players.delete(socket.id);
         socket.to(socket.roomId).emit('playerLeft', socket.id);
+        
+        if (room.players.size === 0) {
+          gameRooms.delete(socket.roomId);
+          console.log(`Game room deleted: ${socket.roomId}`);
+        }
       }
     }
+    
+    broadcastQueuesStatus();
   });
 });
 
@@ -506,9 +616,12 @@ app.get('/health', (req, res) => {
   
   res.json({ 
     status: 'ok', 
-    lobbies: lobbies.size, 
+    lobbies: lobbies.size,
     gameRooms: gameRooms.size,
-    queueLength: queue.length,
+    queues: {
+      '5v5': queues['5v5'].length,
+      'ffa': queues['ffa'].length
+    },
     totalPlayers
   });
 });
@@ -516,4 +629,5 @@ app.get('/health', (req, res) => {
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`Game server running on port ${PORT}`);
-}); 
+  console.log(`Modes: 5v5 (${MODES['5v5'].maxPlayers} players), FFA (${MODES['ffa'].maxPlayers} players)`);
+});
