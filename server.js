@@ -21,6 +21,7 @@ const MODES = {
 };
 
 // Структуры данных
+const MAIN_LOBBY_ID = 'main_lobby';
 const lobbies = new Map();
 const gameRooms = new Map();
 const queues = {
@@ -30,15 +31,16 @@ const queues = {
 
 let roomCounter = 1;
 
-// Инициализация лобби
+// ✅ ИСПРАВЛЕНИЕ: Всегда используем ОДНО главное лобби
 function getOrCreateLobby() {
-  for (const [lobbyId, lobby] of lobbies.entries()) {
-    if (lobby.players.size < 50) return lobbyId;
+  if (!lobbies.has(MAIN_LOBBY_ID)) {
+    lobbies.set(MAIN_LOBBY_ID, { 
+      id: MAIN_LOBBY_ID, 
+      players: new Map() 
+    });
+    console.log(`✅ Main lobby created: ${MAIN_LOBBY_ID}`);
   }
-  const lobbyId = `lobby_${lobbies.size + 1}`;
-  lobbies.set(lobbyId, { id: lobbyId, players: new Map() });
-  console.log(`Lobby created: ${lobbyId}`);
-  return lobbyId;
+  return MAIN_LOBBY_ID;
 }
 
 // Получить статус очередей
@@ -84,6 +86,7 @@ function addPlayerToFFARoom(playerData, room) {
       lobby.players.delete(playerData.socketId);
       socket.leave(socket.lobbyId);
       socket.to(socket.lobbyId).emit('playerLeftLobby', playerData.socketId);
+      console.log(`📤 Player ${playerData.username} left lobby ${socket.lobbyId}`);
     }
   }
   
@@ -130,7 +133,7 @@ function addPlayerToFFARoom(playerData, room) {
   // Уведомляем других игроков
   socket.to(room.id).emit('playerJoinedFFAGame', player);
   
-  console.log(`Player ${player.username} joined FFA room ${room.id} (${room.players.size}/${MODES['ffa'].maxPlayers})`);
+  console.log(`🎮 Player ${player.username} joined FFA room ${room.id} (${room.players.size}/${MODES['ffa'].maxPlayers})`);
   
   return true;
 }
@@ -168,7 +171,7 @@ function tryStartGame(mode) {
       };
       
       gameRooms.set(roomId, room);
-      console.log(`FFA game started: ${roomId} with ${Math.min(queue.length, modeConfig.maxPlayers)} players`);
+      console.log(`🎮 FFA game started: ${roomId} with ${Math.min(queue.length, modeConfig.maxPlayers)} players`);
       
       // Добавляем игроков (до maxPlayers)
       const playersToAdd = Math.min(queue.length, modeConfig.maxPlayers);
@@ -200,7 +203,7 @@ function tryStartGame(mode) {
   
   gameRooms.set(roomId, room);
   
-  console.log(`Game started: ${roomId} (${mode}) with ${playersToMove.length} players`);
+  console.log(`🎮 Game started: ${roomId} (${mode}) with ${playersToMove.length} players`);
   
   playersToMove.forEach((playerData, index) => {
     const socket = io.sockets.sockets.get(playerData.socketId);
@@ -212,6 +215,7 @@ function tryStartGame(mode) {
         lobby.players.delete(playerData.socketId);
         socket.leave(socket.lobbyId);
         socket.to(socket.lobbyId).emit('playerLeftLobby', playerData.socketId);
+        console.log(`📤 Player ${playerData.username} left lobby ${socket.lobbyId}`);
       }
     }
     
@@ -256,7 +260,7 @@ function handleGameEnd(roomId, winnerData) {
   const room = gameRooms.get(roomId);
   if (!room) return;
   
-  console.log(`Game ended: ${roomId}, winner:`, winnerData);
+  console.log(`🏆 Game ended: ${roomId}, winner:`, winnerData);
   
   io.to(roomId).emit('gameEnded', {
     winner: winnerData,
@@ -269,6 +273,12 @@ function handleGameEnd(roomId, winnerData) {
     room.players.clear();
     gameRooms.delete(roomId);
     
+    console.log(`🔄 Returning ${players.length} players to lobby`);
+    
+    // ✅ ИСПРАВЛЕНИЕ: Возвращаем всех в ОДНО главное лобби
+    const lobbyId = getOrCreateLobby();
+    const lobby = lobbies.get(lobbyId);
+    
     players.forEach(player => {
       const socket = io.sockets.sockets.get(player.id);
       if (!socket) return;
@@ -276,12 +286,14 @@ function handleGameEnd(roomId, winnerData) {
       socket.leave(roomId);
       socket.roomId = null;
       
-      const lobbyId = getOrCreateLobby();
-      const lobby = lobbies.get(lobbyId);
-      
+      // ✅ ИСПРАВЛЕНИЕ: Позиция спавна в безопасной зоне лобби
       const resetPlayer = {
         ...player,
-        position: { x: Math.random() * 20 - 10, y: 1, z: Math.random() * 20 - 10 },
+        position: { 
+          x: Math.random() * 30 - 15, // От -15 до 15
+          y: 1, 
+          z: Math.random() * 30 - 15  // От -15 до 15
+        },
         rotation: { x: 0, y: 0, z: 0 },
         health: 100,
         kills: 0,
@@ -294,6 +306,9 @@ function handleGameEnd(roomId, winnerData) {
       socket.join(lobbyId);
       socket.lobbyId = lobbyId;
       
+      console.log(`✅ Player ${player.username} returned to lobby ${lobbyId} (total: ${lobby.players.size})`);
+      
+      // Отправляем игроку данные о возврате
       socket.emit('returnedToLobby', {
         lobbyId,
         player: resetPlayer,
@@ -302,6 +317,7 @@ function handleGameEnd(roomId, winnerData) {
         gameRooms: getGameRoomsStatus()
       });
       
+      // Уведомляем остальных в лобби
       socket.to(lobbyId).emit('playerJoinedLobby', resetPlayer);
     });
     
@@ -326,18 +342,32 @@ function broadcastQueuesStatus() {
 }
 
 io.on('connection', (socket) => {
-  console.log(`Player connected: ${socket.id}`);
+  console.log(`🔌 Player connected: ${socket.id}`);
 
   socket.on('joinLobby', (data) => {
+    // ✅ ИСПРАВЛЕНИЕ: Если игрок уже в лобби, не добавляем снова
+    if (socket.lobbyId && lobbies.has(socket.lobbyId)) {
+      const existingLobby = lobbies.get(socket.lobbyId);
+      if (existingLobby.players.has(socket.id)) {
+        console.log(`⚠️ Player ${data.username} already in lobby ${socket.lobbyId}`);
+        return;
+      }
+    }
+    
     const lobbyId = getOrCreateLobby();
     const lobby = lobbies.get(lobbyId);
     
+    // ✅ ИСПРАВЛЕНИЕ: Безопасная позиция спавна (не внутри стен)
     const player = {
       id: socket.id,
       wallet: data.wallet,
       username: data.username || `Player_${socket.id.substring(0, 4)}`,
       team: 0,
-      position: { x: Math.random() * 20 - 10, y: 1, z: Math.random() * 20 - 10 },
+      position: { 
+        x: Math.random() * 30 - 15, // От -15 до 15
+        y: 1, 
+        z: Math.random() * 30 - 15  // От -15 до 15
+      },
       rotation: { x: 0, y: 0, z: 0 },
       health: 100,
       kills: 0,
@@ -361,7 +391,7 @@ io.on('connection', (socket) => {
       }
     }
     
-    console.log(`Player ${player.username} joined lobby ${lobbyId}`);
+    console.log(`✅ Player ${player.username} joined lobby ${lobbyId} (total: ${lobby.players.size})`);
     
     socket.emit('lobbyJoined', {
       lobbyId,
@@ -423,7 +453,7 @@ io.on('connection', (socket) => {
     const position = queues[mode].length;
     socket.emit('joinedQueue', { mode, position });
     
-    console.log(`Player ${data.username} joined ${mode} queue at position ${position}`);
+    console.log(`📋 Player ${data.username} joined ${mode} queue at position ${position}`);
     
     tryStartGame(mode);
     broadcastQueuesStatus();
@@ -441,7 +471,7 @@ io.on('connection', (socket) => {
           if (s) s.emit('queuePositionUpdate', { position: i + 1 });
         });
         
-        console.log(`Player left ${mode} queue`);
+        console.log(`📋 Player left ${mode} queue`);
         broadcastQueuesStatus();
         return;
       }
@@ -566,7 +596,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    console.log(`Player disconnected: ${socket.id}`);
+    console.log(`🔌 Player disconnected: ${socket.id}`);
     
     for (const [mode, queue] of Object.entries(queues)) {
       const index = queue.findIndex(p => p.socketId === socket.id);
@@ -585,9 +615,12 @@ io.on('connection', (socket) => {
         lobby.players.delete(socket.id);
         socket.to(socket.lobbyId).emit('playerLeftLobby', socket.id);
         
-        if (lobby.players.size === 0) {
+        console.log(`📤 Player left lobby ${socket.lobbyId} (remaining: ${lobby.players.size})`);
+        
+        // ✅ ИСПРАВЛЕНИЕ: Не удаляем главное лобби
+        if (lobby.players.size === 0 && lobby.id !== MAIN_LOBBY_ID) {
           lobbies.delete(socket.lobbyId);
-          console.log(`Lobby deleted: ${socket.lobbyId}`);
+          console.log(`🗑️ Empty lobby deleted: ${socket.lobbyId}`);
         }
       }
     }
@@ -600,7 +633,7 @@ io.on('connection', (socket) => {
         
         if (room.players.size === 0) {
           gameRooms.delete(socket.roomId);
-          console.log(`Game room deleted: ${socket.roomId}`);
+          console.log(`🗑️ Empty game room deleted: ${socket.roomId}`);
         }
       }
     }
@@ -628,6 +661,6 @@ app.get('/health', (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`Game server running on port ${PORT}`);
-  console.log(`Modes: 5v5 (${MODES['5v5'].maxPlayers} players), FFA (${MODES['ffa'].maxPlayers} players)`);
+  console.log(`🚀 Game server running on port ${PORT}`);
+  console.log(`🎮 Modes: 5v5 (${MODES['5v5'].maxPlayers} players), FFA (${MODES['ffa'].maxPlayers} players)`);
 });
