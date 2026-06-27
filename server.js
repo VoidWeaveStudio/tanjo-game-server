@@ -20,8 +20,8 @@ const MODES = {
 };
 
 const MAX_SPEED = 15;
-const MAX_WEAPON_RANGE_SQ = 10000; 
-const SHOOT_COOLDOWN_MS = 100;  
+const MAX_WEAPON_RANGE_SQ = 10000;
+const SHOOT_COOLDOWN_MS = 100;
 const MAIN_LOBBY_ID = 'main_lobby';
 const lobbies = new Map();
 const gameRooms = new Map();
@@ -428,9 +428,6 @@ io.on('connection', (socket) => {
     const shooter = room.players.get(socket.id);
     if (!shooter || !shooter.isAlive) return;
 
-    const now = Date.now();
-    if (now - (shooter.lastShotTime || 0) < SHOOT_COOLDOWN_MS) return;
-    shooter.lastShotTime = now;
 
     socket.to(socket.roomId).emit('playerShot', {
       shooterId: socket.id,
@@ -444,28 +441,6 @@ io.on('connection', (socket) => {
       const isFriendlyFire = room.mode === '5v5' && hitPlayer.team === shooter.team;
 
       if (!isFriendlyFire) {
-        const dx = hitPlayer.position.x - shooter.position.x;
-        const dz = hitPlayer.position.z - shooter.position.z;
-        const dy = hitPlayer.position.y - shooter.position.y;
-        const distSq = dx * dx + dz * dz + dy * dy;
-
-        if (distSq > MAX_WEAPON_RANGE_SQ) {
-          return;
-        }
-
-        if (data.direction) {
-          const dirLen = Math.sqrt(
-            data.direction.x ** 2 + data.direction.y ** 2 + data.direction.z ** 2
-          );
-          if (dirLen > 0.001) {
-            const dist = Math.sqrt(distSq);
-            const dotProduct = (dx * data.direction.x + dy * data.direction.y + dz * data.direction.z) / (dist * dirLen);
-            if (dotProduct < 0.3) {
-              return;
-            }
-          }
-        }
-
         const damage = Math.min(data.damage || 25, 100);
         hitPlayer.health -= damage;
 
