@@ -1,3 +1,4 @@
+//server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -15,14 +16,15 @@ const io = new Server(server, {
 });
 
 const MODES = {
-  '5v5': { maxPlayers: 10, playersPerTeam: 5, killsToWin: 50, teamBased: true },
-  'ffa': { maxPlayers: 20, playersPerTeam: 1, killsToWin: 50, teamBased: false }
+  '5v5': { maxPlayers: 10, playersPerTeam: 5, killsToWin: 50, teamBased: true, matchDuration: 600000 },
+  'ffa': { maxPlayers: 20, playersPerTeam: 1, killsToWin: 50, teamBased: false, matchDuration: 600000 }
 };
 
 const MAX_SPEED = 25;
 const MAX_WEAPON_RANGE_SQ = 10000;
-const SHOOT_COOLDOWN_MS = 100;
+const SHOOT_COOLDOWN_MS = 120;
 const MAIN_LOBBY_ID = 'main_lobby';
+const SPAWN_PROTECTION_MS = 3000;
 const lobbies = new Map();
 const gameRooms = new Map();
 const queues = { '5v5': [], 'ffa': [] };
@@ -43,6 +45,11 @@ const SPAWN_POINTS = {
     { x: 30, z: -30 }, { x: 0, z: -30 }, { x: -15, z: -25 }, { x: 15, z: -25 }
   ]
 };
+
+const LOBBY_SPAWN_POINTS = [
+  { x: -10, z: -10 }, { x: 10, z: -10 }, { x: -10, z: 10 }, { x: 10, z: 10 },
+  { x: 0, z: -15 }, { x: 0, z: 15 }, { x: -15, z: 0 }, { x: 15, z: 0 }
+];
 
 function getOrCreateLobby() {
   if (!lobbies.has(MAIN_LOBBY_ID)) {
@@ -86,6 +93,35 @@ function getSafeSpawnPoint(mode, team, usedPositions = []) {
 
   const randomPoint = spawnPoints[Math.floor(Math.random() * spawnPoints.length)];
   return { x: randomPoint.x, y: 1, z: randomPoint.z };
+}
+
+function getLobbySpawnPoint(usedPositions = []) {
+  for (const point of LOBBY_SPAWN_POINTS) {
+    const isUsed = usedPositions.some(pos =>
+      Math.abs(pos.x - point.x) < 3 && Math.abs(pos.z - point.z) < 3
+    );
+    if (!isUsed) {
+      return { x: point.x, y: 1, z: point.z };
+    }
+  }
+  const randomPoint = LOBBY_SPAWN_POINTS[Math.floor(Math.random() * LOBBY_SPAWN_POINTS.length)];
+  return { x: randomPoint.x, y: 1, z: randomPoint.z };
+}
+
+function validatePosition(data) {
+  if (!data || typeof data !== 'object') return false;
+  if (!Array.isArray(data.position) || data.position.length !== 3) return false;
+  if (!Array.isArray(data.rotation) || data.rotation.length !== 3) return false;
+  
+  for (let i = 0; i < 3; i++) {
+    if (typeof data.position[i] !== 'number' || !isFinite(data.position[i])) return false;
+    if (typeof data.rotation[i] !== 'number' || !isFinite(data.rotation[i])) return false;
+  }
+  
+  if (Math.abs(data.position[0]) > 200 || Math.abs(data.position[2]) > 200) return false;
+  if (data.position[1] < 0 || data.position[1] > 50) return false;
+  
+  return true;
 }
 
 function addPlayerToRoom(playerData, room) {
@@ -137,7 +173,8 @@ function addPlayerToRoom(playerData, room) {
     isAlive: true,
     lastMoveTime: Date.now(),
     lastShotTime: 0,
-    respawnTimeout: null
+    respawnTimeout: null,
+    spawnProtectionUntil: Date.now() + SPAWN_PROTECTION_MS
   };
 
   room.players.set(player.id, player);
@@ -151,7 +188,8 @@ function addPlayerToRoom(playerData, room) {
     mode: room.mode,
     player,
     players: Array.from(room.players.values()),
-    scores: room.scores
+    scores: room.scores,
+    matchEndTime: room.matchEndTime
   });
 
   socket.to(room.id).emit(room.mode === 'ffa' ? 'playerJoinedFFAGame' : 'playerJoinedGame', player);
@@ -190,6 +228,8 @@ function tryStartGame(mode) {
 function createNewRoom(mode, queue) {
   const modeConfig = MODES[mode];
   const roomId = `room_${roomCounter++}`;
+  const matchEndTime = Date.now() + modeConfig.matchDuration;
+  
   const room = {
     id: roomId,
     mode,
@@ -198,10 +238,16 @@ function createNewRoom(mode, queue) {
     scores: mode === '5v5' ? { 1: 0, 2: 0 } : {},
     killsToWin: modeConfig.killsToWin,
     createdAt: Date.now(),
+    matchEndTime,
+    matchTimer: null,
     endGameTimeout: null
   };
 
   gameRooms.set(roomId, room);
+
+  room.matchTimer = setTimeout(() => {
+    handleMatchTimeout(roomId);
+  }, modeConfig.matchDuration);
 
   const playersToAdd = Math.min(queue.length, modeConfig.maxPlayers);
   for (let i = 0; i < playersToAdd; i++) {
@@ -211,11 +257,44 @@ function createNewRoom(mode, queue) {
   broadcastQueuesStatus();
 }
 
+function handleMatchTimeout(roomId) {
+  const room = gameRooms.get(roomId);
+  if (!room || room.status !== 'playing') return;
+
+  let winner = null;
+  if (room.mode === '5v5') {
+    const team1Score = room.scores[1] || 0;
+    const team2Score = room.scores[2] || 0;
+    if (team1Score > team2Score) {
+      winner = { type: 'team', team: 1 };
+    } else if (team2Score > team1Score) {
+      winner = { type: 'team', team: 2 };
+    } else {
+      winner = { type: 'draw' };
+    }
+  } else {
+    let maxKills = 0;
+    let topPlayer = null;
+    room.players.forEach(player => {
+      if (player.kills > maxKills) {
+        maxKills = player.kills;
+        topPlayer = player;
+      }
+    });
+    if (topPlayer) {
+      winner = { type: 'player', playerId: topPlayer.id, username: topPlayer.username };
+    }
+  }
+
+  handleGameEnd(roomId, winner);
+}
+
 function handleGameEnd(roomId, winnerData) {
   const room = gameRooms.get(roomId);
   if (!room) return;
 
   if (room.endGameTimeout) clearTimeout(room.endGameTimeout);
+  if (room.matchTimer) clearTimeout(room.matchTimer);
 
   io.to(roomId).emit('gameEnded', {
     winner: winnerData,
@@ -238,9 +317,12 @@ function handleGameEnd(roomId, winnerData) {
       socket.leave(roomId);
       socket.roomId = null;
 
+      const usedPositions = Array.from(lobby.players.values()).map(p => p.position);
+      const spawnPoint = getLobbySpawnPoint(usedPositions);
+
       const resetPlayer = {
         ...player,
-        position: { x: Math.random() * 30 - 15, y: 1, z: Math.random() * 30 - 15 },
+        position: spawnPoint,
         rotation: { x: 0, y: 0, z: 0 },
         health: 100, kills: 0, deaths: 0, team: 0, isAlive: true
       };
@@ -264,11 +346,12 @@ function handleGameEnd(roomId, winnerData) {
 
 function broadcastQueuesStatus() {
   const queuesStatus = getQueuesStatus();
-  lobbies.forEach(lobby => {
-    lobby.players.forEach((p, pid) => {
-      const s = io.sockets.sockets.get(pid);
-      if (s) s.emit('queuesStatusUpdate', queuesStatus);
-    });
+  const lobby = lobbies.get(MAIN_LOBBY_ID);
+  if (!lobby) return;
+
+  lobby.players.forEach((p, pid) => {
+    const s = io.sockets.sockets.get(pid);
+    if (s) s.emit('queuesStatusUpdate', queuesStatus);
   });
 }
 
@@ -289,12 +372,15 @@ io.on('connection', (socket) => {
     const lobbyId = getOrCreateLobby();
     const lobby = lobbies.get(lobbyId);
 
+    const usedPositions = Array.from(lobby.players.values()).map(p => p.position);
+    const spawnPoint = getLobbySpawnPoint(usedPositions);
+
     const player = {
       id: socket.id,
       wallet: data.wallet,
       username: data.username || `Player_${socket.id.substring(0, 4)}`,
       team: 0,
-      position: { x: Math.random() * 30 - 15, y: 1, z: Math.random() * 30 - 15 },
+      position: spawnPoint,
       rotation: { x: 0, y: 0, z: 0 },
       health: 100, kills: 0, deaths: 0, isAlive: true
     };
@@ -327,12 +413,15 @@ io.on('connection', (socket) => {
       mode: room.mode,
       player: player,
       players: Array.from(room.players.values()),
-      scores: room.scores
+      scores: room.scores,
+      matchEndTime: room.matchEndTime
     });
   });
 
   socket.on('lobbyMove', (data) => {
     if (!socket.lobbyId) return;
+    if (!validatePosition(data)) return;
+
     const lobby = lobbies.get(socket.lobbyId);
     if (!lobby) return;
 
@@ -383,6 +472,7 @@ io.on('connection', (socket) => {
 
   socket.on('playerMove', (data) => {
     if (!socket.roomId) return;
+    if (!validatePosition(data)) return;
 
     const room = gameRooms.get(socket.roomId);
     if (!room || room.status !== 'playing') return;
@@ -400,7 +490,7 @@ io.on('connection', (socket) => {
     const timeDelta = (Date.now() - (player.lastMoveTime || Date.now())) / 1000;
     const maxDistSq = timeDelta > 0 ? (MAX_SPEED * timeDelta) ** 2 : 0;
 
-    if (timeDelta > 0 && distSq > maxDistSq) {
+    if (timeDelta > 0 && distSq > maxDistSq * 1.5) {
       socket.emit('positionCorrection', {
         position: [oldPos.x, oldPos.y, oldPos.z],
         rotation: [player.rotation.x, player.rotation.y, player.rotation.z]
@@ -428,6 +518,11 @@ io.on('connection', (socket) => {
     const shooter = room.players.get(socket.id);
     if (!shooter || !shooter.isAlive) return;
 
+    const now = Date.now();
+    if (now - shooter.lastShotTime < SHOOT_COOLDOWN_MS) {
+      return;
+    }
+    shooter.lastShotTime = now;
 
     socket.to(socket.roomId).emit('playerShot', {
       shooterId: socket.id,
@@ -438,10 +533,22 @@ io.on('connection', (socket) => {
     const hitPlayer = room.players.get(data.targetId);
 
     if (hitPlayer && hitPlayer.isAlive) {
+      if (now < hitPlayer.spawnProtectionUntil) {
+        return;
+      }
+
       const isFriendlyFire = room.mode === '5v5' && hitPlayer.team === shooter.team;
 
       if (!isFriendlyFire) {
-        const damage = Math.min(data.damage || 25, 100);
+        const dx = hitPlayer.position.x - shooter.position.x;
+        const dz = hitPlayer.position.z - shooter.position.z;
+        const distSq = dx * dx + dz * dz;
+
+        if (distSq > MAX_WEAPON_RANGE_SQ) {
+          return;
+        }
+
+        const damage = 25;
         hitPlayer.health -= damage;
 
         if (hitPlayer.health <= 0) {
@@ -482,6 +589,7 @@ io.on('connection', (socket) => {
             hitPlayer.health = 100;
             hitPlayer.isAlive = true;
             hitPlayer.respawnTimeout = null;
+            hitPlayer.spawnProtectionUntil = Date.now() + SPAWN_PROTECTION_MS;
 
             const usedPositions = Array.from(room.players.values())
               .filter(p => p.id !== hitPlayer.id && p.isAlive)
@@ -495,7 +603,8 @@ io.on('connection', (socket) => {
 
             io.to(socket.roomId).emit('playerRespawned', {
               id: hitPlayer.id,
-              position: [hitPlayer.position.x, hitPlayer.position.y, hitPlayer.position.z]
+              position: [hitPlayer.position.x, hitPlayer.position.y, hitPlayer.position.z],
+              spawnProtectionUntil: hitPlayer.spawnProtectionUntil
             });
           }, 3000);
         }
@@ -580,6 +689,10 @@ io.on('connection', (socket) => {
           if (room.endGameTimeout) {
             clearTimeout(room.endGameTimeout);
             room.endGameTimeout = null;
+          }
+          if (room.matchTimer) {
+            clearTimeout(room.matchTimer);
+            room.matchTimer = null;
           }
           gameRooms.delete(socket.roomId);
         }
