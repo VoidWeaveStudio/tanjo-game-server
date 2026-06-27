@@ -1,4 +1,4 @@
-//server.js
+// server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -616,6 +616,71 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('chatMessage', (data) => {
+    if (!socket.roomId) return;
+    
+    const room = gameRooms.get(socket.roomId);
+    if (!room || room.status !== 'playing') return;
+
+    const player = room.players.get(socket.id);
+    if (!player) return;
+
+    const messageText = typeof data.message === 'string' ? data.message.substring(0, 200).trim() : '';
+    if (!messageText) return;
+
+    const message = {
+      id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      username: (typeof data.username === 'string' ? data.username : player.username).substring(0, 20),
+      message: messageText,
+      timestamp: Date.now(),
+      team: player.team
+    };
+
+    if (data.isTeamChat && room.mode === '5v5') {
+      room.players.forEach((p, pid) => {
+        if (p.team === player.team) {
+          const s = io.sockets.sockets.get(pid);
+          if (s) s.emit('chatMessage', message);
+        }
+      });
+    } else {
+      io.to(socket.roomId).emit('chatMessage', message);
+    }
+  });
+
+  socket.on('startVoiceChat', (data) => {
+    if (!socket.roomId) return;
+    const room = gameRooms.get(socket.roomId);
+    if (!room || room.status !== 'playing') return;
+
+    socket.to(socket.roomId).emit('playerTalking', {
+      playerId: socket.id,
+      isTalking: true
+    });
+  });
+
+  socket.on('stopVoiceChat', (data) => {
+    if (!socket.roomId) return;
+    socket.to(socket.roomId).emit('playerTalking', {
+      playerId: socket.id,
+      isTalking: false
+    });
+  });
+
+  socket.on('voiceSignal', (data) => {
+    if (!data || !data.targetId) return;
+    
+    const targetSocket = io.sockets.sockets.get(data.targetId);
+    if (targetSocket) {
+      targetSocket.emit('voiceSignal', {
+        type: data.type,
+        senderId: socket.id,
+        description: data.description,
+        candidate: data.candidate
+      });
+    }
+  });
+
   socket.on('changeUsername', (data) => {
     const newUsername = data.username?.trim();
     if (!newUsername || newUsername.length === 0 || newUsername.length > 20) {
@@ -684,6 +749,11 @@ io.on('connection', (socket) => {
 
         room.players.delete(socket.id);
         socket.to(socket.roomId).emit('playerLeft', socket.id);
+
+        socket.to(socket.roomId).emit('playerTalking', {
+          playerId: socket.id,
+          isTalking: false
+        });
 
         if (room.players.size === 0) {
           if (room.endGameTimeout) {
