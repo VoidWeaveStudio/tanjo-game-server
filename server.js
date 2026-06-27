@@ -1,4 +1,3 @@
-// server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -362,6 +361,47 @@ function unpackMoveData(data) {
   };
 }
 
+function returnPlayerToLobby(socket, playerData = null) {
+  const lobbyId = getOrCreateLobby();
+  const lobby = lobbies.get(lobbyId);
+  
+  const usedPositions = Array.from(lobby.players.values())
+    .filter(p => p.id !== socket.id)
+    .map(p => p.position);
+  const spawnPoint = getLobbySpawnPoint(usedPositions);
+
+  const resetPlayer = {
+    id: socket.id,
+    wallet: playerData?.wallet || '',
+    username: playerData?.username || `Player_${socket.id.substring(0, 4)}`,
+    team: 0,
+    position: spawnPoint,
+    rotation: { x: 0, y: 0, z: 0 },
+    health: 100,
+    kills: 0,
+    deaths: 0,
+    isAlive: true
+  };
+
+  if (lobby.players.has(socket.id)) {
+    lobby.players.set(socket.id, resetPlayer);
+  } else {
+    lobby.players.set(socket.id, resetPlayer);
+    socket.join(lobbyId);
+    socket.to(lobbyId).emit('playerJoinedLobby', resetPlayer);
+  }
+  
+  socket.lobbyId = lobbyId;
+  socket.roomId = null;
+
+  socket.emit('returnedToLobby', {
+    lobbyId,
+    player: resetPlayer,
+    players: Array.from(lobby.players.values()),
+    queues: getQueuesStatus()
+  });
+}
+
 io.on('connection', (socket) => {
   socket.on('joinLobby', (data) => {
     if (socket.lobbyId && lobbies.has(socket.lobbyId)) {
@@ -680,6 +720,54 @@ io.on('connection', (socket) => {
         candidate: data.candidate
       });
     }
+  });
+
+  socket.on('leaveGame', (data) => {
+    if (!socket.roomId) {
+      if (!socket.lobbyId) {
+        returnPlayerToLobby(socket, data);
+      }
+      return;
+    }
+
+    const room = gameRooms.get(socket.roomId);
+    const player = room?.players.get(socket.id);
+    const oldRoomId = socket.roomId;
+
+    if (room) {
+      if (player && player.respawnTimeout) {
+        clearTimeout(player.respawnTimeout);
+        player.respawnTimeout = null;
+      }
+
+      room.players.delete(socket.id);
+      socket.leave(oldRoomId);
+      socket.to(oldRoomId).emit('playerLeft', socket.id);
+
+      socket.to(oldRoomId).emit('playerTalking', {
+        playerId: socket.id,
+        isTalking: false
+      });
+
+      if (room.players.size === 0) {
+        if (room.endGameTimeout) {
+          clearTimeout(room.endGameTimeout);
+          room.endGameTimeout = null;
+        }
+        if (room.matchTimer) {
+          clearTimeout(room.matchTimer);
+          room.matchTimer = null;
+        }
+        gameRooms.delete(oldRoomId);
+        console.log(`🗑️ Empty room ${oldRoomId} deleted`);
+      }
+    }
+
+    socket.roomId = null;
+
+    returnPlayerToLobby(socket, player);
+
+    console.log(`✅ Player ${socket.id} left room ${oldRoomId} and returned to lobby`);
   });
 
   socket.on('changeUsername', (data) => {
