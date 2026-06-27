@@ -20,6 +20,8 @@ const MODES = {
 };
 
 const MAX_SPEED = 15;
+const MAX_WEAPON_RANGE_SQ = 10000; 
+const SHOOT_COOLDOWN_MS = 100;  
 const MAIN_LOBBY_ID = 'main_lobby';
 const lobbies = new Map();
 const gameRooms = new Map();
@@ -28,30 +30,17 @@ let roomCounter = 1;
 
 const SPAWN_POINTS = {
   team1: [
-    { x: -20, z: -50 },
-    { x: -15, z: -50 },
-    { x: -25, z: -50 },
-    { x: -18, z: -48 },
-    { x: -22, z: -48 }
+    { x: -20, z: -50 }, { x: -15, z: -50 }, { x: -25, z: -50 },
+    { x: -18, z: -48 }, { x: -22, z: -48 }
   ],
   team2: [
-    { x: 20, z: -50 },
-    { x: 15, z: -50 },
-    { x: 25, z: -50 },
-    { x: 18, z: -48 },
-    { x: 22, z: -48 }
+    { x: 20, z: -50 }, { x: 15, z: -50 }, { x: 25, z: -50 },
+    { x: 18, z: -48 }, { x: 22, z: -48 }
   ],
   ffa: [
-    { x: 0, z: -45 },
-    { x: -10, z: -40 },
-    { x: 10, z: -40 },
-    { x: -20, z: -35 },
-    { x: 20, z: -35 },
-    { x: -30, z: -30 },
-    { x: 30, z: -30 },
-    { x: 0, z: -30 },
-    { x: -15, z: -25 },
-    { x: 15, z: -25 }
+    { x: 0, z: -45 }, { x: -10, z: -40 }, { x: 10, z: -40 },
+    { x: -20, z: -35 }, { x: 20, z: -35 }, { x: -30, z: -30 },
+    { x: 30, z: -30 }, { x: 0, z: -30 }, { x: -15, z: -25 }, { x: 15, z: -25 }
   ]
 };
 
@@ -80,7 +69,6 @@ function findAvailableRoom(mode) {
 
 function getSafeSpawnPoint(mode, team, usedPositions = []) {
   let spawnPoints;
-  
   if (mode === '5v5') {
     spawnPoints = team === 1 ? SPAWN_POINTS.team1 : SPAWN_POINTS.team2;
   } else {
@@ -88,10 +76,9 @@ function getSafeSpawnPoint(mode, team, usedPositions = []) {
   }
 
   for (const point of spawnPoints) {
-    const isUsed = usedPositions.some(pos => 
+    const isUsed = usedPositions.some(pos =>
       Math.abs(pos.x - point.x) < 2 && Math.abs(pos.z - point.z) < 2
     );
-    
     if (!isUsed) {
       return { x: point.x, y: 1, z: point.z };
     }
@@ -104,7 +91,7 @@ function getSafeSpawnPoint(mode, team, usedPositions = []) {
 function addPlayerToRoom(playerData, room) {
   const socket = io.sockets.sockets.get(playerData.socketId);
   if (!socket) return false;
-  
+
   if (socket.lobbyId) {
     const lobby = lobbies.get(socket.lobbyId);
     if (lobby) {
@@ -113,17 +100,17 @@ function addPlayerToRoom(playerData, room) {
       socket.to(socket.lobbyId).emit('playerLeftLobby', playerData.socketId);
     }
   }
-  
+
   const queueIndex = queues[room.mode].findIndex(p => p.socketId === playerData.socketId);
   if (queueIndex !== -1) queues[room.mode].splice(queueIndex, 1);
-  
+
   let team = 0;
   let position = { x: 0, y: 1, z: 0 };
   let rotation = { x: 0, y: 0, z: 0 };
-  
+
   const modeConfig = MODES[room.mode];
   const index = room.players.size;
-  
+
   if (room.mode === '5v5') {
     team = index < modeConfig.playersPerTeam ? 1 : 2;
     const usedPositions = Array.from(room.players.values())
@@ -136,7 +123,7 @@ function addPlayerToRoom(playerData, room) {
     position = getSafeSpawnPoint(room.mode, 0, usedPositions);
     rotation = { x: 0, y: Math.random() * Math.PI * 2, z: 0 };
   }
-  
+
   const player = {
     id: playerData.socketId,
     wallet: playerData.wallet,
@@ -149,14 +136,15 @@ function addPlayerToRoom(playerData, room) {
     deaths: 0,
     isAlive: true,
     lastMoveTime: Date.now(),
+    lastShotTime: 0,
     respawnTimeout: null
   };
-  
+
   room.players.set(player.id, player);
   socket.join(room.id);
   socket.roomId = room.id;
   socket.lobbyId = null;
-  
+
   const joinEvent = room.mode === 'ffa' ? 'joinedFFAGame' : 'gameStarted';
   socket.emit(joinEvent, {
     roomId: room.id,
@@ -165,7 +153,7 @@ function addPlayerToRoom(playerData, room) {
     players: Array.from(room.players.values()),
     scores: room.scores
   });
-  
+
   socket.to(room.id).emit(room.mode === 'ffa' ? 'playerJoinedFFAGame' : 'playerJoinedGame', player);
   return true;
 }
@@ -173,14 +161,13 @@ function addPlayerToRoom(playerData, room) {
 function tryStartGame(mode) {
   const queue = queues[mode];
   const modeConfig = MODES[mode];
-  
+
   if (mode === 'ffa') {
     const existingRoom = findAvailableRoom(mode);
     if (existingRoom && queue.length > 0) {
       while (queue.length > 0 && existingRoom.players.size < modeConfig.maxPlayers) {
         addPlayerToRoom(queue.shift(), existingRoom);
       }
-      
       if (queue.length > 0) {
         createNewRoom(mode, queue);
       }
@@ -190,7 +177,7 @@ function tryStartGame(mode) {
     broadcastQueuesStatus();
     return;
   }
-  
+
   if (mode === '5v5') {
     if (queue.length >= modeConfig.maxPlayers) {
       createNewRoom(mode, queue);
@@ -213,64 +200,64 @@ function createNewRoom(mode, queue) {
     createdAt: Date.now(),
     endGameTimeout: null
   };
-  
+
   gameRooms.set(roomId, room);
-  
+
   const playersToAdd = Math.min(queue.length, modeConfig.maxPlayers);
   for (let i = 0; i < playersToAdd; i++) {
     addPlayerToRoom(queue.shift(), room);
   }
-  
+
   broadcastQueuesStatus();
 }
 
 function handleGameEnd(roomId, winnerData) {
   const room = gameRooms.get(roomId);
   if (!room) return;
-  
+
   if (room.endGameTimeout) clearTimeout(room.endGameTimeout);
-  
+
   io.to(roomId).emit('gameEnded', {
     winner: winnerData,
     scores: room.scores,
     players: Array.from(room.players.values())
   });
-  
+
   room.endGameTimeout = setTimeout(() => {
     const players = Array.from(room.players.values());
     room.players.clear();
     gameRooms.delete(roomId);
-    
+
     const lobbyId = getOrCreateLobby();
     const lobby = lobbies.get(lobbyId);
-    
+
     players.forEach(player => {
       const socket = io.sockets.sockets.get(player.id);
       if (!socket) return;
-      
+
       socket.leave(roomId);
       socket.roomId = null;
-      
+
       const resetPlayer = {
         ...player,
         position: { x: Math.random() * 30 - 15, y: 1, z: Math.random() * 30 - 15 },
         rotation: { x: 0, y: 0, z: 0 },
         health: 100, kills: 0, deaths: 0, team: 0, isAlive: true
       };
-      
+
       lobby.players.set(player.id, resetPlayer);
       socket.join(lobbyId);
       socket.lobbyId = lobbyId;
-      
+
       socket.emit('returnedToLobby', {
         lobbyId, player: resetPlayer,
         players: Array.from(lobby.players.values()),
         queues: getQueuesStatus()
       });
-      
+
       socket.to(lobbyId).emit('playerJoinedLobby', resetPlayer);
     });
-    
+
     broadcastQueuesStatus();
   }, 5000);
 }
@@ -285,16 +272,23 @@ function broadcastQueuesStatus() {
   });
 }
 
+function unpackMoveData(data) {
+  return {
+    position: { x: data.position[0], y: data.position[1], z: data.position[2] },
+    rotation: { x: data.rotation[0], y: data.rotation[1], z: data.rotation[2] }
+  };
+}
+
 io.on('connection', (socket) => {
   socket.on('joinLobby', (data) => {
     if (socket.lobbyId && lobbies.has(socket.lobbyId)) {
       const existingLobby = lobbies.get(socket.lobbyId);
       if (existingLobby.players.has(socket.id)) return;
     }
-    
+
     const lobbyId = getOrCreateLobby();
     const lobby = lobbies.get(lobbyId);
-    
+
     const player = {
       id: socket.id,
       wallet: data.wallet,
@@ -304,30 +298,30 @@ io.on('connection', (socket) => {
       rotation: { x: 0, y: 0, z: 0 },
       health: 100, kills: 0, deaths: 0, isAlive: true
     };
-    
+
     lobby.players.set(player.id, player);
     socket.join(lobbyId);
     socket.lobbyId = lobbyId;
     socket.roomId = null;
-    
+
     socket.emit('lobbyJoined', {
       lobbyId, player,
       players: Array.from(lobby.players.values()),
       queues: getQueuesStatus()
     });
-    
+
     socket.to(lobbyId).emit('playerJoinedLobby', player);
   });
 
   socket.on('joinGameRoom', (data) => {
     if (!socket.roomId) return;
-    
+
     const room = gameRooms.get(socket.roomId);
     if (!room) return;
-    
+
     const player = room.players.get(socket.id);
     if (!player) return;
-    
+
     socket.emit('joinedGameRoom', {
       roomId: room.id,
       mode: room.mode,
@@ -341,33 +335,36 @@ io.on('connection', (socket) => {
     if (!socket.lobbyId) return;
     const lobby = lobbies.get(socket.lobbyId);
     if (!lobby) return;
-    
+
     const player = lobby.players.get(socket.id);
     if (!player) return;
-    
-    player.position = data.position;
-    player.rotation = data.rotation;
-    
+
+    const unpacked = unpackMoveData(data);
+    player.position = unpacked.position;
+    player.rotation = unpacked.rotation;
+
     socket.to(socket.lobbyId).emit('playerMovedInLobby', {
-      id: socket.id, position: data.position, rotation: data.rotation
+      id: socket.id,
+      position: [unpacked.position.x, unpacked.position.y, unpacked.position.z],
+      rotation: [unpacked.rotation.x, unpacked.rotation.y, unpacked.rotation.z]
     });
   });
 
   socket.on('joinQueue', (data) => {
     const mode = data.mode;
     if (!MODES[mode]) return socket.emit('queueError', 'Invalid game mode');
-    
+
     for (const [m, queue] of Object.entries(queues)) {
       if (queue.some(p => p.socketId === socket.id)) {
         return socket.emit('queueError', `You are already in ${m} queue`);
       }
     }
-    
+
     if (socket.roomId) return socket.emit('queueError', 'You are already in a game');
-    
+
     queues[mode].push({ socketId: socket.id, wallet: data.wallet, username: data.username });
     socket.emit('joinedQueue', { mode, position: queues[mode].length });
-    
+
     tryStartGame(mode);
     broadcastQueuesStatus();
   });
@@ -386,72 +383,106 @@ io.on('connection', (socket) => {
 
   socket.on('playerMove', (data) => {
     if (!socket.roomId) return;
-    
+
     const room = gameRooms.get(socket.roomId);
     if (!room || room.status !== 'playing') return;
-    
+
     const player = room.players.get(socket.id);
     if (!player || !player.isAlive) return;
-    
+
+    const unpacked = unpackMoveData(data);
     const oldPos = player.position;
-    const newPos = data.position;
+    const newPos = unpacked.position;
     const dx = newPos.x - oldPos.x;
     const dz = newPos.z - oldPos.z;
-    const dist = Math.sqrt(dx * dx + dz * dz);
+
+    const distSq = dx * dx + dz * dz;
     const timeDelta = (Date.now() - (player.lastMoveTime || Date.now())) / 1000;
-    
-    if (timeDelta > 0) {
-      const speed = dist / timeDelta;
-      if (speed > MAX_SPEED) {
-        socket.emit('positionCorrection', { position: oldPos, rotation: player.rotation });
-        return;
-      }
+    const maxDistSq = timeDelta > 0 ? (MAX_SPEED * timeDelta) ** 2 : 0;
+
+    if (timeDelta > 0 && distSq > maxDistSq) {
+      socket.emit('positionCorrection', {
+        position: [oldPos.x, oldPos.y, oldPos.z],
+        rotation: [player.rotation.x, player.rotation.y, player.rotation.z]
+      });
+      return;
     }
-    
+
     player.position = newPos;
-    player.rotation = data.rotation;
+    player.rotation = unpacked.rotation;
     player.lastMoveTime = Date.now();
-    
+
     socket.to(socket.roomId).emit('playerMoved', {
-      id: socket.id, position: newPos, rotation: data.rotation
+      id: socket.id,
+      position: [newPos.x, newPos.y, newPos.z],
+      rotation: [unpacked.rotation.x, unpacked.rotation.y, unpacked.rotation.z]
     });
   });
 
   socket.on('shoot', (data) => {
     if (!socket.roomId) return;
-    
+
     const room = gameRooms.get(socket.roomId);
     if (!room || room.status !== 'playing') return;
-    
+
     const shooter = room.players.get(socket.id);
     if (!shooter || !shooter.isAlive) return;
-    
+
+    const now = Date.now();
+    if (now - (shooter.lastShotTime || 0) < SHOOT_COOLDOWN_MS) return;
+    shooter.lastShotTime = now;
+
     socket.to(socket.roomId).emit('playerShot', {
-      shooterId: socket.id, origin: data.origin, direction: data.direction
+      shooterId: socket.id,
+      origin: data.origin,
+      direction: data.direction
     });
-    
+
     const hitPlayer = room.players.get(data.targetId);
-    
+
     if (hitPlayer && hitPlayer.isAlive) {
       const isFriendlyFire = room.mode === '5v5' && hitPlayer.team === shooter.team;
-      
+
       if (!isFriendlyFire) {
-        hitPlayer.health -= data.damage || 25;
-        
+        const dx = hitPlayer.position.x - shooter.position.x;
+        const dz = hitPlayer.position.z - shooter.position.z;
+        const dy = hitPlayer.position.y - shooter.position.y;
+        const distSq = dx * dx + dz * dz + dy * dy;
+
+        if (distSq > MAX_WEAPON_RANGE_SQ) {
+          return;
+        }
+
+        if (data.direction) {
+          const dirLen = Math.sqrt(
+            data.direction.x ** 2 + data.direction.y ** 2 + data.direction.z ** 2
+          );
+          if (dirLen > 0.001) {
+            const dist = Math.sqrt(distSq);
+            const dotProduct = (dx * data.direction.x + dy * data.direction.y + dz * data.direction.z) / (dist * dirLen);
+            if (dotProduct < 0.3) {
+              return;
+            }
+          }
+        }
+
+        const damage = Math.min(data.damage || 25, 100);
+        hitPlayer.health -= damage;
+
         if (hitPlayer.health <= 0) {
           hitPlayer.health = 0;
           hitPlayer.isAlive = false;
           hitPlayer.deaths++;
           shooter.kills++;
-          
+
           if (room.mode === '5v5') room.scores[shooter.team]++;
           else room.scores[shooter.id] = shooter.kills;
-          
+
           io.to(socket.roomId).emit('playerKilled', {
             killerId: shooter.id, victimId: hitPlayer.id,
             scores: room.scores, killerKills: shooter.kills
           });
-          
+
           let winner = null;
           if (room.mode === '5v5') {
             if (room.scores[shooter.team] >= room.killsToWin) {
@@ -462,39 +493,40 @@ io.on('connection', (socket) => {
               winner = { type: 'player', playerId: shooter.id, username: shooter.username };
             }
           }
-          
+
           if (winner) {
             handleGameEnd(socket.roomId, winner);
             return;
           }
-          
+
           if (hitPlayer.respawnTimeout) clearTimeout(hitPlayer.respawnTimeout);
-          
+
           hitPlayer.respawnTimeout = setTimeout(() => {
             if (!room.players.has(hitPlayer.id)) return;
-            
+
             hitPlayer.health = 100;
             hitPlayer.isAlive = true;
             hitPlayer.respawnTimeout = null;
-            
+
             const usedPositions = Array.from(room.players.values())
               .filter(p => p.id !== hitPlayer.id && p.isAlive)
               .map(p => p.position);
-            
+
             if (room.mode === '5v5') {
               hitPlayer.position = getSafeSpawnPoint(room.mode, hitPlayer.team, usedPositions);
             } else {
               hitPlayer.position = getSafeSpawnPoint(room.mode, 0, usedPositions);
             }
-            
+
             io.to(socket.roomId).emit('playerRespawned', {
-              id: hitPlayer.id, position: hitPlayer.position
+              id: hitPlayer.id,
+              position: [hitPlayer.position.x, hitPlayer.position.y, hitPlayer.position.z]
             });
           }, 3000);
         }
-        
+
         io.to(socket.roomId).emit('playerHit', {
-          targetId: hitPlayer.id, damage: data.damage || 25, health: hitPlayer.health
+          targetId: hitPlayer.id, damage: damage, health: hitPlayer.health
         });
       }
     }
@@ -514,8 +546,7 @@ io.on('connection', (socket) => {
         if (player) {
           player.username = newUsername;
           socket.to(socket.lobbyId).emit('playerUsernameChanged', {
-            id: socket.id,
-            username: newUsername
+            id: socket.id, username: newUsername
           });
         }
       }
@@ -528,8 +559,7 @@ io.on('connection', (socket) => {
         if (player) {
           player.username = newUsername;
           socket.to(socket.roomId).emit('playerUsernameChanged', {
-            id: socket.id,
-            username: newUsername
+            id: socket.id, username: newUsername
           });
         }
       }
@@ -550,7 +580,7 @@ io.on('connection', (socket) => {
       const index = queue.findIndex(p => p.socketId === socket.id);
       if (index !== -1) queue.splice(index, 1);
     }
-    
+
     if (socket.lobbyId) {
       const lobby = lobbies.get(socket.lobbyId);
       if (lobby) {
@@ -558,7 +588,7 @@ io.on('connection', (socket) => {
         socket.to(socket.lobbyId).emit('playerLeftLobby', socket.id);
       }
     }
-    
+
     if (socket.roomId) {
       const room = gameRooms.get(socket.roomId);
       if (room) {
@@ -567,10 +597,10 @@ io.on('connection', (socket) => {
           clearTimeout(player.respawnTimeout);
           player.respawnTimeout = null;
         }
-        
+
         room.players.delete(socket.id);
         socket.to(socket.roomId).emit('playerLeft', socket.id);
-        
+
         if (room.players.size === 0) {
           if (room.endGameTimeout) {
             clearTimeout(room.endGameTimeout);
@@ -580,7 +610,7 @@ io.on('connection', (socket) => {
         }
       }
     }
-    
+
     broadcastQueuesStatus();
   });
 });
