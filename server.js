@@ -1,3 +1,4 @@
+//server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -14,36 +15,25 @@ const io = new Server(server, {
   }
 });
 
-// Константы режимов
 const MODES = {
-  '5v5': { maxPlayers: 10, playersPerTeam: 5, killsToWin: 50, teamBased: true, waitForFull: true },
-  'ffa': { maxPlayers: 20, playersPerTeam: 1, killsToWin: 50, teamBased: false, waitForFull: false }
+  '5v5': { maxPlayers: 10, playersPerTeam: 5, killsToWin: 50, teamBased: true },
+  'ffa': { maxPlayers: 20, playersPerTeam: 1, killsToWin: 50, teamBased: false }
 };
 
-// Структуры данных
+const MAX_SPEED = 15;
 const MAIN_LOBBY_ID = 'main_lobby';
 const lobbies = new Map();
 const gameRooms = new Map();
-const queues = {
-  '5v5': [],
-  'ffa': []
-};
-
+const queues = { '5v5': [], 'ffa': [] };
 let roomCounter = 1;
 
-// ✅ ИСПРАВЛЕНИЕ: Всегда используем ОДНО главное лобби
 function getOrCreateLobby() {
   if (!lobbies.has(MAIN_LOBBY_ID)) {
-    lobbies.set(MAIN_LOBBY_ID, { 
-      id: MAIN_LOBBY_ID, 
-      players: new Map() 
-    });
-    console.log(`✅ Main lobby created: ${MAIN_LOBBY_ID}`);
+    lobbies.set(MAIN_LOBBY_ID, { id: MAIN_LOBBY_ID, players: new Map() });
   }
   return MAIN_LOBBY_ID;
 }
 
-// Получить статус очередей
 function getQueuesStatus() {
   return {
     '5v5': { count: queues['5v5'].length, max: MODES['5v5'].maxPlayers },
@@ -51,20 +41,6 @@ function getQueuesStatus() {
   };
 }
 
-// Получить статус игровых комнат
-function getGameRoomsStatus() {
-  return Array.from(gameRooms.values()).map(room => ({
-    id: room.id,
-    mode: room.mode,
-    playersCount: room.players.size,
-    maxPlayers: MODES[room.mode].maxPlayers,
-    status: room.status,
-    scores: room.scores,
-    acceptingPlayers: room.players.size < MODES[room.mode].maxPlayers
-  }));
-}
-
-// ✅ ИСПРАВЛЕНИЕ: Универсальный поиск свободной комнаты для ЛЮБОГО режима
 function findAvailableRoom(mode) {
   for (const [roomId, room] of gameRooms.entries()) {
     if (room.mode === mode && room.status === 'playing' && room.players.size < MODES[mode].maxPlayers) {
@@ -74,27 +50,21 @@ function findAvailableRoom(mode) {
   return null;
 }
 
-// ✅ ИСПРАВЛЕНИЕ: Универсальная функция добавления игрока в комнату
 function addPlayerToRoom(playerData, room) {
   const socket = io.sockets.sockets.get(playerData.socketId);
   if (!socket) return false;
   
-  // Убираем из лобби
   if (socket.lobbyId) {
     const lobby = lobbies.get(socket.lobbyId);
     if (lobby) {
       lobby.players.delete(playerData.socketId);
       socket.leave(socket.lobbyId);
       socket.to(socket.lobbyId).emit('playerLeftLobby', playerData.socketId);
-      console.log(`📤 Player ${playerData.username} left lobby ${socket.lobbyId}`);
     }
   }
   
-  // Убираем из очереди
   const queueIndex = queues[room.mode].findIndex(p => p.socketId === playerData.socketId);
-  if (queueIndex !== -1) {
-    queues[room.mode].splice(queueIndex, 1);
-  }
+  if (queueIndex !== -1) queues[room.mode].splice(queueIndex, 1);
   
   let team = 0;
   let position = { x: 0, y: 1, z: 0 };
@@ -103,7 +73,6 @@ function addPlayerToRoom(playerData, room) {
   const modeConfig = MODES[room.mode];
   const index = room.players.size; 
   
-  // Логика спавна в зависимости от режима
   if (room.mode === '5v5') {
     team = index < modeConfig.playersPerTeam ? 1 : 2;
     position = { x: team === 1 ? -20 : 20, y: 1, z: (index % 5) * 2 - 4 };
@@ -125,7 +94,9 @@ function addPlayerToRoom(playerData, room) {
     health: 100,
     kills: 0,
     deaths: 0,
-    isAlive: true
+    isAlive: true,
+    lastMoveTime: Date.now(),  
+    respawnTimeout: null 
   };
   
   room.players.set(player.id, player);
@@ -133,7 +104,6 @@ function addPlayerToRoom(playerData, room) {
   socket.roomId = room.id;
   socket.lobbyId = null;
   
-  // Отправляем игроку состояние игры
   const joinEvent = room.mode === 'ffa' ? 'joinedFFAGame' : 'gameStarted';
   socket.emit(joinEvent, {
     roomId: room.id,
@@ -143,48 +113,34 @@ function addPlayerToRoom(playerData, room) {
     scores: room.scores
   });
   
-  // Уведомляем других игроков в комнате
-  if (room.mode === 'ffa') {
-    socket.to(room.id).emit('playerJoinedFFAGame', player);
-  } else {
-    socket.to(room.id).emit('playerJoinedGame', player);
-  }
-  
-  console.log(`🎮 Player ${player.username} joined ${room.mode} room ${room.id} (${room.players.size}/${modeConfig.maxPlayers})`);
+  socket.to(room.id).emit(room.mode === 'ffa' ? 'playerJoinedFFAGame' : 'playerJoinedGame', player);
   return true;
 }
 
-// ✅ ИСПРАВЛЕНИЕ: Единая логика старта и наполнения комнат
 function tryStartGame(mode) {
   const queue = queues[mode];
   const modeConfig = MODES[mode];
   
-  // 1. Пытаемся наполнить существующую комнату (для FFA и 5v5)
-  const existingRoom = findAvailableRoom(mode);
-  
-  if (existingRoom && queue.length > 0) {
-    while (queue.length > 0 && existingRoom.players.size < modeConfig.maxPlayers) {
-      const playerData = queue.shift();
-      addPlayerToRoom(playerData, existingRoom);
+  if (mode === 'ffa') {
+    const existingRoom = findAvailableRoom(mode);
+    if (existingRoom && queue.length > 0) {
+      while (queue.length > 0 && existingRoom.players.size < modeConfig.maxPlayers) {
+        addPlayerToRoom(queue.shift(), existingRoom);
+      }
+    } else if (queue.length > 0) {
+      createNewRoom(mode, queue);
     }
     broadcastQueuesStatus();
-    
-    // Если для 5v5 после наполнения в очереди осталось меньше 10 человек, ждем
-    if (mode === '5v5' && queue.length < modeConfig.maxPlayers) return;
-    // Если для FFA очередь пуста, выходим
-    if (mode === 'ffa' && queue.length === 0) return;
-  }
-  
-  // 2. Создаем новую комнату
-  if (mode === 'ffa') {
-    if (queue.length > 0) createNewRoom(mode, queue);
     return;
   }
   
-  // Для 5v5 ждем полного заполнения (10 человек) для НОВОЙ комнаты
-  if (queue.length < modeConfig.maxPlayers) return;
-  
-  createNewRoom(mode, queue);
+  if (mode === '5v5') {
+    if (queue.length >= modeConfig.maxPlayers) {
+      createNewRoom(mode, queue);
+    }
+    broadcastQueuesStatus();
+    return;
+  }
 }
 
 function createNewRoom(mode, queue) {
@@ -192,32 +148,30 @@ function createNewRoom(mode, queue) {
   const roomId = `room_${roomCounter++}`;
   const room = {
     id: roomId,
-    mode: mode,
+    mode,
     players: new Map(),
     status: 'playing',
     scores: mode === '5v5' ? { 1: 0, 2: 0 } : {},
     killsToWin: modeConfig.killsToWin,
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    endGameTimeout: null
   };
   
   gameRooms.set(roomId, room);
-  console.log(`🎮 ${mode} game started: ${roomId}`);
   
   const playersToAdd = Math.min(queue.length, modeConfig.maxPlayers);
   for (let i = 0; i < playersToAdd; i++) {
-    const playerData = queue.shift();
-    addPlayerToRoom(playerData, room);
+    addPlayerToRoom(queue.shift(), room);
   }
   
   broadcastQueuesStatus();
 }
 
-// Обработать конец игры
 function handleGameEnd(roomId, winnerData) {
   const room = gameRooms.get(roomId);
   if (!room) return;
   
-  console.log(`🏆 Game ended: ${roomId}, winner:`, winnerData);
+  if (room.endGameTimeout) clearTimeout(room.endGameTimeout);
   
   io.to(roomId).emit('gameEnded', {
     winner: winnerData,
@@ -225,12 +179,10 @@ function handleGameEnd(roomId, winnerData) {
     players: Array.from(room.players.values())
   });
   
-  setTimeout(() => {
+  room.endGameTimeout = setTimeout(() => {
     const players = Array.from(room.players.values());
     room.players.clear();
     gameRooms.delete(roomId);
-    
-    console.log(`🔄 Returning ${players.length} players to lobby`);
     
     const lobbyId = getOrCreateLobby();
     const lobby = lobbies.get(lobbyId);
@@ -244,31 +196,19 @@ function handleGameEnd(roomId, winnerData) {
       
       const resetPlayer = {
         ...player,
-        position: { 
-          x: Math.random() * 30 - 15,
-          y: 1, 
-          z: Math.random() * 30 - 15
-        },
+        position: { x: Math.random() * 30 - 15, y: 1, z: Math.random() * 30 - 15 },
         rotation: { x: 0, y: 0, z: 0 },
-        health: 100,
-        kills: 0,
-        deaths: 0,
-        team: 0,
-        isAlive: true
+        health: 100, kills: 0, deaths: 0, team: 0, isAlive: true
       };
       
       lobby.players.set(player.id, resetPlayer);
       socket.join(lobbyId);
       socket.lobbyId = lobbyId;
       
-      console.log(`✅ Player ${player.username} returned to lobby ${lobbyId} (total: ${lobby.players.size})`);
-      
       socket.emit('returnedToLobby', {
-        lobbyId,
-        player: resetPlayer,
+        lobbyId, player: resetPlayer,
         players: Array.from(lobby.players.values()),
-        queues: getQueuesStatus(),
-        gameRooms: getGameRoomsStatus()
+        queues: getQueuesStatus()
       });
       
       socket.to(lobbyId).emit('playerJoinedLobby', resetPlayer);
@@ -278,32 +218,21 @@ function handleGameEnd(roomId, winnerData) {
   }, 5000);
 }
 
-// Отправить статус очередей всем в лобби
 function broadcastQueuesStatus() {
   const queuesStatus = getQueuesStatus();
-  const roomsStatus = getGameRoomsStatus();
-  
   lobbies.forEach(lobby => {
     lobby.players.forEach((p, pid) => {
       const s = io.sockets.sockets.get(pid);
-      if (s) {
-        s.emit('queuesStatusUpdate', queuesStatus);
-        s.emit('gameRoomsStatusUpdate', roomsStatus);
-      }
+      if (s) s.emit('queuesStatusUpdate', queuesStatus);
     });
   });
 }
 
 io.on('connection', (socket) => {
-  console.log(`🔌 Player connected: ${socket.id}`);
-
   socket.on('joinLobby', (data) => {
     if (socket.lobbyId && lobbies.has(socket.lobbyId)) {
       const existingLobby = lobbies.get(socket.lobbyId);
-      if (existingLobby.players.has(socket.id)) {
-        console.log(`⚠️ Player ${data.username} already in lobby ${socket.lobbyId}`);
-        return;
-      }
+      if (existingLobby.players.has(socket.id)) return;
     }
     
     const lobbyId = getOrCreateLobby();
@@ -314,16 +243,9 @@ io.on('connection', (socket) => {
       wallet: data.wallet,
       username: data.username || `Player_${socket.id.substring(0, 4)}`,
       team: 0,
-      position: { 
-        x: Math.random() * 30 - 15,
-        y: 1, 
-        z: Math.random() * 30 - 15
-      },
+      position: { x: Math.random() * 30 - 15, y: 1, z: Math.random() * 30 - 15 },
       rotation: { x: 0, y: 0, z: 0 },
-      health: 100,
-      kills: 0,
-      deaths: 0,
-      isAlive: true
+      health: 100, kills: 0, deaths: 0, isAlive: true
     };
     
     lobby.players.set(player.id, player);
@@ -331,35 +253,35 @@ io.on('connection', (socket) => {
     socket.lobbyId = lobbyId;
     socket.roomId = null;
     
-    let queuePosition = null;
-    let queueMode = null;
-    for (const [mode, queue] of Object.entries(queues)) {
-      const idx = queue.findIndex(p => p.socketId === socket.id);
-      if (idx !== -1) {
-        queuePosition = idx + 1;
-        queueMode = mode;
-        break;
-      }
-    }
-    
-    console.log(`✅ Player ${player.username} joined lobby ${lobbyId} (total: ${lobby.players.size})`);
-    
     socket.emit('lobbyJoined', {
-      lobbyId,
-      player,
+      lobbyId, player,
       players: Array.from(lobby.players.values()),
-      queues: getQueuesStatus(),
-      gameRooms: getGameRoomsStatus(),
-      queuePosition,
-      queueMode
+      queues: getQueuesStatus()
     });
     
     socket.to(lobbyId).emit('playerJoinedLobby', player);
   });
 
+  socket.on('joinGameRoom', (data) => {
+    if (!socket.roomId) return;
+    
+    const room = gameRooms.get(socket.roomId);
+    if (!room) return;
+    
+    const player = room.players.get(socket.id);
+    if (!player) return;
+    
+    socket.emit('joinedGameRoom', {
+      roomId: room.id,
+      mode: room.mode,
+      player: player,
+      players: Array.from(room.players.values()),
+      scores: room.scores
+    });
+  });
+
   socket.on('lobbyMove', (data) => {
     if (!socket.lobbyId) return;
-    
     const lobby = lobbies.get(socket.lobbyId);
     if (!lobby) return;
     
@@ -370,41 +292,24 @@ io.on('connection', (socket) => {
     player.rotation = data.rotation;
     
     socket.to(socket.lobbyId).emit('playerMovedInLobby', {
-      id: socket.id,
-      position: data.position,
-      rotation: data.rotation
+      id: socket.id, position: data.position, rotation: data.rotation
     });
   });
 
   socket.on('joinQueue', (data) => {
     const mode = data.mode;
-    if (!MODES[mode]) {
-      socket.emit('queueError', 'Invalid game mode');
-      return;
-    }
+    if (!MODES[mode]) return socket.emit('queueError', 'Invalid game mode');
     
     for (const [m, queue] of Object.entries(queues)) {
       if (queue.some(p => p.socketId === socket.id)) {
-        socket.emit('queueError', `You are already in ${m} queue`);
-        return;
+        return socket.emit('queueError', `You are already in ${m} queue`);
       }
     }
     
-    if (socket.roomId) {
-      socket.emit('queueError', 'You are already in a game');
-      return;
-    }
+    if (socket.roomId) return socket.emit('queueError', 'You are already in a game');
     
-    queues[mode].push({
-      socketId: socket.id,
-      wallet: data.wallet,
-      username: data.username
-    });
-    
-    const position = queues[mode].length;
-    socket.emit('joinedQueue', { mode, position });
-    
-    console.log(`📋 Player ${data.username} joined ${mode} queue at position ${position}`);
+    queues[mode].push({ socketId: socket.id, wallet: data.wallet, username: data.username });
+    socket.emit('joinedQueue', { mode, position: queues[mode].length });
     
     tryStartGame(mode);
     broadcastQueuesStatus();
@@ -416,13 +321,6 @@ io.on('connection', (socket) => {
       if (index !== -1) {
         queue.splice(index, 1);
         socket.emit('leftQueue');
-        
-        queue.forEach((p, i) => {
-          const s = io.sockets.sockets.get(p.socketId);
-          if (s) s.emit('queuePositionUpdate', { position: i + 1 });
-        });
-        
-        console.log(`📋 Player left ${mode} queue`);
         broadcastQueuesStatus();
         return;
       }
@@ -438,13 +336,27 @@ io.on('connection', (socket) => {
     const player = room.players.get(socket.id);
     if (!player || !player.isAlive) return;
     
-    player.position = data.position;
+    const oldPos = player.position;
+    const newPos = data.position;
+    const dx = newPos.x - oldPos.x;
+    const dz = newPos.z - oldPos.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    const timeDelta = (Date.now() - (player.lastMoveTime || Date.now())) / 1000;
+    
+    if (timeDelta > 0) {
+      const speed = dist / timeDelta;
+      if (speed > MAX_SPEED) {
+        socket.emit('positionCorrection', { position: oldPos, rotation: player.rotation });
+        return;
+      }
+    }
+    
+    player.position = newPos;
     player.rotation = data.rotation;
+    player.lastMoveTime = Date.now();
     
     socket.to(socket.roomId).emit('playerMoved', {
-      id: socket.id,
-      position: data.position,
-      rotation: data.rotation
+      id: socket.id, position: newPos, rotation: data.rotation
     });
   });
 
@@ -458,9 +370,7 @@ io.on('connection', (socket) => {
     if (!shooter || !shooter.isAlive) return;
     
     socket.to(socket.roomId).emit('playerShot', {
-      shooterId: socket.id,
-      origin: data.origin,
-      direction: data.direction
+      shooterId: socket.id, origin: data.origin, direction: data.direction
     });
     
     const hitPlayer = room.players.get(data.targetId);
@@ -477,19 +387,12 @@ io.on('connection', (socket) => {
           hitPlayer.deaths++;
           shooter.kills++;
           
-          if (room.mode === '5v5') {
-            room.scores[shooter.team]++;
-          } else {
-            room.scores[shooter.id] = shooter.kills;
-          }
+          if (room.mode === '5v5') room.scores[shooter.team]++;
+          else room.scores[shooter.id] = shooter.kills;
           
           io.to(socket.roomId).emit('playerKilled', {
-            killerId: shooter.id,
-            killerName: shooter.username,
-            victimId: hitPlayer.id,
-            victimName: hitPlayer.username,
-            scores: room.scores,
-            killerKills: shooter.kills
+            killerId: shooter.id, victimId: hitPlayer.id,
+            scores: room.scores, killerKills: shooter.kills
           });
           
           let winner = null;
@@ -508,56 +411,40 @@ io.on('connection', (socket) => {
             return;
           }
           
-          setTimeout(() => {
+          if (hitPlayer.respawnTimeout) clearTimeout(hitPlayer.respawnTimeout);
+          
+          hitPlayer.respawnTimeout = setTimeout(() => {
             if (!room.players.has(hitPlayer.id)) return;
             
             hitPlayer.health = 100;
             hitPlayer.isAlive = true;
+            hitPlayer.respawnTimeout = null;
             
             if (room.mode === '5v5') {
-              hitPlayer.position = { 
-                x: hitPlayer.team === 1 ? -20 : 20, 
-                y: 1, 
-                z: Math.random() * 10 - 5 
-              };
+              hitPlayer.position = { x: hitPlayer.team === 1 ? -20 : 20, y: 1, z: Math.random() * 10 - 5 };
             } else {
               const angle = Math.random() * Math.PI * 2;
               const radius = 20 + Math.random() * 10;
-              hitPlayer.position = { 
-                x: Math.cos(angle) * radius, 
-                y: 1, 
-                z: Math.sin(angle) * radius 
-              };
+              hitPlayer.position = { x: Math.cos(angle) * radius, y: 1, z: Math.sin(angle) * radius };
             }
             
             io.to(socket.roomId).emit('playerRespawned', {
-              id: hitPlayer.id,
-              position: hitPlayer.position
+              id: hitPlayer.id, position: hitPlayer.position
             });
           }, 3000);
         }
         
         io.to(socket.roomId).emit('playerHit', {
-          targetId: hitPlayer.id,
-          damage: data.damage || 25,
-          health: hitPlayer.health
+          targetId: hitPlayer.id, damage: data.damage || 25, health: hitPlayer.health
         });
       }
     }
   });
 
   socket.on('disconnect', () => {
-    console.log(`🔌 Player disconnected: ${socket.id}`);
-    
     for (const [mode, queue] of Object.entries(queues)) {
       const index = queue.findIndex(p => p.socketId === socket.id);
-      if (index !== -1) {
-        queue.splice(index, 1);
-        queue.forEach((p, i) => {
-          const s = io.sockets.sockets.get(p.socketId);
-          if (s) s.emit('queuePositionUpdate', { position: i + 1 });
-        });
-      }
+      if (index !== -1) queue.splice(index, 1);
     }
     
     if (socket.lobbyId) {
@@ -565,25 +452,27 @@ io.on('connection', (socket) => {
       if (lobby) {
         lobby.players.delete(socket.id);
         socket.to(socket.lobbyId).emit('playerLeftLobby', socket.id);
-        
-        console.log(`📤 Player left lobby ${socket.lobbyId} (remaining: ${lobby.players.size})`);
-        
-        if (lobby.players.size === 0 && lobby.id !== MAIN_LOBBY_ID) {
-          lobbies.delete(socket.lobbyId);
-          console.log(`🗑️ Empty lobby deleted: ${socket.lobbyId}`);
-        }
       }
     }
     
     if (socket.roomId) {
       const room = gameRooms.get(socket.roomId);
       if (room) {
+        const player = room.players.get(socket.id);
+        if (player && player.respawnTimeout) {
+          clearTimeout(player.respawnTimeout);
+          player.respawnTimeout = null;
+        }
+        
         room.players.delete(socket.id);
         socket.to(socket.roomId).emit('playerLeft', socket.id);
         
         if (room.players.size === 0) {
+          if (room.endGameTimeout) {
+            clearTimeout(room.endGameTimeout);
+            room.endGameTimeout = null;
+          }
           gameRooms.delete(socket.roomId);
-          console.log(`🗑️ Empty game room deleted: ${socket.roomId}`);
         }
       }
     }
@@ -592,25 +481,5 @@ io.on('connection', (socket) => {
   });
 });
 
-app.get('/health', (req, res) => {
-  const totalPlayers = 
-    Array.from(lobbies.values()).reduce((sum, lobby) => sum + lobby.players.size, 0) +
-    Array.from(gameRooms.values()).reduce((sum, room) => sum + room.players.size, 0);
-  
-  res.json({ 
-    status: 'ok', 
-    lobbies: lobbies.size,
-    gameRooms: gameRooms.size,
-    queues: {
-      '5v5': queues['5v5'].length,
-      'ffa': queues['ffa'].length
-    },
-    totalPlayers
-  });
-});
-
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`🚀 Game server running on port ${PORT}`);
-  console.log(`🎮 Modes: 5v5 (${MODES['5v5'].maxPlayers} players), FFA (${MODES['ffa'].maxPlayers} players)`);
-});
+server.listen(PORT, () => console.log(`🚀 Game server running on port ${PORT}`));
