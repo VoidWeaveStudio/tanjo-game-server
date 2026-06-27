@@ -19,7 +19,7 @@ const MODES = {
   'ffa': { maxPlayers: 20, playersPerTeam: 1, killsToWin: 50, teamBased: false }
 };
 
-const MAX_SPEED = 15;
+const MAX_SPEED = 25;
 const MAX_WEAPON_RANGE_SQ = 10000;
 const SHOOT_COOLDOWN_MS = 100;
 const MAIN_LOBBY_ID = 'main_lobby';
