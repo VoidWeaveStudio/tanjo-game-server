@@ -26,6 +26,35 @@ const gameRooms = new Map();
 const queues = { '5v5': [], 'ffa': [] };
 let roomCounter = 1;
 
+const SPAWN_POINTS = {
+  team1: [
+    { x: -20, z: -50 },
+    { x: -15, z: -50 },
+    { x: -25, z: -50 },
+    { x: -18, z: -48 },
+    { x: -22, z: -48 }
+  ],
+  team2: [
+    { x: 20, z: -50 },
+    { x: 15, z: -50 },
+    { x: 25, z: -50 },
+    { x: 18, z: -48 },
+    { x: 22, z: -48 }
+  ],
+  ffa: [
+    { x: 0, z: -45 },
+    { x: -10, z: -40 },
+    { x: 10, z: -40 },
+    { x: -20, z: -35 },
+    { x: 20, z: -35 },
+    { x: -30, z: -30 },
+    { x: 30, z: -30 },
+    { x: 0, z: -30 },
+    { x: -15, z: -25 },
+    { x: 15, z: -25 }
+  ]
+};
+
 function getOrCreateLobby() {
   if (!lobbies.has(MAIN_LOBBY_ID)) {
     lobbies.set(MAIN_LOBBY_ID, { id: MAIN_LOBBY_ID, players: new Map() });
@@ -49,6 +78,29 @@ function findAvailableRoom(mode) {
   return null;
 }
 
+function getSafeSpawnPoint(mode, team, usedPositions = []) {
+  let spawnPoints;
+  
+  if (mode === '5v5') {
+    spawnPoints = team === 1 ? SPAWN_POINTS.team1 : SPAWN_POINTS.team2;
+  } else {
+    spawnPoints = SPAWN_POINTS.ffa;
+  }
+
+  for (const point of spawnPoints) {
+    const isUsed = usedPositions.some(pos => 
+      Math.abs(pos.x - point.x) < 2 && Math.abs(pos.z - point.z) < 2
+    );
+    
+    if (!isUsed) {
+      return { x: point.x, y: 1, z: point.z };
+    }
+  }
+
+  const randomPoint = spawnPoints[Math.floor(Math.random() * spawnPoints.length)];
+  return { x: randomPoint.x, y: 1, z: randomPoint.z };
+}
+
 function addPlayerToRoom(playerData, room) {
   const socket = io.sockets.sockets.get(playerData.socketId);
   if (!socket) return false;
@@ -70,17 +122,19 @@ function addPlayerToRoom(playerData, room) {
   let rotation = { x: 0, y: 0, z: 0 };
   
   const modeConfig = MODES[room.mode];
-  const index = room.players.size; 
+  const index = room.players.size;
   
   if (room.mode === '5v5') {
     team = index < modeConfig.playersPerTeam ? 1 : 2;
-    position = { x: team === 1 ? -20 : 20, y: 1, z: (index % 5) * 2 - 4 };
+    const usedPositions = Array.from(room.players.values())
+      .filter(p => p.team === team)
+      .map(p => p.position);
+    position = getSafeSpawnPoint(room.mode, team, usedPositions);
     rotation = { x: 0, y: team === 1 ? 0 : Math.PI, z: 0 };
   } else if (room.mode === 'ffa') {
-    const angle = (index / modeConfig.maxPlayers) * Math.PI * 2;
-    const radius = 25;
-    position = { x: Math.cos(angle) * radius, y: 1, z: Math.sin(angle) * radius };
-    rotation = { x: 0, y: -angle + Math.PI, z: 0 };
+    const usedPositions = Array.from(room.players.values()).map(p => p.position);
+    position = getSafeSpawnPoint(room.mode, 0, usedPositions);
+    rotation = { x: 0, y: Math.random() * Math.PI * 2, z: 0 };
   }
   
   const player = {
@@ -94,8 +148,8 @@ function addPlayerToRoom(playerData, room) {
     kills: 0,
     deaths: 0,
     isAlive: true,
-    lastMoveTime: Date.now(),  
-    respawnTimeout: null 
+    lastMoveTime: Date.now(),
+    respawnTimeout: null
   };
   
   room.players.set(player.id, player);
@@ -330,51 +384,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('changeUsername', (data) => {
-    const newUsername = data.username?.trim();
-    if (!newUsername || newUsername.length === 0 || newUsername.length > 20) {
-      socket.emit('usernameError', 'Invalid username (1-20 characters)');
-      return;
-    }
-
-    if (socket.lobbyId) {
-      const lobby = lobbies.get(socket.lobbyId);
-      if (lobby) {
-        const player = lobby.players.get(socket.id);
-        if (player) {
-          player.username = newUsername;
-          socket.to(socket.lobbyId).emit('playerUsernameChanged', {
-            id: socket.id,
-            username: newUsername
-          });
-        }
-      }
-    }
-
-    if (socket.roomId) {
-      const room = gameRooms.get(socket.roomId);
-      if (room) {
-        const player = room.players.get(socket.id);
-        if (player) {
-          player.username = newUsername;
-          socket.to(socket.roomId).emit('playerUsernameChanged', {
-            id: socket.id,
-            username: newUsername
-          });
-        }
-      }
-    }
-
-    for (const [mode, queue] of Object.entries(queues)) {
-      const playerInQueue = queue.find(p => p.socketId === socket.id);
-      if (playerInQueue) {
-        playerInQueue.username = newUsername;
-      }
-    }
-
-    console.log(`✅ Player ${socket.id} changed username to: ${newUsername}`);
-  });
-
   socket.on('playerMove', (data) => {
     if (!socket.roomId) return;
     
@@ -468,12 +477,14 @@ io.on('connection', (socket) => {
             hitPlayer.isAlive = true;
             hitPlayer.respawnTimeout = null;
             
+            const usedPositions = Array.from(room.players.values())
+              .filter(p => p.id !== hitPlayer.id && p.isAlive)
+              .map(p => p.position);
+            
             if (room.mode === '5v5') {
-              hitPlayer.position = { x: hitPlayer.team === 1 ? -20 : 20, y: 1, z: Math.random() * 10 - 5 };
+              hitPlayer.position = getSafeSpawnPoint(room.mode, hitPlayer.team, usedPositions);
             } else {
-              const angle = Math.random() * Math.PI * 2;
-              const radius = 20 + Math.random() * 10;
-              hitPlayer.position = { x: Math.cos(angle) * radius, y: 1, z: Math.sin(angle) * radius };
+              hitPlayer.position = getSafeSpawnPoint(room.mode, 0, usedPositions);
             }
             
             io.to(socket.roomId).emit('playerRespawned', {
@@ -487,6 +498,51 @@ io.on('connection', (socket) => {
         });
       }
     }
+  });
+
+  socket.on('changeUsername', (data) => {
+    const newUsername = data.username?.trim();
+    if (!newUsername || newUsername.length === 0 || newUsername.length > 20) {
+      socket.emit('usernameError', 'Invalid username (1-20 characters)');
+      return;
+    }
+
+    if (socket.lobbyId) {
+      const lobby = lobbies.get(socket.lobbyId);
+      if (lobby) {
+        const player = lobby.players.get(socket.id);
+        if (player) {
+          player.username = newUsername;
+          socket.to(socket.lobbyId).emit('playerUsernameChanged', {
+            id: socket.id,
+            username: newUsername
+          });
+        }
+      }
+    }
+
+    if (socket.roomId) {
+      const room = gameRooms.get(socket.roomId);
+      if (room) {
+        const player = room.players.get(socket.id);
+        if (player) {
+          player.username = newUsername;
+          socket.to(socket.roomId).emit('playerUsernameChanged', {
+            id: socket.id,
+            username: newUsername
+          });
+        }
+      }
+    }
+
+    for (const [mode, queue] of Object.entries(queues)) {
+      const playerInQueue = queue.find(p => p.socketId === socket.id);
+      if (playerInQueue) {
+        playerInQueue.username = newUsername;
+      }
+    }
+
+    console.log(`✅ Player ${socket.id} changed username to: ${newUsername}`);
   });
 
   socket.on('disconnect', () => {
