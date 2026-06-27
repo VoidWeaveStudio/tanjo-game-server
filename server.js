@@ -1,4 +1,3 @@
-//server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -126,6 +125,10 @@ function tryStartGame(mode) {
     if (existingRoom && queue.length > 0) {
       while (queue.length > 0 && existingRoom.players.size < modeConfig.maxPlayers) {
         addPlayerToRoom(queue.shift(), existingRoom);
+      }
+      
+      if (queue.length > 0) {
+        createNewRoom(mode, queue);
       }
     } else if (queue.length > 0) {
       createNewRoom(mode, queue);
@@ -325,6 +328,51 @@ io.on('connection', (socket) => {
         return;
       }
     }
+  });
+
+  socket.on('changeUsername', (data) => {
+    const newUsername = data.username?.trim();
+    if (!newUsername || newUsername.length === 0 || newUsername.length > 20) {
+      socket.emit('usernameError', 'Invalid username (1-20 characters)');
+      return;
+    }
+
+    if (socket.lobbyId) {
+      const lobby = lobbies.get(socket.lobbyId);
+      if (lobby) {
+        const player = lobby.players.get(socket.id);
+        if (player) {
+          player.username = newUsername;
+          socket.to(socket.lobbyId).emit('playerUsernameChanged', {
+            id: socket.id,
+            username: newUsername
+          });
+        }
+      }
+    }
+
+    if (socket.roomId) {
+      const room = gameRooms.get(socket.roomId);
+      if (room) {
+        const player = room.players.get(socket.id);
+        if (player) {
+          player.username = newUsername;
+          socket.to(socket.roomId).emit('playerUsernameChanged', {
+            id: socket.id,
+            username: newUsername
+          });
+        }
+      }
+    }
+
+    for (const [mode, queue] of Object.entries(queues)) {
+      const playerInQueue = queue.find(p => p.socketId === socket.id);
+      if (playerInQueue) {
+        playerInQueue.username = newUsername;
+      }
+    }
+
+    console.log(`✅ Player ${socket.id} changed username to: ${newUsername}`);
   });
 
   socket.on('playerMove', (data) => {
