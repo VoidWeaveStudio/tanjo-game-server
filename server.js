@@ -633,7 +633,8 @@ io.on('connection', (socket) => {
       username: (typeof data.username === 'string' ? data.username : player.username).substring(0, 20),
       message: messageText,
       timestamp: Date.now(),
-      team: player.team
+      team: player.team,
+      isTeamChat: data.isTeamChat === true
     };
 
     if (data.isTeamChat && room.mode === '5v5') {
