@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const { RateLimiterMemory } = require('rate-limiter-flexible');
 
 const app = express();
 app.use(cors());
@@ -9,21 +10,36 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: '*',
+    origin: process.env.CLIENT_URL || '*',
     methods: ['GET', 'POST']
-  }
+  },
+  pingTimeout: 10000,
+  pingInterval: 5000
 });
+
+const rateLimiter = new RateLimiterMemory({
+  points: 60,      
+  duration: 1     
+});
+
+const shootRateLimiter = new RateLimiterMemory({
+  points: 10,       
+  duration: 1      
+});
+
 
 const MODES = {
   '5v5': { maxPlayers: 10, playersPerTeam: 5, killsToWin: 50, teamBased: true, matchDuration: 600000 },
   'ffa': { maxPlayers: 20, playersPerTeam: 1, killsToWin: 50, teamBased: false, matchDuration: 600000 }
 };
 
-const MAX_SPEED = 25;
-const MAX_WEAPON_RANGE_SQ = 10000;
+const MAX_SPEED = 25;             
+const MAX_WEAPON_RANGE_SQ = 10000; 
 const SHOOT_COOLDOWN_MS = 120;
 const MAIN_LOBBY_ID = 'main_lobby';
 const SPAWN_PROTECTION_MS = 3000;
+const FIXED_DAMAGE = 25;          
+
 const lobbies = new Map();
 const gameRooms = new Map();
 const queues = { '5v5': [], 'ffa': [] };
@@ -35,13 +51,16 @@ const SPAWN_POINTS = {
     { x: -18, z: -48 }, { x: -22, z: -48 }
   ],
   team2: [
-    { x: 20, z: -50 }, { x: 15, z: -50 }, { x: 25, z: -50 },
-    { x: 18, z: -48 }, { x: 22, z: -48 }
+    { x: 20, z: 55 }, { x: 15, z: 55 }, { x: 25, z: 55 },
+    { x: 18, z: 53 }, { x: 22, z: 53 }
   ],
   ffa: [
     { x: 0, z: -45 }, { x: -10, z: -40 }, { x: 10, z: -40 },
     { x: -20, z: -35 }, { x: 20, z: -35 }, { x: -30, z: -30 },
-    { x: 30, z: -30 }, { x: 0, z: -30 }, { x: -15, z: -25 }, { x: 15, z: -25 }
+    { x: 30, z: -30 }, { x: 0, z: -30 }, { x: -15, z: -25 }, { x: 15, z: -25 },
+    { x: -40, z: -20 }, { x: 40, z: -20 }, { x: -50, z: -10 },
+    { x: 50, z: -10 }, { x: -45, z: 0 }, { x: 45, z: 0 },
+    { x: -35, z: 10 }, { x: 35, z: 10 }, { x: -25, z: 20 }, { x: 25, z: 20 }
   ]
 };
 
@@ -49,6 +68,79 @@ const LOBBY_SPAWN_POINTS = [
   { x: -10, z: -10 }, { x: 10, z: -10 }, { x: -10, z: 10 }, { x: 10, z: 10 },
   { x: 0, z: -15 }, { x: 0, z: 15 }, { x: -15, z: 0 }, { x: 15, z: 0 }
 ];
+
+function rayIntersectsAABB(
+  ox, oy, oz, dx, dy, dz,
+  minX, minY, minZ, maxX, maxY, maxZ
+) {
+  let tmin = -Infinity;
+  let tmax = Infinity;
+
+  if (Math.abs(dx) > 1e-8) {
+    const t1 = (minX - ox) / dx;
+    const t2 = (maxX - ox) / dx;
+    tmin = Math.max(tmin, Math.min(t1, t2));
+    tmax = Math.min(tmax, Math.max(t1, t2));
+  } else {
+    if (ox < minX || ox > maxX) return null;
+  }
+
+  if (Math.abs(dy) > 1e-8) {
+    const t1 = (minY - oy) / dy;
+    const t2 = (maxY - oy) / dy;
+    tmin = Math.max(tmin, Math.min(t1, t2));
+    tmax = Math.min(tmax, Math.max(t1, t2));
+  } else {
+    if (oy < minY || oy > maxY) return null;
+  }
+
+  if (Math.abs(dz) > 1e-8) {
+    const t1 = (minZ - oz) / dz;
+    const t2 = (maxZ - oz) / dz;
+    tmin = Math.max(tmin, Math.min(t1, t2));
+    tmax = Math.min(tmax, Math.max(t1, t2));
+  } else {
+    if (oz < minZ || oz > maxZ) return null;
+  }
+
+  if (tmax < 0 || tmin > tmax) return null;
+  
+  return tmin >= 0 ? tmin : tmax;
+}
+
+function serverSideRaycast(origin, direction, players, shooterId) {
+  const { x: ox, y: oy, z: oz } = origin;
+  const len = Math.sqrt(direction.x ** 2 + direction.y ** 2 + direction.z ** 2);
+  if (len < 0.001) return null;
+  const dx = direction.x / len;
+  const dy = direction.y / len;
+  const dz = direction.z / len;
+
+  let closestPlayer = null;
+  let closestDist = Infinity;
+
+  for (const [id, player] of players) {
+    if (id === shooterId || !player.isAlive) continue;
+
+    const px = player.position.x;
+    const py = player.position.y || 0;
+    const pz = player.position.z;
+    
+    const dist = rayIntersectsAABB(
+      ox, oy, oz, dx, dy, dz,
+      px - 0.4, py, pz - 0.4,
+      px + 0.4, py + 1.8, pz + 0.4
+    );
+
+    if (dist !== null && dist < closestDist) {
+      closestDist = dist;
+      closestPlayer = player;
+    }
+  }
+
+  return closestPlayer;
+}
+
 
 function getOrCreateLobby() {
   if (!lobbies.has(MAIN_LOBBY_ID)) {
@@ -85,9 +177,7 @@ function getSafeSpawnPoint(mode, team, usedPositions = []) {
     const isUsed = usedPositions.some(pos =>
       Math.abs(pos.x - point.x) < 2 && Math.abs(pos.z - point.z) < 2
     );
-    if (!isUsed) {
-      return { x: point.x, y: 1, z: point.z };
-    }
+    if (!isUsed) return { x: point.x, y: 1, z: point.z };
   }
 
   const randomPoint = spawnPoints[Math.floor(Math.random() * spawnPoints.length)];
@@ -99,9 +189,7 @@ function getLobbySpawnPoint(usedPositions = []) {
     const isUsed = usedPositions.some(pos =>
       Math.abs(pos.x - point.x) < 3 && Math.abs(pos.z - point.z) < 3
     );
-    if (!isUsed) {
-      return { x: point.x, y: 1, z: point.z };
-    }
+    if (!isUsed) return { x: point.x, y: 1, z: point.z };
   }
   const randomPoint = LOBBY_SPAWN_POINTS[Math.floor(Math.random() * LOBBY_SPAWN_POINTS.length)];
   return { x: randomPoint.x, y: 1, z: randomPoint.z };
@@ -121,6 +209,30 @@ function validatePosition(data) {
   if (data.position[1] < 0 || data.position[1] > 50) return false;
   
   return true;
+}
+
+function validateShoot(data) {
+  if (!data || typeof data !== 'object') return false;
+  
+  if (!data.origin || typeof data.origin !== 'object') return false;
+  const { x: ox, y: oy, z: oz } = data.origin;
+  if (!isFinite(ox) || !isFinite(oy) || !isFinite(oz)) return false;
+  if (Math.abs(ox) > 150 || Math.abs(oy) > 50 || Math.abs(oz) > 150) return false;
+  
+  if (!data.direction || typeof data.direction !== 'object') return false;
+  const { x: dx, y: dy, z: dz } = data.direction;
+  if (!isFinite(dx) || !isFinite(dy) || !isFinite(dz)) return false;
+  const len = Math.sqrt(dx*dx + dy*dy + dz*dz);
+  if (len < 0.8 || len > 1.2) return false;
+  
+  return true;
+}
+
+function unpackMoveData(data) {
+  return {
+    position: { x: data.position[0], y: data.position[1], z: data.position[2] },
+    rotation: { x: data.rotation[0], y: data.rotation[1], z: data.rotation[2] }
+  };
 }
 
 function addPlayerToRoom(playerData, room) {
@@ -188,7 +300,8 @@ function addPlayerToRoom(playerData, room) {
     player,
     players: Array.from(room.players.values()),
     scores: room.scores,
-    matchEndTime: room.matchEndTime
+    matchEndTime: room.matchEndTime,
+    spawnProtectionUntil: player.spawnProtectionUntil
   });
 
   socket.to(room.id).emit(room.mode === 'ffa' ? 'playerJoinedFFAGame' : 'playerJoinedGame', player);
@@ -205,9 +318,7 @@ function tryStartGame(mode) {
       while (queue.length > 0 && existingRoom.players.size < modeConfig.maxPlayers) {
         addPlayerToRoom(queue.shift(), existingRoom);
       }
-      if (queue.length > 0) {
-        createNewRoom(mode, queue);
-      }
+      if (queue.length > 0) createNewRoom(mode, queue);
     } else if (queue.length > 0) {
       createNewRoom(mode, queue);
     }
@@ -264,13 +375,9 @@ function handleMatchTimeout(roomId) {
   if (room.mode === '5v5') {
     const team1Score = room.scores[1] || 0;
     const team2Score = room.scores[2] || 0;
-    if (team1Score > team2Score) {
-      winner = { type: 'team', team: 1 };
-    } else if (team2Score > team1Score) {
-      winner = { type: 'team', team: 2 };
-    } else {
-      winner = { type: 'draw' };
-    }
+    if (team1Score > team2Score) winner = { type: 'team', team: 1 };
+    else if (team2Score > team1Score) winner = { type: 'team', team: 2 };
+    else winner = { type: 'draw' };
   } else {
     let maxKills = 0;
     let topPlayer = null;
@@ -354,13 +461,6 @@ function broadcastQueuesStatus() {
   });
 }
 
-function unpackMoveData(data) {
-  return {
-    position: { x: data.position[0], y: data.position[1], z: data.position[2] },
-    rotation: { x: data.rotation[0], y: data.rotation[1], z: data.rotation[2] }
-  };
-}
-
 function returnPlayerToLobby(socket, playerData = null) {
   const lobbyId = getOrCreateLobby();
   const lobby = lobbies.get(lobbyId);
@@ -377,10 +477,7 @@ function returnPlayerToLobby(socket, playerData = null) {
     team: 0,
     position: spawnPoint,
     rotation: { x: 0, y: 0, z: 0 },
-    health: 100,
-    kills: 0,
-    deaths: 0,
-    isAlive: true
+    health: 100, kills: 0, deaths: 0, isAlive: true
   };
 
   if (lobby.players.has(socket.id)) {
@@ -402,7 +499,20 @@ function returnPlayerToLobby(socket, playerData = null) {
   });
 }
 
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
+  socket.use(async ([event, data], next) => {
+    try {
+      if (event === 'shoot') {
+        await shootRateLimiter.consume(socket.id);
+      } else {
+        await rateLimiter.consume(socket.id);
+      }
+      next();
+    } catch (rlRejected) {
+      console.warn(`⚠️ Rate limit exceeded for ${socket.id} on ${event}`);
+    }
+  });
+
   socket.on('joinLobby', (data) => {
     if (socket.lobbyId && lobbies.has(socket.lobbyId)) {
       const existingLobby = lobbies.get(socket.lobbyId);
@@ -454,7 +564,8 @@ io.on('connection', (socket) => {
       player: player,
       players: Array.from(room.players.values()),
       scores: room.scores,
-      matchEndTime: room.matchEndTime
+      matchEndTime: room.matchEndTime,
+      spawnProtectionUntil: player.spawnProtectionUntil
     });
   });
 
@@ -475,7 +586,8 @@ io.on('connection', (socket) => {
     socket.to(socket.lobbyId).emit('playerMovedInLobby', {
       id: socket.id,
       position: [unpacked.position.x, unpacked.position.y, unpacked.position.z],
-      rotation: [unpacked.rotation.x, unpacked.rotation.y, unpacked.rotation.z]
+      rotation: [unpacked.rotation.x, unpacked.rotation.y, unpacked.rotation.z],
+      serverTime: Date.now() 
     });
   });
 
@@ -533,7 +645,8 @@ io.on('connection', (socket) => {
     if (timeDelta > 0 && distSq > maxDistSq * 1.5) {
       socket.emit('positionCorrection', {
         position: [oldPos.x, oldPos.y, oldPos.z],
-        rotation: [player.rotation.x, player.rotation.y, player.rotation.z]
+        rotation: [player.rotation.x, player.rotation.y, player.rotation.z],
+        serverTime: Date.now()
       });
       return;
     }
@@ -545,12 +658,18 @@ io.on('connection', (socket) => {
     socket.to(socket.roomId).emit('playerMoved', {
       id: socket.id,
       position: [newPos.x, newPos.y, newPos.z],
-      rotation: [unpacked.rotation.x, unpacked.rotation.y, unpacked.rotation.z]
+      rotation: [unpacked.rotation.x, unpacked.rotation.y, unpacked.rotation.z],
+      serverTime: Date.now()
     });
   });
 
   socket.on('shoot', (data) => {
     if (!socket.roomId) return;
+
+    if (!validateShoot(data)) {
+      console.warn(`⚠️ Invalid shoot data from ${socket.id}`);
+      return;
+    }
 
     const room = gameRooms.get(socket.roomId);
     if (!room || room.status !== 'playing') return;
@@ -564,95 +683,101 @@ io.on('connection', (socket) => {
     }
     shooter.lastShotTime = now;
 
+    const damage = FIXED_DAMAGE;
+
     socket.to(socket.roomId).emit('playerShot', {
       shooterId: socket.id,
       origin: data.origin,
       direction: data.direction
     });
 
-    const hitPlayer = room.players.get(data.targetId);
+    const hitPlayer = serverSideRaycast(
+      data.origin, 
+      data.direction, 
+      room.players, 
+      shooter.id
+    );
 
-    if (hitPlayer && hitPlayer.isAlive) {
+    if (hitPlayer) {
       if (now < hitPlayer.spawnProtectionUntil) {
         return;
       }
 
       const isFriendlyFire = room.mode === '5v5' && hitPlayer.team === shooter.team;
+      if (isFriendlyFire) return;
 
-      if (!isFriendlyFire) {
-        const dx = hitPlayer.position.x - shooter.position.x;
-        const dz = hitPlayer.position.z - shooter.position.z;
-        const distSq = dx * dx + dz * dz;
+      const pdx = hitPlayer.position.x - shooter.position.x;
+      const pdz = hitPlayer.position.z - shooter.position.z;
+      const distSq = pdx * pdx + pdz * pdz;
+      if (distSq > MAX_WEAPON_RANGE_SQ) return;
 
-        if (distSq > MAX_WEAPON_RANGE_SQ) {
+      hitPlayer.health -= damage;
+
+      if (hitPlayer.health <= 0) {
+        hitPlayer.health = 0;
+        hitPlayer.isAlive = false;
+        hitPlayer.deaths++;
+        shooter.kills++;
+
+        if (room.mode === '5v5') room.scores[shooter.team]++;
+        else room.scores[shooter.id] = shooter.kills;
+
+        io.to(socket.roomId).emit('playerKilled', {
+          killerId: shooter.id, 
+          victimId: hitPlayer.id,
+          scores: room.scores, 
+          killerKills: shooter.kills
+        });
+
+        let winner = null;
+        if (room.mode === '5v5') {
+          if (room.scores[shooter.team] >= room.killsToWin) {
+            winner = { type: 'team', team: shooter.team };
+          }
+        } else {
+          if (shooter.kills >= room.killsToWin) {
+            winner = { type: 'player', playerId: shooter.id, username: shooter.username };
+          }
+        }
+
+        if (winner) {
+          handleGameEnd(socket.roomId, winner);
           return;
         }
 
-        const damage = 25;
-        hitPlayer.health -= damage;
+        if (hitPlayer.respawnTimeout) clearTimeout(hitPlayer.respawnTimeout);
 
-        if (hitPlayer.health <= 0) {
-          hitPlayer.health = 0;
-          hitPlayer.isAlive = false;
-          hitPlayer.deaths++;
-          shooter.kills++;
+        hitPlayer.respawnTimeout = setTimeout(() => {
+          if (!room.players.has(hitPlayer.id)) return;
 
-          if (room.mode === '5v5') room.scores[shooter.team]++;
-          else room.scores[shooter.id] = shooter.kills;
+          hitPlayer.health = 100;
+          hitPlayer.isAlive = true;
+          hitPlayer.respawnTimeout = null;
+          hitPlayer.spawnProtectionUntil = Date.now() + SPAWN_PROTECTION_MS;
 
-          io.to(socket.roomId).emit('playerKilled', {
-            killerId: shooter.id, victimId: hitPlayer.id,
-            scores: room.scores, killerKills: shooter.kills
+          const usedPositions = Array.from(room.players.values())
+            .filter(p => p.id !== hitPlayer.id && p.isAlive)
+            .map(p => p.position);
+
+          hitPlayer.position = getSafeSpawnPoint(
+            room.mode, 
+            room.mode === '5v5' ? hitPlayer.team : 0, 
+            usedPositions
+          );
+
+          io.to(socket.roomId).emit('playerRespawned', {
+            id: hitPlayer.id,
+            position: [hitPlayer.position.x, hitPlayer.position.y, hitPlayer.position.z],
+            spawnProtectionUntil: hitPlayer.spawnProtectionUntil
           });
-
-          let winner = null;
-          if (room.mode === '5v5') {
-            if (room.scores[shooter.team] >= room.killsToWin) {
-              winner = { type: 'team', team: shooter.team };
-            }
-          } else {
-            if (shooter.kills >= room.killsToWin) {
-              winner = { type: 'player', playerId: shooter.id, username: shooter.username };
-            }
-          }
-
-          if (winner) {
-            handleGameEnd(socket.roomId, winner);
-            return;
-          }
-
-          if (hitPlayer.respawnTimeout) clearTimeout(hitPlayer.respawnTimeout);
-
-          hitPlayer.respawnTimeout = setTimeout(() => {
-            if (!room.players.has(hitPlayer.id)) return;
-
-            hitPlayer.health = 100;
-            hitPlayer.isAlive = true;
-            hitPlayer.respawnTimeout = null;
-            hitPlayer.spawnProtectionUntil = Date.now() + SPAWN_PROTECTION_MS;
-
-            const usedPositions = Array.from(room.players.values())
-              .filter(p => p.id !== hitPlayer.id && p.isAlive)
-              .map(p => p.position);
-
-            if (room.mode === '5v5') {
-              hitPlayer.position = getSafeSpawnPoint(room.mode, hitPlayer.team, usedPositions);
-            } else {
-              hitPlayer.position = getSafeSpawnPoint(room.mode, 0, usedPositions);
-            }
-
-            io.to(socket.roomId).emit('playerRespawned', {
-              id: hitPlayer.id,
-              position: [hitPlayer.position.x, hitPlayer.position.y, hitPlayer.position.z],
-              spawnProtectionUntil: hitPlayer.spawnProtectionUntil
-            });
-          }, 3000);
-        }
-
-        io.to(socket.roomId).emit('playerHit', {
-          targetId: hitPlayer.id, damage: damage, health: hitPlayer.health
-        });
+        }, 3000);
       }
+
+      io.to(socket.roomId).emit('playerHit', {
+        targetId: hitPlayer.id, 
+        damage: damage, 
+        health: hitPlayer.health
+      });
     }
   });
 
@@ -689,28 +814,22 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('startVoiceChat', (data) => {
+  socket.on('startVoiceChat', () => {
     if (!socket.roomId) return;
-    const room = gameRooms.get(socket.roomId);
-    if (!room || room.status !== 'playing') return;
-
     socket.to(socket.roomId).emit('playerTalking', {
-      playerId: socket.id,
-      isTalking: true
+      playerId: socket.id, isTalking: true
     });
   });
 
-  socket.on('stopVoiceChat', (data) => {
+  socket.on('stopVoiceChat', () => {
     if (!socket.roomId) return;
     socket.to(socket.roomId).emit('playerTalking', {
-      playerId: socket.id,
-      isTalking: false
+      playerId: socket.id, isTalking: false
     });
   });
 
   socket.on('voiceSignal', (data) => {
     if (!data || !data.targetId) return;
-    
     const targetSocket = io.sockets.sockets.get(data.targetId);
     if (targetSocket) {
       targetSocket.emit('voiceSignal', {
@@ -724,9 +843,7 @@ io.on('connection', (socket) => {
 
   socket.on('leaveGame', (data) => {
     if (!socket.roomId) {
-      if (!socket.lobbyId) {
-        returnPlayerToLobby(socket, data);
-      }
+      if (!socket.lobbyId) returnPlayerToLobby(socket, data);
       return;
     }
 
@@ -743,31 +860,17 @@ io.on('connection', (socket) => {
       room.players.delete(socket.id);
       socket.leave(oldRoomId);
       socket.to(oldRoomId).emit('playerLeft', socket.id);
-
-      socket.to(oldRoomId).emit('playerTalking', {
-        playerId: socket.id,
-        isTalking: false
-      });
+      socket.to(oldRoomId).emit('playerTalking', { playerId: socket.id, isTalking: false });
 
       if (room.players.size === 0) {
-        if (room.endGameTimeout) {
-          clearTimeout(room.endGameTimeout);
-          room.endGameTimeout = null;
-        }
-        if (room.matchTimer) {
-          clearTimeout(room.matchTimer);
-          room.matchTimer = null;
-        }
+        if (room.endGameTimeout) clearTimeout(room.endGameTimeout);
+        if (room.matchTimer) clearTimeout(room.matchTimer);
         gameRooms.delete(oldRoomId);
-        console.log(`🗑️ Empty room ${oldRoomId} deleted`);
       }
     }
 
     socket.roomId = null;
-
     returnPlayerToLobby(socket, player);
-
-    console.log(`✅ Player ${socket.id} left room ${oldRoomId} and returned to lobby`);
   });
 
   socket.on('changeUsername', (data) => {
@@ -805,12 +908,8 @@ io.on('connection', (socket) => {
 
     for (const [mode, queue] of Object.entries(queues)) {
       const playerInQueue = queue.find(p => p.socketId === socket.id);
-      if (playerInQueue) {
-        playerInQueue.username = newUsername;
-      }
+      if (playerInQueue) playerInQueue.username = newUsername;
     }
-
-    console.log(`✅ Player ${socket.id} changed username to: ${newUsername}`);
   });
 
   socket.on('disconnect', () => {
@@ -838,21 +937,11 @@ io.on('connection', (socket) => {
 
         room.players.delete(socket.id);
         socket.to(socket.roomId).emit('playerLeft', socket.id);
-
-        socket.to(socket.roomId).emit('playerTalking', {
-          playerId: socket.id,
-          isTalking: false
-        });
+        socket.to(socket.roomId).emit('playerTalking', { playerId: socket.id, isTalking: false });
 
         if (room.players.size === 0) {
-          if (room.endGameTimeout) {
-            clearTimeout(room.endGameTimeout);
-            room.endGameTimeout = null;
-          }
-          if (room.matchTimer) {
-            clearTimeout(room.matchTimer);
-            room.matchTimer = null;
-          }
+          if (room.endGameTimeout) clearTimeout(room.endGameTimeout);
+          if (room.matchTimer) clearTimeout(room.matchTimer);
           gameRooms.delete(socket.roomId);
         }
       }
