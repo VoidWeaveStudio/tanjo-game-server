@@ -18,13 +18,13 @@ const io = new Server(server, {
 });
 
 const rateLimiter = new RateLimiterMemory({
-  points: 60,      
-  duration: 1     
+  points: 60,
+  duration: 1
 });
 
 const shootRateLimiter = new RateLimiterMemory({
-  points: 10,       
-  duration: 1      
+  points: 10,
+  duration: 1
 });
 
 
@@ -33,12 +33,12 @@ const MODES = {
   'ffa': { maxPlayers: 20, playersPerTeam: 1, killsToWin: 50, teamBased: false, matchDuration: 600000 }
 };
 
-const MAX_SPEED = 25;             
-const MAX_WEAPON_RANGE_SQ = 10000; 
+const MAX_SPEED = 25;
+const MAX_WEAPON_RANGE_SQ = 10000;
 const SHOOT_COOLDOWN_MS = 120;
 const MAIN_LOBBY_ID = 'main_lobby';
 const SPAWN_PROTECTION_MS = 3000;
-const FIXED_DAMAGE = 25;          
+const FIXED_DAMAGE = 25;
 
 const lobbies = new Map();
 const gameRooms = new Map();
@@ -104,7 +104,7 @@ function rayIntersectsAABB(
   }
 
   if (tmax < 0 || tmin > tmax) return null;
-  
+
   return tmin >= 0 ? tmin : tmax;
 }
 
@@ -125,7 +125,7 @@ function serverSideRaycast(origin, direction, players, shooterId) {
     const px = player.position.x;
     const py = player.position.y || 0;
     const pz = player.position.z;
-    
+
     const dist = rayIntersectsAABB(
       ox, oy, oz, dx, dy, dz,
       px - 0.4, py, pz - 0.4,
@@ -199,32 +199,32 @@ function validatePosition(data) {
   if (!data || typeof data !== 'object') return false;
   if (!Array.isArray(data.position) || data.position.length !== 3) return false;
   if (!Array.isArray(data.rotation) || data.rotation.length !== 3) return false;
-  
+
   for (let i = 0; i < 3; i++) {
     if (typeof data.position[i] !== 'number' || !isFinite(data.position[i])) return false;
     if (typeof data.rotation[i] !== 'number' || !isFinite(data.rotation[i])) return false;
   }
-  
+
   if (Math.abs(data.position[0]) > 200 || Math.abs(data.position[2]) > 200) return false;
   if (data.position[1] < 0 || data.position[1] > 50) return false;
-  
+
   return true;
 }
 
 function validateShoot(data) {
   if (!data || typeof data !== 'object') return false;
-  
+
   if (!data.origin || typeof data.origin !== 'object') return false;
   const { x: ox, y: oy, z: oz } = data.origin;
   if (!isFinite(ox) || !isFinite(oy) || !isFinite(oz)) return false;
   if (Math.abs(ox) > 150 || Math.abs(oy) > 50 || Math.abs(oz) > 150) return false;
-  
+
   if (!data.direction || typeof data.direction !== 'object') return false;
   const { x: dx, y: dy, z: dz } = data.direction;
   if (!isFinite(dx) || !isFinite(dy) || !isFinite(dz)) return false;
-  const len = Math.sqrt(dx*dx + dy*dy + dz*dz);
+  const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
   if (len < 0.8 || len > 1.2) return false;
-  
+
   return true;
 }
 
@@ -339,7 +339,7 @@ function createNewRoom(mode, queue) {
   const modeConfig = MODES[mode];
   const roomId = `room_${roomCounter++}`;
   const matchEndTime = Date.now() + modeConfig.matchDuration;
-  
+
   const room = {
     id: roomId,
     mode,
@@ -464,7 +464,7 @@ function broadcastQueuesStatus() {
 function returnPlayerToLobby(socket, playerData = null) {
   const lobbyId = getOrCreateLobby();
   const lobby = lobbies.get(lobbyId);
-  
+
   const usedPositions = Array.from(lobby.players.values())
     .filter(p => p.id !== socket.id)
     .map(p => p.position);
@@ -487,7 +487,7 @@ function returnPlayerToLobby(socket, playerData = null) {
     socket.join(lobbyId);
     socket.to(lobbyId).emit('playerJoinedLobby', resetPlayer);
   }
-  
+
   socket.lobbyId = lobbyId;
   socket.roomId = null;
 
@@ -587,7 +587,7 @@ io.on('connection', async (socket) => {
       id: socket.id,
       position: [unpacked.position.x, unpacked.position.y, unpacked.position.z],
       rotation: [unpacked.rotation.x, unpacked.rotation.y, unpacked.rotation.z],
-      serverTime: Date.now() 
+      serverTime: Date.now()
     });
   });
 
@@ -692,9 +692,9 @@ io.on('connection', async (socket) => {
     });
 
     const hitPlayer = serverSideRaycast(
-      data.origin, 
-      data.direction, 
-      room.players, 
+      data.origin,
+      data.direction,
+      room.players,
       shooter.id
     );
 
@@ -723,9 +723,9 @@ io.on('connection', async (socket) => {
         else room.scores[shooter.id] = shooter.kills;
 
         io.to(socket.roomId).emit('playerKilled', {
-          killerId: shooter.id, 
+          killerId: shooter.id,
           victimId: hitPlayer.id,
-          scores: room.scores, 
+          scores: room.scores,
           killerKills: shooter.kills
         });
 
@@ -760,8 +760,8 @@ io.on('connection', async (socket) => {
             .map(p => p.position);
 
           hitPlayer.position = getSafeSpawnPoint(
-            room.mode, 
-            room.mode === '5v5' ? hitPlayer.team : 0, 
+            room.mode,
+            room.mode === '5v5' ? hitPlayer.team : 0,
             usedPositions
           );
 
@@ -774,60 +774,84 @@ io.on('connection', async (socket) => {
       }
 
       io.to(socket.roomId).emit('playerHit', {
-        targetId: hitPlayer.id, 
-        damage: damage, 
+        targetId: hitPlayer.id,
+        damage: damage,
         health: hitPlayer.health
       });
     }
   });
 
   socket.on('chatMessage', (data) => {
-    if (!socket.roomId) return;
-    
-    const room = gameRooms.get(socket.roomId);
-    if (!room || room.status !== 'playing') return;
-
-    const player = room.players.get(socket.id);
-    if (!player) return;
+    const channelId = data.channelId;
+    if (!channelId) return;
 
     const messageText = typeof data.message === 'string' ? data.message.substring(0, 200).trim() : '';
     if (!messageText) return;
 
+    const isFromLobby = lobbies.has(channelId);
+    const isFromRoom = gameRooms.has(channelId);
+
+    if (!isFromLobby && !isFromRoom) return;
+
+    let username = `Player_${socket.id.substring(0, 4)}`;
+    let team = 0;
+
+    if (isFromRoom) {
+      const room = gameRooms.get(channelId);
+      const player = room?.players.get(socket.id);
+      if (!player) return;
+      username = player.username;
+      team = player.team;
+    } else if (isFromLobby) {
+      const lobby = lobbies.get(channelId);
+      const player = lobby?.players.get(socket.id);
+      if (player) username = player.username;
+    }
+
     const message = {
       id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      username: (typeof data.username === 'string' ? data.username : player.username).substring(0, 20),
+      username: username.substring(0, 20),
       message: messageText,
       timestamp: Date.now(),
-      team: player.team,
-      isTeamChat: data.isTeamChat === true
+      team: team,
+      isTeamChat: false
     };
 
-    if (data.isTeamChat && room.mode === '5v5') {
-      room.players.forEach((p, pid) => {
-        if (p.team === player.team) {
-          const s = io.sockets.sockets.get(pid);
-          if (s) s.emit('chatMessage', message);
-        }
-      });
-    } else {
-      io.to(socket.roomId).emit('chatMessage', message);
+    if (data.isTeamChat && isFromRoom) {
+      const room = gameRooms.get(channelId);
+      if (room && room.mode === '5v5') {
+        room.players.forEach((p, pid) => {
+          if (p.team === team) {
+            const s = io.sockets.sockets.get(pid);
+            if (s) s.emit('chatMessage', message);
+          }
+        });
+        return;
+      }
     }
+
+    io.to(channelId).emit('chatMessage', message);
   });
 
-  socket.on('startVoiceChat', () => {
-    if (!socket.roomId) return;
-    socket.to(socket.roomId).emit('playerTalking', {
-      playerId: socket.id, isTalking: true
+  socket.on('startVoiceChat', (data) => {
+    const channelId = data.channelId || socket.roomId || socket.lobbyId;
+    if (!channelId) return;
+
+    socket.to(channelId).emit('playerTalking', {
+      playerId: socket.id,
+      isTalking: true
     });
   });
 
-  socket.on('stopVoiceChat', () => {
-    if (!socket.roomId) return;
-    socket.to(socket.roomId).emit('playerTalking', {
-      playerId: socket.id, isTalking: false
+  socket.on('stopVoiceChat', (data) => {
+    const channelId = data.channelId || socket.roomId || socket.lobbyId;
+    if (!channelId) return;
+
+    socket.to(channelId).emit('playerTalking', {
+      playerId: socket.id,
+      isTalking: false
     });
   });
-
   socket.on('voiceSignal', (data) => {
     if (!data || !data.targetId) return;
     const targetSocket = io.sockets.sockets.get(data.targetId);
