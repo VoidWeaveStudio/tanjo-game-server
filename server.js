@@ -623,44 +623,62 @@ io.on('connection', async (socket) => {
   });
 
   socket.on('playerMove', (data) => {
-    if (!socket.roomId) return;
     if (!validatePosition(data)) return;
-
-    const room = gameRooms.get(socket.roomId);
-    if (!room || room.status !== 'playing') return;
-
-    const player = room.players.get(socket.id);
-    if (!player || !player.isAlive) return;
-
     const unpacked = unpackMoveData(data);
-    const oldPos = player.position;
-    const newPos = unpacked.position;
-    const dx = newPos.x - oldPos.x;
-    const dz = newPos.z - oldPos.z;
 
-    const distSq = dx * dx + dz * dz;
-    const timeDelta = (Date.now() - (player.lastMoveTime || Date.now())) / 1000;
-    const maxDistSq = timeDelta > 0 ? (MAX_SPEED * timeDelta) ** 2 : 0;
+    if (socket.roomId) {
+      const room = gameRooms.get(socket.roomId);
+      if (!room || room.status !== 'playing') return;
 
-    if (timeDelta > 0 && distSq > maxDistSq * 1.5) {
-      socket.emit('positionCorrection', {
-        position: [oldPos.x, oldPos.y, oldPos.z],
-        rotation: [player.rotation.x, player.rotation.y, player.rotation.z],
+      const player = room.players.get(socket.id);
+      if (!player || !player.isAlive) return;
+
+      const oldPos = player.position;
+      const newPos = unpacked.position;
+      const dx = newPos.x - oldPos.x;
+      const dz = newPos.z - oldPos.z;
+
+      const distSq = dx * dx + dz * dz;
+      const timeDelta = (Date.now() - (player.lastMoveTime || Date.now())) / 1000;
+      const maxDistSq = timeDelta > 0 ? (MAX_SPEED * timeDelta) ** 2 : 0;
+
+      if (timeDelta > 0 && distSq > maxDistSq * 1.5) {
+        socket.emit('positionCorrection', {
+          position: [oldPos.x, oldPos.y, oldPos.z],
+          rotation: [player.rotation.x, player.rotation.y, player.rotation.z],
+          serverTime: Date.now()
+        });
+        return;
+      }
+
+      player.position = newPos;
+      player.rotation = unpacked.rotation;
+      player.lastMoveTime = Date.now();
+
+      socket.to(socket.roomId).emit('playerMoved', {
+        id: socket.id,
+        position: [newPos.x, newPos.y, newPos.z],
+        rotation: [unpacked.rotation.x, unpacked.rotation.y, unpacked.rotation.z],
         serverTime: Date.now()
       });
-      return;
     }
+    else if (socket.lobbyId) {
+      const lobby = lobbies.get(socket.lobbyId);
+      if (!lobby) return;
 
-    player.position = newPos;
-    player.rotation = unpacked.rotation;
-    player.lastMoveTime = Date.now();
+      const player = lobby.players.get(socket.id);
+      if (!player) return;
 
-    socket.to(socket.roomId).emit('playerMoved', {
-      id: socket.id,
-      position: [newPos.x, newPos.y, newPos.z],
-      rotation: [unpacked.rotation.x, unpacked.rotation.y, unpacked.rotation.z],
-      serverTime: Date.now()
-    });
+      player.position = unpacked.position;
+      player.rotation = unpacked.rotation;
+
+      socket.to(socket.lobbyId).emit('playerMovedInLobby', {
+        id: socket.id,
+        position: [unpacked.position.x, unpacked.position.y, unpacked.position.z],
+        rotation: [unpacked.rotation.x, unpacked.rotation.y, unpacked.rotation.z],
+        serverTime: Date.now()
+      });
+    }
   });
 
   socket.on('shoot', (data) => {
