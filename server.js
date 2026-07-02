@@ -27,7 +27,6 @@ const shootRateLimiter = new RateLimiterMemory({
   duration: 1
 });
 
-
 const MODES = {
   '5v5': { maxPlayers: 10, playersPerTeam: 5, killsToWin: 50, teamBased: true, matchDuration: 600000 },
   'ffa': { maxPlayers: 20, playersPerTeam: 1, killsToWin: 50, teamBased: false, matchDuration: 600000 }
@@ -69,10 +68,7 @@ const LOBBY_SPAWN_POINTS = [
   { x: 0, z: -15 }, { x: 0, z: 15 }, { x: -15, z: 0 }, { x: 15, z: 0 }
 ];
 
-function rayIntersectsAABB(
-  ox, oy, oz, dx, dy, dz,
-  minX, minY, minZ, maxX, maxY, maxZ
-) {
+function rayIntersectsAABB(ox, oy, oz, dx, dy, dz, minX, minY, minZ, maxX, maxY, maxZ) {
   let tmin = -Infinity;
   let tmax = Infinity;
 
@@ -140,7 +136,6 @@ function serverSideRaycast(origin, direction, players, shooterId) {
 
   return closestPlayer;
 }
-
 
 function getOrCreateLobby() {
   if (!lobbies.has(MAIN_LOBBY_ID)) {
@@ -502,7 +497,7 @@ function returnPlayerToLobby(socket, playerData = null) {
 io.on('connection', async (socket) => {
   socket.use(async ([event, data], next) => {
     try {
-      if (event === 'shoot') {
+      if (event === 'shoot' || event === 'lobbyShoot') {
         await shootRateLimiter.consume(socket.id);
       } else {
         await rateLimiter.consume(socket.id);
@@ -672,8 +667,6 @@ io.on('connection', async (socket) => {
       player.position = unpacked.position;
       player.rotation = unpacked.rotation;
 
-      console.log('📤 [Server] Broadcasting playerMovedInLobby for:', socket.id);
-
       socket.to(socket.lobbyId).emit('playerMovedInLobby', {
         id: socket.id,
         position: [unpacked.position.x, unpacked.position.y, unpacked.position.z],
@@ -801,6 +794,82 @@ io.on('connection', async (socket) => {
     }
   });
 
+  socket.on('lobbyShoot', (data) => {
+    if (!socket.lobbyId) return;
+    
+    if (!validateShoot(data)) {
+      console.warn(`⚠️ Invalid lobby shoot data from ${socket.id}`);
+      return;
+    }
+
+    const lobby = lobbies.get(socket.lobbyId);
+    if (!lobby) return;
+
+    const shooter = lobby.players.get(socket.id);
+    if (!shooter) return;
+
+    const now = Date.now();
+    if (now - (shooter.lastShotTime || 0) < SHOOT_COOLDOWN_MS) {
+      return;
+    }
+    shooter.lastShotTime = now;
+
+    const hitPlayer = serverSideRaycast(
+      data.origin,
+      data.direction,
+      lobby.players,
+      shooter.id
+    );
+
+    socket.to(socket.lobbyId).emit('playerShotInLobby', {
+      shooterId: socket.id,
+      origin: data.origin,
+      direction: data.direction,
+      hitPlayerId: hitPlayer?.id || null
+    });
+
+    if (hitPlayer) {
+      io.to(socket.lobbyId).emit('playerHitInLobby', {
+        shooterId: socket.id,
+        targetId: hitPlayer.id,
+        damage: FIXED_DAMAGE
+      });
+    }
+  });
+
+  socket.on('lobbyBuild', (data) => {
+    if (!socket.lobbyId) return;
+    
+    const lobby = lobbies.get(socket.lobbyId);
+    if (!lobby) return;
+
+    const player = lobby.players.get(socket.id);
+    if (!player) return;
+
+    socket.to(socket.lobbyId).emit('playerBuildInLobby', {
+      playerId: socket.id,
+      action: data.action,
+      pieceType: data.pieceType,
+      position: data.position,
+      rotation: data.rotation
+    });
+  });
+
+  socket.on('lobbyEmote', (data) => {
+    if (!socket.lobbyId) return;
+    
+    const lobby = lobbies.get(socket.lobbyId);
+    if (!lobby) return;
+
+    const player = lobby.players.get(socket.id);
+    if (!player) return;
+
+    socket.to(socket.lobbyId).emit('playerEmoteInLobby', {
+      playerId: socket.id,
+      emoteId: data.emoteId
+    });
+  });
+
   socket.on('chatMessage', (data) => {
     const channelId = data.channelId;
     if (!channelId) return;
@@ -872,6 +941,7 @@ io.on('connection', async (socket) => {
       isTalking: false
     });
   });
+
   socket.on('voiceSignal', (data) => {
     if (!data || !data.targetId) return;
     const targetSocket = io.sockets.sockets.get(data.targetId);
