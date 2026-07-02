@@ -27,11 +27,11 @@ const shootRateLimiter = new RateLimiterMemory({
   duration: 1
 });
 
-const MAX_SPEED = 25;
 const SHOOT_COOLDOWN_MS = 120;
 const MAIN_LOBBY_ID = 'main_lobby';
 const MAX_LOBBY_PLAYERS = 100;
 const FIXED_DAMAGE = 25;
+const RESPAWN_TIME_MS = 3000;
 
 const lobbies = new Map();
 
@@ -178,9 +178,7 @@ io.on('connection', async (socket) => {
         await rateLimiter.consume(socket.id);
       }
       next();
-    } catch (rlRejected) {
-      console.warn(`⚠️ Rate limit exceeded for ${socket.id} on ${event}`);
-    }
+    } catch (rlRejected) {}
   });
 
   socket.on('joinLobby', (data) => {
@@ -231,7 +229,7 @@ io.on('connection', async (socket) => {
     if (!lobby) return;
 
     const player = lobby.players.get(socket.id);
-    if (!player) return;
+    if (!player || !player.isAlive) return;
 
     const unpacked = unpackMoveData(data);
     player.position = unpacked.position;
@@ -248,16 +246,13 @@ io.on('connection', async (socket) => {
   socket.on('lobbyShoot', (data) => {
     if (!socket.lobbyId) return;
     
-    if (!validateShoot(data)) {
-      console.warn(`⚠️ Invalid lobby shoot data from ${socket.id}`);
-      return;
-    }
+    if (!validateShoot(data)) return;
 
     const lobby = lobbies.get(socket.lobbyId);
     if (!lobby) return;
 
     const shooter = lobby.players.get(socket.id);
-    if (!shooter) return;
+    if (!shooter || !shooter.isAlive) return;
 
     const now = Date.now();
     if (now - (shooter.lastShotTime || 0) < SHOOT_COOLDOWN_MS) {
@@ -273,18 +268,57 @@ io.on('connection', async (socket) => {
     );
 
     socket.to(socket.lobbyId).emit('playerShotInLobby', {
-      shooterId: socket.id,
+      shooterId: shooter.id,
       origin: data.origin,
       direction: data.direction,
       hitPlayerId: hitPlayer?.id || null
     });
 
     if (hitPlayer) {
+      hitPlayer.health -= FIXED_DAMAGE;
+      
       io.to(socket.lobbyId).emit('playerHitInLobby', {
-        shooterId: socket.id,
+        shooterId: shooter.id,
         targetId: hitPlayer.id,
         damage: FIXED_DAMAGE
       });
+
+      io.to(socket.lobbyId).emit('playerHealthChanged', {
+        targetId: hitPlayer.id,
+        health: hitPlayer.health
+      });
+
+      if (hitPlayer.health <= 0) {
+        hitPlayer.health = 0;
+        hitPlayer.isAlive = false;
+        
+        io.to(socket.lobbyId).emit('playerDiedInLobby', {
+          targetId: hitPlayer.id,
+          killerId: shooter.id
+        });
+
+        setTimeout(() => {
+          const lobby = lobbies.get(socket.lobbyId);
+          if (lobby && lobby.players.has(hitPlayer.id)) {
+            const deadPlayer = lobby.players.get(hitPlayer.id);
+            if (!deadPlayer.isAlive) {
+              const usedPositions = Array.from(lobby.players.values()).map(p => p.position);
+              const spawnPoint = getLobbySpawnPoint(usedPositions);
+              deadPlayer.position = spawnPoint;
+              deadPlayer.rotation = { x: 0, y: 0, z: 0 };
+              deadPlayer.health = 100;
+              deadPlayer.isAlive = true;
+              
+              io.to(socket.lobbyId).emit('playerRespawnedInLobby', {
+                targetId: deadPlayer.id,
+                position: spawnPoint,
+                rotation: { x: 0, y: 0, z: 0 },
+                health: 100
+              });
+            }
+          }
+        }, RESPAWN_TIME_MS);
+      }
     }
   });
 
