@@ -1,4 +1,4 @@
-//server.js
+// server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -8,37 +8,37 @@ const { RateLimiterMemory } = require('rate-limiter-flexible');
 const app = express();
 app.use(cors());
 
+const lobbies = new Map();
+const MAIN_LOBBY_ID = 'main_lobby';
+
 app.get('/health', (req, res) => {
     res.json({ 
         status: 'ok', 
         timestamp: Date.now(),
         uptime: process.uptime(),
-        players: lobbies.get(MAIN_LOBBY_ID)?.players.size || 0
+        players: lobbies.get(MAIN_LOBBY_ID)?.players.size || 0,
+        lobbiesCount: lobbies.size
     });
 });
 
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { 
-    origin: process.env.CLIENT_URL ? process.env.CLIENT_URL.split(',') : '*', 
+    origin: process.env.CLIENT_URL ? process.env.CLIENT_URL.split(',').map(s => s.trim()) : true,
     methods: ['GET', 'POST'],
-    credentials: true
   },
-  pingTimeout: 10000,
-  pingInterval: 5000
+  pingTimeout: 20000,
+  pingInterval: 10000
 });
 
 const rateLimiter = new RateLimiterMemory({ points: 60, duration: 1 });
 const shootRateLimiter = new RateLimiterMemory({ points: 10, duration: 1 });
 
 const SHOOT_COOLDOWN_MS = 120;
-const MAIN_LOBBY_ID = 'main_lobby';
 const MAX_LOBBY_PLAYERS = 100;
 const FIXED_DAMAGE = 25;
 const RESPAWN_TIME_MS = 3000;
 const MAX_PLAYER_SPEED = 15;
-
-const lobbies = new Map();
 
 const LOBBY_SPAWN_POINTS = [
   { x: -10, z: -10 }, { x: 10, z: -10 }, { x: -10, z: 10 }, { x: 10, z: 10 },
@@ -162,19 +162,33 @@ function unpackMoveData(data) {
 }
 
 io.on('connection', async (socket) => {
+  console.log(`🔌 [${socket.id}] Connected from ${socket.handshake.address}`);
+
   socket.use(async ([event, data], next) => {
     try {
       if (event === 'lobbyShoot') await shootRateLimiter.consume(socket.id);
       else await rateLimiter.consume(socket.id);
       next();
-    } catch (rlRejected) {}
+    } catch (rlRejected) {
+      console.warn(`⚠️ [${socket.id}] Rate limited on event: ${event}`);
+    }
   });
 
   socket.on('joinLobby', (data) => {
+    console.log(`🎮 [${socket.id}] joinLobby received. Username: ${data?.username}, Wallet: ${data?.wallet?.substring(0, 8)}`);
+    
     const lobbyId = getOrCreateLobby();
     const lobby = lobbies.get(lobbyId);
-    if (lobby.players.size >= MAX_LOBBY_PLAYERS) { socket.emit('lobbyFull'); return; }
-    if (lobby.players.has(socket.id)) return;
+    
+    if (lobby.players.size >= MAX_LOBBY_PLAYERS) { 
+      console.log(`❌ [${socket.id}] Lobby full (${lobby.players.size}/${MAX_LOBBY_PLAYERS})`);
+      socket.emit('lobbyFull'); 
+      return; 
+    }
+    if (lobby.players.has(socket.id)) {
+      console.log(`⚠️ [${socket.id}] Already in lobby, skipping`);
+      return;
+    }
 
     const usedPositions = Array.from(lobby.players.values()).map(p => p.position);
     const spawnPoint = getLobbySpawnPoint(usedPositions);
@@ -198,6 +212,9 @@ io.on('connection', async (socket) => {
     socket.join(lobbyId);
     socket.lobbyId = lobbyId;
 
+    console.log(`✅ [${socket.id}] Added to lobby "${lobbyId}". Total players: ${lobby.players.size}`);
+    console.log(`📋 [${socket.id}] Spawn position:`, spawnPoint);
+
     socket.emit('lobbyJoined', {
       lobbyId, player,
       players: Array.from(lobby.players.values()),
@@ -205,10 +222,20 @@ io.on('connection', async (socket) => {
     });
     socket.to(lobbyId).emit('playerJoinedLobby', player);
     socket.to(lobbyId).emit('lobbyPlayersCount', lobby.players.size);
+    
+    console.log(`📤 [${socket.id}] Sent lobbyJoined to client with ${lobby.players.size} players`);
   });
 
   socket.on('playerMove', (data) => {
-    if (!socket.lobbyId || !validatePosition(data)) return;
+    if (!socket.lobbyId) {
+      console.warn(`⚠️ [${socket.id}] playerMove without lobbyId`);
+      return;
+    }
+    if (!validatePosition(data)) {
+      console.warn(`⚠️ [${socket.id}] Invalid position data`);
+      return;
+    }
+    
     const lobby = lobbies.get(socket.lobbyId);
     if (!lobby) return;
     const player = lobby.players.get(socket.id);
@@ -225,6 +252,7 @@ io.on('connection', async (socket) => {
         const speed = distance / dt;
 
         if (speed > MAX_PLAYER_SPEED) {
+            console.warn(`⚠️ [${socket.id}] Speed hack detected: ${speed.toFixed(2)} > ${MAX_PLAYER_SPEED}`);
             socket.emit('positionCorrection', {
                 position: [player.position.x, player.position.y, player.position.z],
                 rotation: [player.rotation.x, player.rotation.y, player.rotation.z]
@@ -270,6 +298,8 @@ io.on('connection', async (socket) => {
     const hitPlayer = serverSideRaycastWithLagComp(
         data.origin, data.direction, lobby.players, shooter.id, targetTime
     );
+
+    console.log(`🔫 [${socket.id}] Shot. Hit: ${hitPlayer?.id || 'none'}`);
 
     socket.to(socket.lobbyId).emit('playerShotInLobby', {
       shooterId: shooter.id, origin: data.origin, direction: data.direction,
@@ -386,7 +416,8 @@ io.on('connection', async (socket) => {
     }
   });
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', (reason) => {
+    console.log(`🔌 [${socket.id}] Disconnected: ${reason}`);
     if (socket.lobbyId) {
       const lobby = lobbies.get(socket.lobbyId);
       if (lobby) {
@@ -400,6 +431,7 @@ io.on('connection', async (socket) => {
         lobby.players.delete(socket.id);
         socket.to(socket.lobbyId).emit('playerLeftLobby', socket.id);
         socket.to(socket.lobbyId).emit('lobbyPlayersCount', lobby.players.size);
+        console.log(`📤 [${socket.id}] Removed from lobby. Remaining: ${lobby.players.size}`);
       }
     }
   });
