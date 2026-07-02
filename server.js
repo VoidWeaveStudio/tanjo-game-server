@@ -8,6 +8,15 @@ const { RateLimiterMemory } = require('rate-limiter-flexible');
 const app = express();
 app.use(cors());
 
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        timestamp: Date.now(),
+        uptime: process.uptime(),
+        players: lobbies.get(MAIN_LOBBY_ID)?.players.size || 0
+    });
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: process.env.CLIENT_URL || '*', methods: ['GET', 'POST'] },
