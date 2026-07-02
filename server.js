@@ -19,7 +19,11 @@ app.get('/health', (req, res) => {
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: process.env.CLIENT_URL || '*', methods: ['GET', 'POST'] },
+  cors: { 
+    origin: process.env.CLIENT_URL ? process.env.CLIENT_URL.split(',') : '*', 
+    methods: ['GET', 'POST'],
+    credentials: true
+  },
   pingTimeout: 10000,
   pingInterval: 5000
 });
