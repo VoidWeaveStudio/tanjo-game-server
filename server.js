@@ -672,6 +672,8 @@ io.on('connection', async (socket) => {
       player.position = unpacked.position;
       player.rotation = unpacked.rotation;
 
+      console.log('📤 [Server] Broadcasting playerMovedInLobby for:', socket.id);
+
       socket.to(socket.lobbyId).emit('playerMovedInLobby', {
         id: socket.id,
         position: [unpacked.position.x, unpacked.position.y, unpacked.position.z],
