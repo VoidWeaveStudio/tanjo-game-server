@@ -31,8 +31,9 @@ const io = new Server(server, {
   pingInterval: 10000
 });
 
-const rateLimiter = new RateLimiterMemory({ points: 60, duration: 1 });
+const moveRateLimiter = new RateLimiterMemory({ points: 100, duration: 1 });
 const shootRateLimiter = new RateLimiterMemory({ points: 10, duration: 1 });
+const generalRateLimiter = new RateLimiterMemory({ points: 30, duration: 1 });
 
 const SHOOT_COOLDOWN_MS = 120;
 const MAX_LOBBY_PLAYERS = 100;
@@ -166,8 +167,13 @@ io.on('connection', async (socket) => {
 
   socket.use(async ([event, data], next) => {
     try {
-      if (event === 'lobbyShoot') await shootRateLimiter.consume(socket.id);
-      else await rateLimiter.consume(socket.id);
+      if (event === 'lobbyShoot') {
+        await shootRateLimiter.consume(socket.id);
+      } else if (event === 'playerMove') {
+        await moveRateLimiter.consume(socket.id);
+      } else if (event !== 'joinLobby' && event !== 'disconnect') {
+        await generalRateLimiter.consume(socket.id);
+      }
       next();
     } catch (rlRejected) {
       console.warn(`⚠️ [${socket.id}] Rate limited on event: ${event}`);
