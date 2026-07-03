@@ -1,447 +1,679 @@
-// server.js
-const express = require('express');
+//server.js
+
+const WebSocket = require('ws');
 const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
-const { RateLimiterMemory } = require('rate-limiter-flexible');
-
-const app = express();
-app.use(cors());
-
-const lobbies = new Map();
-const MAIN_LOBBY_ID = 'main_lobby';
-
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        timestamp: Date.now(),
-        uptime: process.uptime(),
-        players: lobbies.get(MAIN_LOBBY_ID)?.players.size || 0,
-        lobbiesCount: lobbies.size
-    });
-});
-
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { 
-    origin: process.env.CLIENT_URL ? process.env.CLIENT_URL.split(',').map(s => s.trim()) : true,
-    methods: ['GET', 'POST'],
-  },
-  pingTimeout: 20000,
-  pingInterval: 10000
-});
-
-const moveRateLimiter = new RateLimiterMemory({ points: 100, duration: 1 });
-const shootRateLimiter = new RateLimiterMemory({ points: 10, duration: 1 });
-const generalRateLimiter = new RateLimiterMemory({ points: 30, duration: 1 });
-
-const SHOOT_COOLDOWN_MS = 120;
-const MAX_LOBBY_PLAYERS = 100;
-const FIXED_DAMAGE = 25;
-const RESPAWN_TIME_MS = 3000;
-const MAX_PLAYER_SPEED = 15;
-
-const LOBBY_SPAWN_POINTS = [
-  { x: -10, z: -10 }, { x: 10, z: -10 }, { x: -10, z: 10 }, { x: 10, z: 10 },
-  { x: 0, z: -15 }, { x: 0, z: 15 }, { x: -15, z: 0 }, { x: 15, z: 0 },
-  { x: -20, z: -20 }, { x: 20, z: -20 }, { x: -20, z: 20 }, { x: 20, z: 20 },
-  { x: -5, z: -5 }, { x: 5, z: -5 }, { x: -5, z: 5 }, { x: 5, z: 5 }
-];
-
-function rayIntersectsAABB(ox, oy, oz, dx, dy, dz, minX, minY, minZ, maxX, maxY, maxZ) {
-  let tmin = -Infinity, tmax = Infinity;
-  if (Math.abs(dx) > 1e-8) {
-    const t1 = (minX - ox) / dx, t2 = (maxX - ox) / dx;
-    tmin = Math.max(tmin, Math.min(t1, t2)); tmax = Math.min(tmax, Math.max(t1, t2));
-  } else { if (ox < minX || ox > maxX) return null; }
-  if (Math.abs(dy) > 1e-8) {
-    const t1 = (minY - oy) / dy, t2 = (maxY - oy) / dy;
-    tmin = Math.max(tmin, Math.min(t1, t2)); tmax = Math.min(tmax, Math.max(t1, t2));
-  } else { if (oy < minY || oy > maxY) return null; }
-  if (Math.abs(dz) > 1e-8) {
-    const t1 = (minZ - oz) / dz, t2 = (maxZ - oz) / dz;
-    tmin = Math.max(tmin, Math.min(t1, t2)); tmax = Math.min(tmax, Math.max(t1, t2));
-  } else { if (oz < minZ || oz > maxZ) return null; }
-  if (tmax < 0 || tmin > tmax) return null;
-  return tmin >= 0 ? tmin : tmax;
-}
-
-function getPositionAtTime(player, targetTime) {
-    const history = player.positionHistory;
-    if (!history || history.length === 0) return player.position;
-    if (history[0].time >= targetTime) return history[0].pos;
-    if (history[history.length - 1].time <= targetTime) return history[history.length - 1].pos;
-
-    for (let i = 0; i < history.length - 1; i++) {
-        const older = history[i];
-        const newer = history[i + 1];
-        if (older.time <= targetTime && newer.time >= targetTime) {
-            const t = (targetTime - older.time) / (newer.time - older.time);
-            return {
-                x: older.pos.x + (newer.pos.x - older.pos.x) * t,
-                y: older.pos.y + (newer.pos.y - older.pos.y) * t,
-                z: older.pos.z + (newer.pos.z - older.pos.z) * t
-            };
-        }
-    }
-    return player.position;
-}
-
-function serverSideRaycastWithLagComp(origin, direction, players, shooterId, targetTime) {
-    const { x: ox, y: oy, z: oz } = origin;
-    const len = Math.sqrt(direction.x ** 2 + direction.y ** 2 + direction.z ** 2);
-    if (len < 0.001) return null;
-    const dx = direction.x / len, dy = direction.y / len, dz = direction.z / len;
-
-    let closestPlayer = null, closestDist = Infinity;
-
-    for (const [id, player] of players) {
-        if (id === shooterId || !player.isAlive) continue;
-        
-        const pastPos = getPositionAtTime(player, targetTime);
-        const px = pastPos.x, py = pastPos.y || 0, pz = pastPos.z;
-
-        const dist = rayIntersectsAABB(
-            ox, oy, oz, dx, dy, dz,
-            px - 0.4, py, pz - 0.4, px + 0.4, py + 1.8, pz + 0.4
-        );
-
-        if (dist !== null && dist < closestDist) {
-            closestDist = dist;
-            closestPlayer = player;
-        }
-    }
-    return closestPlayer;
-}
-
-function getOrCreateLobby() {
-  if (!lobbies.has(MAIN_LOBBY_ID)) lobbies.set(MAIN_LOBBY_ID, { id: MAIN_LOBBY_ID, players: new Map() });
-  return MAIN_LOBBY_ID;
-}
-
-function getLobbySpawnPoint(usedPositions = []) {
-  for (const point of LOBBY_SPAWN_POINTS) {
-    const isUsed = usedPositions.some(pos => Math.abs(pos.x - point.x) < 3 && Math.abs(pos.z - point.z) < 3);
-    if (!isUsed) return { x: point.x, y: 1, z: point.z };
-  }
-  const randomPoint = LOBBY_SPAWN_POINTS[Math.floor(Math.random() * LOBBY_SPAWN_POINTS.length)];
-  return { x: randomPoint.x, y: 1, z: randomPoint.z };
-}
-
-function validatePosition(data) {
-  if (!data || typeof data !== 'object') return false;
-  if (!Array.isArray(data.position) || data.position.length !== 3) return false;
-  if (!Array.isArray(data.rotation) || data.rotation.length !== 3) return false;
-  for (let i = 0; i < 3; i++) {
-    if (typeof data.position[i] !== 'number' || !isFinite(data.position[i])) return false;
-    if (typeof data.rotation[i] !== 'number' || !isFinite(data.rotation[i])) return false;
-  }
-  if (Math.abs(data.position[0]) > 200 || Math.abs(data.position[2]) > 200) return false;
-  if (data.position[1] < 0 || data.position[1] > 50) return false;
-  return true;
-}
-
-function validateShoot(data) {
-  if (!data || typeof data !== 'object') return false;
-  if (!data.origin || typeof data.origin !== 'object') return false;
-  const { x: ox, y: oy, z: oz } = data.origin;
-  if (!isFinite(ox) || !isFinite(oy) || !isFinite(oz)) return false;
-  if (Math.abs(ox) > 150 || Math.abs(oy) > 50 || Math.abs(oz) > 150) return false;
-  if (!data.direction || typeof data.direction !== 'object') return false;
-  const { x: dx, y: dy, z: dz } = data.direction;
-  if (!isFinite(dx) || !isFinite(dy) || !isFinite(dz)) return false;
-  const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  if (len < 0.8 || len > 1.2) return false;
-  return true;
-}
-
-function unpackMoveData(data) {
-  return {
-    position: { x: data.position[0], y: data.position[1], z: data.position[2] },
-    rotation: { x: data.rotation[0], y: data.rotation[1], z: data.rotation[2] }
-  };
-}
-
-io.on('connection', async (socket) => {
-  console.log(`🔌 [${socket.id}] Connected from ${socket.handshake.address}`);
-
-  socket.use(async ([event, data], next) => {
-    try {
-      if (event === 'lobbyShoot') {
-        await shootRateLimiter.consume(socket.id);
-      } else if (event === 'playerMove') {
-        await moveRateLimiter.consume(socket.id);
-      } else if (event !== 'joinLobby' && event !== 'disconnect') {
-        await generalRateLimiter.consume(socket.id);
-      }
-      next();
-    } catch (rlRejected) {
-      console.warn(`⚠️ [${socket.id}] Rate limited on event: ${event}`);
-    }
-  });
-
-  socket.on('joinLobby', (data) => {
-    console.log(`🎮 [${socket.id}] joinLobby received. Username: ${data?.username}, Wallet: ${data?.wallet?.substring(0, 8)}`);
-    
-    const lobbyId = getOrCreateLobby();
-    const lobby = lobbies.get(lobbyId);
-    
-    if (lobby.players.size >= MAX_LOBBY_PLAYERS) { 
-      console.log(`❌ [${socket.id}] Lobby full (${lobby.players.size}/${MAX_LOBBY_PLAYERS})`);
-      socket.emit('lobbyFull'); 
-      return; 
-    }
-    if (lobby.players.has(socket.id)) {
-      console.log(`⚠️ [${socket.id}] Already in lobby, skipping`);
-      return;
-    }
-
-    const usedPositions = Array.from(lobby.players.values()).map(p => p.position);
-    const spawnPoint = getLobbySpawnPoint(usedPositions);
-
-    const player = {
-      id: socket.id,
-      wallet: data.wallet,
-      username: data.username || `Player_${socket.id.substring(0, 4)}`,
-      position: spawnPoint,
-      rotation: { x: 0, y: 0, z: 0 },
-      health: 100,
-      isAlive: true,
-      lastShotTime: 0,
-      respawnTimeoutId: null,
-      lastMoveTime: Date.now(),
-      positionHistory: [],     
-      velocity: { x: 0, z: 0 }
-    };
-
-    lobby.players.set(player.id, player);
-    socket.join(lobbyId);
-    socket.lobbyId = lobbyId;
-
-    console.log(`✅ [${socket.id}] Added to lobby "${lobbyId}". Total players: ${lobby.players.size}`);
-    console.log(`📋 [${socket.id}] Spawn position:`, spawnPoint);
-
-    socket.emit('lobbyJoined', {
-      lobbyId, player,
-      players: Array.from(lobby.players.values()),
-      playersCount: lobby.players.size
-    });
-    socket.to(lobbyId).emit('playerJoinedLobby', player);
-    socket.to(lobbyId).emit('lobbyPlayersCount', lobby.players.size);
-    
-    console.log(`📤 [${socket.id}] Sent lobbyJoined to client with ${lobby.players.size} players`);
-  });
-
-  socket.on('playerMove', (data) => {
-    if (!socket.lobbyId) {
-      console.warn(`⚠️ [${socket.id}] playerMove without lobbyId`);
-      return;
-    }
-    if (!validatePosition(data)) {
-      console.warn(`⚠️ [${socket.id}] Invalid position data`);
-      return;
-    }
-    
-    const lobby = lobbies.get(socket.lobbyId);
-    if (!lobby) return;
-    const player = lobby.players.get(socket.id);
-    if (!player || !player.isAlive) return;
-
-    const unpacked = unpackMoveData(data);
-    const now = Date.now();
-    const dt = (now - player.lastMoveTime) / 1000;
-
-    if (dt > 0 && dt < 1) {
-        const dx = unpacked.position.x - player.position.x;
-        const dz = unpacked.position.z - player.position.z;
-        const distance = Math.sqrt(dx * dx + dz * dz);
-        const speed = distance / dt;
-
-        if (speed > MAX_PLAYER_SPEED) {
-            console.warn(`⚠️ [${socket.id}] Speed hack detected: ${speed.toFixed(2)} > ${MAX_PLAYER_SPEED}`);
-            socket.emit('positionCorrection', {
-                position: [player.position.x, player.position.y, player.position.z],
-                rotation: [player.rotation.x, player.rotation.y, player.rotation.z]
-            });
-            return; 
-        }
-        
-        player.velocity = { x: dx / dt, z: dz / dt };
-    }
-    
-    player.lastMoveTime = now;
-
-    player.positionHistory.push({ time: now, pos: unpacked.position });
-    if (player.positionHistory.length > 60) player.positionHistory.shift();
-
-    player.position = unpacked.position;
-    player.rotation = unpacked.rotation;
-
-    socket.to(socket.lobbyId).emit('playerMovedInLobby', {
-      id: socket.id,
-      position: [unpacked.position.x, unpacked.position.y, unpacked.position.z],
-      rotation: [unpacked.rotation.x, unpacked.rotation.y, unpacked.rotation.z],
-      serverTime: now,
-      velocity: [player.velocity.x, player.velocity.z] 
-    });
-  });
-
-  socket.on('lobbyShoot', (data) => {
-    if (!socket.lobbyId || !validateShoot(data)) return;
-    const lobby = lobbies.get(socket.lobbyId);
-    if (!lobby) return;
-    const shooter = lobby.players.get(socket.id);
-    if (!shooter || !shooter.isAlive) return;
-
-    const now = Date.now();
-    if (now - (shooter.lastShotTime || 0) < SHOOT_COOLDOWN_MS) return;
-    shooter.lastShotTime = now;
-
-    const clientTimestamp = data.clientTimestamp || now;
-    const clientLatency = Math.max(0, now - clientTimestamp);
-    const targetTime = now - clientLatency;
-
-    const hitPlayer = serverSideRaycastWithLagComp(
-        data.origin, data.direction, lobby.players, shooter.id, targetTime
-    );
-
-    console.log(`🔫 [${socket.id}] Shot. Hit: ${hitPlayer?.id || 'none'}`);
-
-    socket.to(socket.lobbyId).emit('playerShotInLobby', {
-      shooterId: shooter.id, origin: data.origin, direction: data.direction,
-      hitPlayerId: hitPlayer?.id || null
-    });
-
-    if (hitPlayer) {
-      hitPlayer.health -= FIXED_DAMAGE;
-      io.to(socket.lobbyId).emit('playerHitInLobby', { shooterId: shooter.id, targetId: hitPlayer.id, damage: FIXED_DAMAGE });
-      io.to(socket.lobbyId).emit('playerHealthChanged', { targetId: hitPlayer.id, health: hitPlayer.health });
-
-      if (hitPlayer.health <= 0) {
-        hitPlayer.health = 0;
-        hitPlayer.isAlive = false;
-        io.to(socket.lobbyId).emit('playerDiedInLobby', { targetId: hitPlayer.id, killerId: shooter.id });
-
-        hitPlayer.respawnTimeoutId = setTimeout(() => {
-          const lobby = lobbies.get(socket.lobbyId);
-          if (lobby && lobby.players.has(hitPlayer.id)) {
-            const deadPlayer = lobby.players.get(hitPlayer.id);
-            if (!deadPlayer.isAlive) {
-              const usedPositions = Array.from(lobby.players.values()).map(p => p.position);
-              const spawnPoint = getLobbySpawnPoint(usedPositions);
-              deadPlayer.position = spawnPoint;
-              deadPlayer.rotation = { x: 0, y: 0, z: 0 };
-              deadPlayer.health = 100;
-              deadPlayer.isAlive = true;
-              deadPlayer.positionHistory = []; 
-              
-              io.to(socket.lobbyId).emit('playerRespawnedInLobby', {
-                targetId: deadPlayer.id, position: spawnPoint,
-                rotation: { x: 0, y: 0, z: 0 }, health: 100
-              });
-            }
-          }
-        }, RESPAWN_TIME_MS);
-      }
-    }
-  });
-
-  socket.on('lobbyBuild', (data) => {
-    if (!socket.lobbyId) return;
-    const lobby = lobbies.get(socket.lobbyId);
-    if (!lobby) return;
-    const player = lobby.players.get(socket.id);
-    if (!player) return;
-    socket.to(socket.lobbyId).emit('playerBuildInLobby', {
-      playerId: socket.id, action: data.action, pieceType: data.pieceType,
-      position: data.position, rotation: data.rotation
-    });
-  });
-
-  socket.on('lobbyEmote', (data) => {
-    if (!socket.lobbyId) return;
-    const lobby = lobbies.get(socket.lobbyId);
-    if (!lobby) return;
-    const player = lobby.players.get(socket.id);
-    if (!player) return;
-    socket.to(socket.lobbyId).emit('playerEmoteInLobby', { playerId: socket.id, emoteId: data.emoteId });
-  });
-
-  socket.on('chatMessage', (data) => {
-    const channelId = data.channelId;
-    if (!channelId) return;
-    const messageText = typeof data.message === 'string' ? data.message.substring(0, 200).trim() : '';
-    if (!messageText) return;
-    const lobby = lobbies.get(channelId);
-    if (!lobby) return;
-    const player = lobby.players.get(socket.id);
-    if (!player) return;
-    const message = {
-      id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      username: player.username.substring(0, 20), message: messageText, timestamp: Date.now()
-    };
-    io.to(channelId).emit('chatMessage', message);
-  });
-
-  socket.on('startVoiceChat', (data) => {
-    const channelId = data.channelId || socket.lobbyId;
-    if (!channelId) return;
-    socket.to(channelId).emit('playerTalking', { playerId: socket.id, isTalking: true });
-  });
-
-  socket.on('stopVoiceChat', (data) => {
-    const channelId = data.channelId || socket.lobbyId;
-    if (!channelId) return;
-    socket.to(channelId).emit('playerTalking', { playerId: socket.id, isTalking: false });
-  });
-
-  socket.on('voiceSignal', (data) => {
-    if (!data || !data.targetId) return;
-    const targetSocket = io.sockets.sockets.get(data.targetId);
-    if (targetSocket) {
-      targetSocket.emit('voiceSignal', {
-        type: data.type, senderId: socket.id, description: data.description, candidate: data.candidate
-      });
-    }
-  });
-
-  socket.on('changeUsername', (data) => {
-    const newUsername = data.username?.trim();
-    if (!newUsername || newUsername.length === 0 || newUsername.length > 20) {
-      socket.emit('usernameError', 'Invalid username (1-20 characters)'); return;
-    }
-    if (socket.lobbyId) {
-      const lobby = lobbies.get(socket.lobbyId);
-      if (lobby) {
-        const player = lobby.players.get(socket.id);
-        if (player) {
-          player.username = newUsername;
-          socket.to(socket.lobbyId).emit('playerUsernameChanged', { id: socket.id, username: newUsername });
-        }
-      }
-    }
-  });
-
-  socket.on('disconnect', (reason) => {
-    console.log(`🔌 [${socket.id}] Disconnected: ${reason}`);
-    if (socket.lobbyId) {
-      const lobby = lobbies.get(socket.lobbyId);
-      if (lobby) {
-        const player = lobby.players.get(socket.id);
-        
-        if (player && player.respawnTimeoutId) {
-          clearTimeout(player.respawnTimeoutId);
-          player.respawnTimeoutId = null;
-        }
-        
-        lobby.players.delete(socket.id);
-        socket.to(socket.lobbyId).emit('playerLeftLobby', socket.id);
-        socket.to(socket.lobbyId).emit('lobbyPlayersCount', lobby.players.size);
-        console.log(`📤 [${socket.id}] Removed from lobby. Remaining: ${lobby.players.size}`);
-      }
-    }
-  });
-});
+const https = require('https');
+const jwt = require('jsonwebtoken');
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`🚀 Game server running on port ${PORT}`));
+const MAX_PLAYERS = 100;
+
+const CONFIG = {
+  world: {
+    size: 500,
+    maxSpeed: 15,
+    maxPositionUpdateRate: 50,
+  },
+  network: {
+    heartbeatInterval: 5000,
+    heartbeatTimeout: 15000,
+    staleTimeout: 60000,
+    maxMessageSize: 16 * 1024,
+    chatRateLimit: 3,
+    updateRateLimit: 25,
+  },
+  siteUrl: process.env.SITE_URL || 'https://theadvenjo.online',
+  internalSecret: process.env.INTERNAL_API_SECRET,
+  gameTokenSecret: process.env.GAME_TOKEN_SECRET || process.env.JWT_SECRET,
+  autoSaveInterval: 30000,
+};
+
+if (!CONFIG.internalSecret) {
+  console.error('[!] INTERNAL_API_SECRET not set. Persistence disabled.');
+}
+if (!CONFIG.gameTokenSecret) {
+  console.error('[!] GAME_TOKEN_SECRET/JWT_SECRET not set. Auth will fail.');
+}
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200);
+    res.end('ok');
+    return;
+  }
+  res.writeHead(404);
+  res.end();
+});
+
+const wss = new WebSocket.Server({
+  server,
+  maxPayload: CONFIG.network.maxMessageSize,
+  perMessageDeflate: false,
+});
+
+const players = new Map();
+const rateLimits = new Map();
+
+function checkRateLimit(playerId, type, limit) {
+  const now = Date.now();
+  const key = `${playerId}:${type}`;
+  const data = rateLimits.get(key) || { count: 0, resetTime: now + 1000 };
+  if (now > data.resetTime) {
+    data.count = 0;
+    data.resetTime = now + 1000;
+  }
+  data.count++;
+  rateLimits.set(key, data);
+  return data.count <= limit;
+}
+
+function isValidPosition(pos) {
+  if (!Array.isArray(pos) || pos.length !== 3) return false;
+  const [x, y, z] = pos;
+  const halfSize = CONFIG.world.size / 2;
+  return (
+    typeof x === 'number' && typeof y === 'number' && typeof z === 'number' &&
+    !isNaN(x) && !isNaN(y) && !isNaN(z) &&
+    Math.abs(x) <= halfSize && Math.abs(z) <= halfSize &&
+    y >= 0 && y <= 50 &&
+    isFinite(x) && isFinite(y) && isFinite(z)
+  );
+}
+
+function isValidMovement(player, newPosition, deltaTimeMs) {
+  const [ox, , oz] = player.position;
+  const [nx, , nz] = newPosition;
+  const dx = nx - ox;
+  const dz = nz - oz;
+  const distance = Math.sqrt(dx * dx + dz * dz);
+  const seconds = deltaTimeMs / 1000;
+  const speed = distance / seconds;
+  
+  if (player.justSpawned || player.justTeleported) {
+    player.justSpawned = false;
+    player.justTeleported = false;
+    return true;
+  }
+  
+  return speed <= CONFIG.world.maxSpeed * 1.5;
+}
+
+function safeSend(ws, data) {
+  if (ws.readyState !== WebSocket.OPEN) return false;
+  try {
+    ws.send(JSON.stringify(data));
+    return true;
+  } catch (err) {
+    console.error('[WS] Send error:', err.message);
+    return false;
+  }
+}
+
+function generateUniqueNickname(base = 'Player') {
+  const existing = Array.from(players.values()).map(p => p.nickname);
+  if (!existing.includes(base)) return base;
+  let suffix = 1;
+  while (existing.includes(`${base}${suffix}`)) suffix++;
+  return `${base}${suffix}`;
+}
+
+function generateId() {
+  return (
+    Math.random().toString(36).substr(2, 9) +
+    Date.now().toString(36).substr(-4) +
+    Math.random().toString(36).substr(2, 4)
+  );
+}
+
+
+async function callInternalApi(endpoint, data) {
+  if (!CONFIG.internalSecret) {
+    console.warn('[Internal] INTERNAL_API_SECRET not set, skipping:', endpoint);
+    return null;
+  }
+
+  return new Promise((resolve, reject) => {
+    const url = new URL(endpoint, CONFIG.siteUrl);
+    const isHttps = url.protocol === 'https:';
+    const lib = isHttps ? https : http;
+    
+    const postData = JSON.stringify(data);
+    
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData),
+        'X-Internal-Secret': CONFIG.internalSecret,
+      },
+    };
+
+    const req = lib.request(options, (res) => {
+      let body = '';
+      res.on('data', (chunk) => body += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (e) {
+          reject(new Error(`Invalid JSON from ${endpoint}: ${body}`));
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      console.error(`[Internal] ${endpoint} error:`, err.message);
+      reject(err);
+    });
+
+    req.setTimeout(10000, () => {
+      req.destroy(new Error(`Timeout calling ${endpoint}`));
+    });
+
+    req.write(postData);
+    req.end();
+  });
+}
+
+async function verifyGameToken(token) {
+  try {
+    const result = await callInternalApi('/api/internal/game/verify-token', { token });
+    return result;
+  } catch (err) {
+    console.error('[Auth] Verify token error:', err.message);
+    return { valid: false, error: 'verification_failed' };
+  }
+}
+
+async function loadPlayerProgress(userId, gameId) {
+  try {
+    return await callInternalApi('/api/internal/game/load-progress', { userId, gameId });
+  } catch (err) {
+    console.error('[Progress] Load error:', err.message);
+    return null;
+  }
+}
+
+async function savePlayerProgress(userId, gameId, data) {
+  try {
+    return await callInternalApi('/api/internal/game/save-progress', {
+      userId,
+      gameId,
+      ...data,
+    });
+  } catch (err) {
+    console.error('[Progress] Save error:', err.message);
+    return null;
+  }
+}
+
+
+setInterval(() => {
+  const now = Date.now();
+  players.forEach((player) => {
+    if (!player.authenticated) return;
+    safeSend(player.ws, { type: 'ping', t: now });
+    if (now - player.lastPong > CONFIG.network.heartbeatTimeout) {
+      console.log(`[!] Heartbeat timeout: ${player.id}`);
+      player.ws.terminate();
+    }
+  });
+}, CONFIG.network.heartbeatInterval);
+
+setInterval(() => {
+  const now = Date.now();
+  players.forEach((p) => {
+    if (now - p.lastSeen > CONFIG.network.staleTimeout) {
+      console.log(`[!] Stale player: ${p.id}`);
+      p.ws.terminate();
+    }
+  });
+  rateLimits.forEach((data, key) => {
+    if (now > data.resetTime + 5000) rateLimits.delete(key);
+  });
+}, 10000);
+
+setInterval(() => {
+  if (!CONFIG.internalSecret) return;
+  
+  players.forEach((player) => {
+    if (!player.authenticated) return;
+    
+    savePlayerProgress(player.userId, player.gameId, {
+      progress: {
+        locationId: player.locationId,
+        position: player.position,
+        rotation: player.rotation,
+        health: player.health,
+      },
+      nickname: player.nickname,
+      statistics: {
+        playtimeSeconds: Math.floor((Date.now() - player.sessionStart) / 1000),
+        kills: player.stats.kills,
+        deaths: player.stats.deaths,
+        shotsFired: player.stats.shotsFired,
+        buildingsPlaced: player.stats.buildingsPlaced,
+      },
+    }).catch(err => {
+      console.error(`[AutoSave] Error for ${player.id}:`, err.message);
+    });
+  });
+}, CONFIG.autoSaveInterval);
+
+
+wss.on('connection', (ws) => {
+  if (players.size >= MAX_PLAYERS) {
+    ws.close(1013, 'Server full');
+    return;
+  }
+
+  const playerId = generateId();
+  
+  const player = {
+    id: playerId,
+    userId: null,
+    wallet: null,
+    gameId: null,
+    gameSlug: null,
+    nickname: null,
+    position: [0, 0, 0],
+    rotation: 0,
+    pitch: 0,
+    animation: 'idle',
+    health: 100,
+    locationId: 'main-world',
+    ws,
+    authenticated: false,
+    lastSeen: Date.now(),
+    lastPong: Date.now(),
+    lastUpdate: 0,
+    justSpawned: false,
+    justTeleported: false,
+    sessionStart: Date.now(),
+    stats: {
+      kills: 0,
+      deaths: 0,
+      shotsFired: 0,
+      buildingsPlaced: 0,
+    },
+    authTimeout: setTimeout(() => {
+      if (!player.authenticated) {
+        console.log(`[!] Auth timeout: ${playerId}`);
+        safeSend(ws, { type: 'auth_error', error: 'auth_timeout' });
+        ws.close(4001, 'Authentication timeout');
+      }
+    }, 10000),
+  };
+
+  ws.on('message', (raw) => {
+    try {
+      const data = JSON.parse(raw.toString());
+      player.lastSeen = Date.now();
+
+      if (!player.authenticated) {
+        if (data.type === 'auth') {
+          handleAuth(player, data);
+          return;
+        } else {
+          safeSend(ws, { type: 'auth_error', error: 'auth_required' });
+          ws.close(4001, 'Authentication required');
+          return;
+        }
+      }
+
+      if (data.type === 'pong') {
+        player.lastPong = Date.now();
+        return;
+      }
+
+      if (data.type === 'playerUpdate') {
+        if (!checkRateLimit(playerId, 'update', CONFIG.network.updateRateLimit)) return;
+      } else if (data.type === 'chat') {
+        if (!checkRateLimit(playerId, 'chat', CONFIG.network.chatRateLimit)) {
+          safeSend(ws, { type: 'error', message: 'Chat rate limit exceeded' });
+          return;
+        }
+      }
+
+      switch (data.type) {
+        case 'playerUpdate': handlePlayerUpdate(player, data); break;
+        case 'shoot': handleShoot(player, data); break;
+        case 'nicknameChange': handleNicknameChange(player, data); break;
+        case 'chat': handleChat(player, data); break;
+        case 'hit': handleHit(player, data); break;
+        case 'saveProgress': handleSaveProgress(player, data); break;
+      }
+    } catch (error) {
+      console.error('[!] Message parse error:', error.message);
+    }
+  });
+
+  ws.on('close', () => {
+    clearTimeout(player.authTimeout);
+    
+    if (player.authenticated && CONFIG.internalSecret) {
+      savePlayerProgress(player.userId, player.gameId, {
+        progress: {
+          locationId: player.locationId,
+          position: player.position,
+          rotation: player.rotation,
+          health: player.health,
+        },
+        nickname: player.nickname,
+        statistics: {
+          playtimeSeconds: Math.floor((Date.now() - player.sessionStart) / 1000),
+          kills: player.stats.kills,
+          deaths: player.stats.deaths,
+          shotsFired: player.stats.shotsFired,
+          buildingsPlaced: player.stats.buildingsPlaced,
+        },
+      }).catch(err => console.error('[FinalSave] Error:', err.message));
+    }
+    
+    players.delete(playerId);
+    console.log(`[-] Player left: ${playerId} (${player.userId || 'unauth'}). Total: ${players.size}`);
+    
+    if (player.authenticated) {
+      broadcast({ type: 'playerLeave', playerId }, playerId);
+      broadcastCount();
+    }
+  });
+
+  ws.on('error', (err) => {
+    console.error(`[!] WS error for ${playerId}:`, err.message);
+  });
+
+
+  async function handleAuth(player, data) {
+    const token = data.token;
+    if (!token || typeof token !== 'string') {
+      safeSend(ws, { type: 'auth_error', error: 'invalid_token' });
+      ws.close(4001, 'Invalid token');
+      return;
+    }
+
+    const verifyResult = await verifyGameToken(token);
+    
+    if (!verifyResult || !verifyResult.valid) {
+      const error = verifyResult?.error || 'invalid_token';
+      console.log(`[!] Auth failed for ${playerId}: ${error}`);
+      safeSend(ws, { type: 'auth_error', error });
+      ws.close(4003, error);
+      return;
+    }
+
+    player.userId = verifyResult.userId;
+    player.wallet = verifyResult.wallet;
+    player.gameId = verifyResult.gameId;
+    player.gameSlug = verifyResult.gameSlug;
+    player.authenticated = true;
+    
+    clearTimeout(player.authTimeout);
+
+    const savedProgress = await loadPlayerProgress(player.userId, player.gameId);
+    
+    if (savedProgress) {
+      if (savedProgress.nickname) {
+        player.nickname = savedProgress.nickname;
+      } else {
+        player.nickname = generateUniqueNickname(`Player_${player.wallet.slice(0, 4)}`);
+      }
+      
+      if (savedProgress.progress) {
+        player.position = savedProgress.progress.position || [0, 0, 0];
+        player.rotation = savedProgress.progress.rotation || 0;
+        player.health = savedProgress.progress.health || 100;
+        player.locationId = savedProgress.progress.locationId || 'main-world';
+      } else {
+        spawnInSafeZone(player);
+      }
+      
+      if (savedProgress.statistics) {
+        player.stats.kills = savedProgress.statistics.kills || 0;
+        player.stats.deaths = savedProgress.statistics.deaths || 0;
+        player.stats.shotsFired = savedProgress.statistics.shotsFired || 0;
+        player.stats.buildingsPlaced = savedProgress.statistics.buildingsPlaced || 0;
+      }
+    } else {
+      player.nickname = generateUniqueNickname(`Player_${player.wallet.slice(0, 4)}`);
+      spawnInSafeZone(player);
+    }
+
+    player.justSpawned = true;
+    players.set(playerId, player);
+    
+    console.log(`[+] Authenticated: ${playerId} (${player.userId}, ${player.nickname}). Total: ${players.size}`);
+
+    const existingPlayers = [];
+    players.forEach((p, id) => {
+      if (id !== playerId && p.authenticated) {
+        existingPlayers.push({
+          type: 'playerJoin',
+          id: p.id,
+          nickname: p.nickname,
+          position: p.position,
+          rotation: p.rotation,
+          pitch: p.pitch,
+          animation: p.animation,
+        });
+      }
+    });
+
+    safeSend(ws, {
+      type: 'auth_success',
+      playerId,
+      nickname: player.nickname,
+      userId: player.userId,
+      wallet: player.wallet,
+      gameId: player.gameId,
+    });
+
+    safeSend(ws, {
+      type: 'init',
+      playerId,
+      players: existingPlayers,
+      count: players.size,
+      spawnPosition: player.position,
+    });
+
+    if (savedProgress) {
+      safeSend(ws, {
+        type: 'progress_loaded',
+        progress: savedProgress,
+      });
+    }
+
+    broadcast({
+      type: 'playerJoin',
+      id: playerId,
+      nickname: player.nickname,
+      position: player.position,
+      rotation: player.rotation,
+      pitch: 0,
+      animation: 'idle',
+    }, playerId);
+
+    broadcastCount();
+  }
+
+  function spawnInSafeZone(player) {
+    const angle = Math.random() * Math.PI * 2;
+    const r = Math.random() * 25;
+    player.position = [Math.cos(angle) * r, 0, Math.sin(angle) * r];
+  }
+
+  function handlePlayerUpdate(player, data) {
+    if (!isValidPosition(data.position)) return;
+    
+    const now = Date.now();
+    const delta = now - player.lastUpdate;
+    if (delta < CONFIG.world.maxPositionUpdateRate) return;
+
+    if (!isValidMovement(player, data.position, delta)) {
+      console.log(`[!] Speed hack: ${playerId}`);
+      safeSend(ws, { type: 'positionCorrection', position: player.position });
+      return;
+    }
+
+    player.position = data.position;
+    player.rotation = typeof data.rotation === 'number' ? data.rotation : 0;
+    player.pitch = typeof data.pitch === 'number' ? data.pitch : 0;
+    player.animation = typeof data.animation === 'string' ? data.animation.slice(0, 20) : 'idle';
+    player.lastUpdate = now;
+
+    broadcast({
+      type: 'playerUpdate',
+      id: playerId,
+      position: player.position,
+      rotation: player.rotation,
+      pitch: player.pitch,
+      animation: player.animation,
+    }, playerId);
+  }
+
+  function handleShoot(player, data) {
+    if (!Array.isArray(data.origin) || !Array.isArray(data.direction)) return;
+    if (data.origin.length !== 3 || data.direction.length !== 3) return;
+    
+    const [x, , z] = player.position;
+    const distFromCenter = Math.sqrt(x * x + z * z);
+    if (distFromCenter < 30) {
+      safeSend(ws, { type: 'error', message: 'Cannot shoot in safe zone' });
+      return;
+    }
+
+    player.stats.shotsFired++;
+
+    broadcast({
+      type: 'shoot',
+      id: playerId,
+      origin: data.origin,
+      direction: data.direction,
+    }, playerId);
+  }
+
+  function handleNicknameChange(player, data) {
+    if (typeof data.nickname !== 'string') return;
+    const newNick = data.nickname.trim().slice(0, 30);
+    if (newNick.length === 0) return;
+    
+    const existing = Array.from(players.values())
+      .filter(p => p.id !== playerId && p.authenticated)
+      .map(p => p.nickname);
+    
+    player.nickname = existing.includes(newNick) ? generateUniqueNickname(newNick) : newNick;
+    
+    broadcast({
+      type: 'nicknameChange',
+      id: playerId,
+      nickname: player.nickname,
+    }, playerId);
+    
+    safeSend(ws, { type: 'nicknameChanged', nickname: player.nickname });
+  }
+
+  function handleChat(player, data) {
+    if (typeof data.message !== 'string') return;
+    const msg = data.message.trim().slice(0, 200);
+    if (msg.length === 0) return;
+
+    broadcast({
+      type: 'chat',
+      id: generateId(),
+      sender: player.nickname,
+      message: msg,
+      timestamp: Date.now(),
+    }, null);
+  }
+
+  function handleHit(player, data) {
+    console.log(`[HIT] ${playerId} -> ${data.target}`);
+  }
+
+  function handleSaveProgress(player, data) {
+    if (!CONFIG.internalSecret) return;
+    
+    savePlayerProgress(player.userId, player.gameId, {
+      progress: data.progress,
+      buildings: data.buildings,
+      inventory: data.inventory,
+    }).catch(err => console.error('[Save] Error:', err.message));
+  }
+});
+
+function broadcast(data, excludeId = null) {
+  const message = JSON.stringify(data);
+  players.forEach((p, id) => {
+    if (id !== excludeId && p.authenticated && p.ws.readyState === WebSocket.OPEN) {
+      try {
+        p.ws.send(message);
+      } catch (err) {
+        console.error('[!] Broadcast error:', err.message);
+      }
+    }
+  });
+}
+
+function broadcastCount() {
+  const count = Array.from(players.values()).filter(p => p.authenticated).length;
+  const msg = JSON.stringify({ type: 'count', count });
+  players.forEach((p) => {
+    if (p.authenticated && p.ws.readyState === WebSocket.OPEN) {
+      try {
+        p.ws.send(msg);
+      } catch (err) { /* ignore */ }
+    }
+  });
+}
+
+function shutdown(signal) {
+  console.log(`\n[!] ${signal} received. Shutting down gracefully...`);
+  
+  const savePromises = [];
+  players.forEach((player) => {
+    if (player.authenticated && CONFIG.internalSecret) {
+      savePromises.push(
+        savePlayerProgress(player.userId, player.gameId, {
+          progress: {
+            locationId: player.locationId,
+            position: player.position,
+            rotation: player.rotation,
+            health: player.health,
+          },
+          nickname: player.nickname,
+        }).catch(() => {})
+      );
+    }
+  });
+  
+  Promise.all(savePromises).finally(() => {
+    const msg = JSON.stringify({ type: 'serverShutdown', reason: 'Server restarting' });
+    players.forEach((p) => {
+      try {
+        p.ws.send(msg);
+        p.ws.close(1001, 'Server shutdown');
+      } catch (err) { /* ignore */ }
+    });
+    
+    setTimeout(() => {
+      wss.close(() => {
+        server.close(() => {
+          console.log('[✓] Shutdown complete');
+          process.exit(0);
+        });
+      });
+    }, 2000);
+  });
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+server.listen(PORT, () => {
+  console.log(`[TANJO] Game server running on port ${PORT}`);
+  console.log(`[TANJO] Health check: http://localhost:${PORT}/health`);
+  console.log(`[TANJO] Site URL: ${CONFIG.siteUrl}`);
+  console.log(`[TANJO] Persistence: ${CONFIG.internalSecret ? 'enabled' : 'DISABLED'}`);
+});
