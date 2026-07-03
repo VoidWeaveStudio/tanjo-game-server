@@ -88,13 +88,13 @@ function isValidMovement(player, newPosition, deltaTimeMs) {
   const distance = Math.sqrt(dx * dx + dz * dz);
   const seconds = deltaTimeMs / 1000;
   const speed = distance / seconds;
-  
+
   if (player.justSpawned || player.justTeleported) {
     player.justSpawned = false;
     player.justTeleported = false;
     return true;
   }
-  
+
   return speed <= CONFIG.world.maxSpeed * 1.5;
 }
 
@@ -136,9 +136,9 @@ async function callInternalApi(endpoint, data) {
     const url = new URL(endpoint, CONFIG.siteUrl);
     const isHttps = url.protocol === 'https:';
     const lib = isHttps ? https : http;
-    
+
     const postData = JSON.stringify(data);
-    
+
     const options = {
       hostname: url.hostname,
       port: url.port || (isHttps ? 443 : 80),
@@ -237,10 +237,10 @@ setInterval(() => {
 
 setInterval(() => {
   if (!CONFIG.internalSecret) return;
-  
+
   players.forEach((player) => {
     if (!player.authenticated) return;
-    
+
     savePlayerProgress(player.userId, player.gameId, {
       progress: {
         locationId: player.locationId,
@@ -270,7 +270,7 @@ wss.on('connection', (ws) => {
   }
 
   const playerId = generateId();
-  
+
   const player = {
     id: playerId,
     userId: null,
@@ -352,7 +352,7 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     clearTimeout(player.authTimeout);
-    
+
     if (player.authenticated && CONFIG.internalSecret) {
       savePlayerProgress(player.userId, player.gameId, {
         progress: {
@@ -371,10 +371,10 @@ wss.on('connection', (ws) => {
         },
       }).catch(err => console.error('[FinalSave] Error:', err.message));
     }
-    
+
     players.delete(playerId);
     console.log(`[-] Player left: ${playerId} (${player.userId || 'unauth'}). Total: ${players.size}`);
-    
+
     if (player.authenticated) {
       broadcast({ type: 'playerLeave', playerId }, playerId);
       broadcastCount();
@@ -395,7 +395,7 @@ wss.on('connection', (ws) => {
     }
 
     const verifyResult = await verifyGameToken(token);
-    
+
     if (!verifyResult || !verifyResult.valid) {
       const error = verifyResult?.error || 'invalid_token';
       console.log(`[!] Auth failed for ${playerId}: ${error}`);
@@ -409,18 +409,18 @@ wss.on('connection', (ws) => {
     player.gameId = verifyResult.gameId;
     player.gameSlug = verifyResult.gameSlug;
     player.authenticated = true;
-    
+
     clearTimeout(player.authTimeout);
 
     const savedProgress = await loadPlayerProgress(player.userId, player.gameId);
-    
+
     if (savedProgress) {
       if (savedProgress.nickname) {
         player.nickname = savedProgress.nickname;
       } else {
         player.nickname = generateUniqueNickname(`Player_${player.wallet.slice(0, 4)}`);
       }
-      
+
       if (savedProgress.progress) {
         player.position = savedProgress.progress.position || [0, 0, 0];
         player.rotation = savedProgress.progress.rotation || 0;
@@ -429,7 +429,7 @@ wss.on('connection', (ws) => {
       } else {
         spawnInSafeZone(player);
       }
-      
+
       if (savedProgress.statistics) {
         player.stats.kills = savedProgress.statistics.kills || 0;
         player.stats.deaths = savedProgress.statistics.deaths || 0;
@@ -443,7 +443,7 @@ wss.on('connection', (ws) => {
 
     player.justSpawned = true;
     players.set(playerId, player);
-    
+
     console.log(`[+] Authenticated: ${playerId} (${player.userId}, ${player.nickname}). Total: ${players.size}`);
 
     const existingPlayers = [];
@@ -500,13 +500,13 @@ wss.on('connection', (ws) => {
 
   function spawnInSafeZone(player) {
     const angle = Math.random() * Math.PI * 2;
-    const r = Math.random() * 25;
+    const r = 10 + Math.random() * 15; // От 10 до 25 метров
     player.position = [Math.cos(angle) * r, 0, Math.sin(angle) * r];
   }
 
   function handlePlayerUpdate(player, data) {
     if (!isValidPosition(data.position)) return;
-    
+
     const now = Date.now();
     const delta = now - player.lastUpdate;
     if (delta < CONFIG.world.maxPositionUpdateRate) return;
@@ -536,7 +536,7 @@ wss.on('connection', (ws) => {
   function handleShoot(player, data) {
     if (!Array.isArray(data.origin) || !Array.isArray(data.direction)) return;
     if (data.origin.length !== 3 || data.direction.length !== 3) return;
-    
+
     const [x, , z] = player.position;
     const distFromCenter = Math.sqrt(x * x + z * z);
     if (distFromCenter < 30) {
@@ -558,19 +558,19 @@ wss.on('connection', (ws) => {
     if (typeof data.nickname !== 'string') return;
     const newNick = data.nickname.trim().slice(0, 30);
     if (newNick.length === 0) return;
-    
+
     const existing = Array.from(players.values())
       .filter(p => p.id !== playerId && p.authenticated)
       .map(p => p.nickname);
-    
+
     player.nickname = existing.includes(newNick) ? generateUniqueNickname(newNick) : newNick;
-    
+
     broadcast({
       type: 'nicknameChange',
       id: playerId,
       nickname: player.nickname,
     }, playerId);
-    
+
     safeSend(ws, { type: 'nicknameChanged', nickname: player.nickname });
   }
 
@@ -594,7 +594,7 @@ wss.on('connection', (ws) => {
 
   function handleSaveProgress(player, data) {
     if (!CONFIG.internalSecret) return;
-    
+
     savePlayerProgress(player.userId, player.gameId, {
       progress: data.progress,
       buildings: data.buildings,
@@ -630,7 +630,7 @@ function broadcastCount() {
 
 function shutdown(signal) {
   console.log(`\n[!] ${signal} received. Shutting down gracefully...`);
-  
+
   const savePromises = [];
   players.forEach((player) => {
     if (player.authenticated && CONFIG.internalSecret) {
@@ -643,11 +643,11 @@ function shutdown(signal) {
             health: player.health,
           },
           nickname: player.nickname,
-        }).catch(() => {})
+        }).catch(() => { })
       );
     }
   });
-  
+
   Promise.all(savePromises).finally(() => {
     const msg = JSON.stringify({ type: 'serverShutdown', reason: 'Server restarting' });
     players.forEach((p) => {
@@ -656,7 +656,7 @@ function shutdown(signal) {
         p.ws.close(1001, 'Server shutdown');
       } catch (err) { /* ignore */ }
     });
-    
+
     setTimeout(() => {
       wss.close(() => {
         server.close(() => {
