@@ -1,5 +1,4 @@
 //server.js
-
 const WebSocket = require('ws');
 const http = require('http');
 const https = require('https');
@@ -21,6 +20,8 @@ const CONFIG = {
     maxMessageSize: 16 * 1024,
     chatRateLimit: 3,
     updateRateLimit: 25,
+    shootRateLimit: 10,
+    hitRateLimit: 15,
   },
   siteUrl: process.env.SITE_URL || 'https://theadvenjo.online',
   internalSecret: process.env.INTERNAL_API_SECRET,
@@ -96,6 +97,32 @@ function isValidMovement(player, newPosition, deltaTimeMs) {
   }
 
   return speed <= CONFIG.world.maxSpeed * 1.5;
+}
+
+function getHistoricalPosition(player, targetTime) {
+  const history = player.positionHistory || [];
+  if (history.length === 0) return player.position;
+
+  let before = history[0];
+  let after = history[history.length - 1];
+
+  for (let i = 0; i < history.length - 1; i++) {
+    if (history[i].time <= targetTime && history[i + 1].time >= targetTime) {
+      before = history[i];
+      after = history[i + 1];
+      break;
+    }
+  }
+
+  const timeDiff = after.time - before.time;
+  if (timeDiff <= 0) return before.position;
+
+  const t = (targetTime - before.time) / timeDiff;
+  return [
+    before.position[0] + (after.position[0] - before.position[0]) * t,
+    before.position[1] + (after.position[1] - before.position[1]) * t,
+    before.position[2] + (after.position[2] - before.position[2]) * t,
+  ];
 }
 
 function safeSend(ws, data) {
@@ -282,7 +309,10 @@ wss.on('connection', (ws) => {
     rotation: 0,
     pitch: 0,
     animation: 'idle',
-    health: 100,
+    state: 'idle',
+    jumping: false,
+    velocityY: 0,
+    lastJump: 0,
     locationId: 'main-world',
     ws,
     authenticated: false,
@@ -292,6 +322,11 @@ wss.on('connection', (ws) => {
     justSpawned: false,
     justTeleported: false,
     sessionStart: Date.now(),
+    health: 100,
+    maxHealth: 100,
+    alive: true,
+    lastDamageTime: 0,
+    positionHistory: [],
     stats: {
       kills: 0,
       deaths: 0,
@@ -333,6 +368,16 @@ wss.on('connection', (ws) => {
       } else if (data.type === 'chat') {
         if (!checkRateLimit(playerId, 'chat', CONFIG.network.chatRateLimit)) {
           safeSend(ws, { type: 'error', message: 'Chat rate limit exceeded' });
+          return;
+        }
+      } else if (data.type === 'shoot') {
+        if (!checkRateLimit(playerId, 'shoot', CONFIG.network.shootRateLimit)) {
+          safeSend(ws, { type: 'error', message: 'Shoot rate limit exceeded' });
+          return;
+        }
+      } else if (data.type === 'hit') {
+        if (!checkRateLimit(playerId, 'hit', CONFIG.network.hitRateLimit)) {
+          safeSend(ws, { type: 'error', message: 'Hit rate limit exceeded' });
           return;
         }
       }
@@ -456,7 +501,11 @@ wss.on('connection', (ws) => {
           position: p.position,
           rotation: p.rotation,
           pitch: p.pitch,
-          animation: p.animation,
+          state: p.state || 'idle',
+          jumping: p.jumping || false,
+          velocityY: p.velocityY || 0,
+          health: p.health,
+          alive: p.alive,
         });
       }
     });
@@ -492,7 +541,11 @@ wss.on('connection', (ws) => {
       position: player.position,
       rotation: player.rotation,
       pitch: 0,
-      animation: 'idle',
+      state: 'idle',
+      jumping: false,
+      velocityY: 0,
+      health: player.health,
+      alive: player.alive,
     }, playerId);
 
     broadcastCount();
@@ -500,11 +553,12 @@ wss.on('connection', (ws) => {
 
   function spawnInSafeZone(player) {
     const angle = Math.random() * Math.PI * 2;
-    const r = 10 + Math.random() * 15; // От 10 до 25 метров
+    const r = 10 + Math.random() * 15;
     player.position = [Math.cos(angle) * r, 0, Math.sin(angle) * r];
   }
 
   function handlePlayerUpdate(player, data) {
+    if (!player.alive) return;
     if (!isValidPosition(data.position)) return;
 
     const now = Date.now();
@@ -512,15 +566,32 @@ wss.on('connection', (ws) => {
     if (delta < CONFIG.world.maxPositionUpdateRate) return;
 
     if (!isValidMovement(player, data.position, delta)) {
-      console.log(`[!] Speed hack: ${playerId}`);
       safeSend(ws, { type: 'positionCorrection', position: player.position });
       return;
     }
 
+    if (data.jumping && !player.jumping) {
+      if (now - player.lastJump < 400) {
+        data.jumping = false;
+      } else {
+        player.lastJump = now;
+      }
+    }
+
+    player.positionHistory.push({
+      position: [...data.position],
+      time: now,
+    });
+    player.positionHistory = player.positionHistory.filter(
+      p => now - p.time < 500
+    );
+
     player.position = data.position;
     player.rotation = typeof data.rotation === 'number' ? data.rotation : 0;
     player.pitch = typeof data.pitch === 'number' ? data.pitch : 0;
-    player.animation = typeof data.animation === 'string' ? data.animation.slice(0, 20) : 'idle';
+    player.state = typeof data.state === 'string' ? data.state.slice(0, 20) : 'idle';
+    player.jumping = !!data.jumping;
+    player.velocityY = typeof data.velocityY === 'number' ? data.velocityY : 0;
     player.lastUpdate = now;
 
     broadcast({
@@ -529,16 +600,40 @@ wss.on('connection', (ws) => {
       position: player.position,
       rotation: player.rotation,
       pitch: player.pitch,
-      animation: player.animation,
+      state: player.state,
+      jumping: player.jumping,
+      velocityY: player.velocityY,
+      health: player.health,
+      alive: player.alive,
     }, playerId);
   }
 
   function handleShoot(player, data) {
+    if (!player.alive) return;
+
     if (!Array.isArray(data.origin) || !Array.isArray(data.direction)) return;
     if (data.origin.length !== 3 || data.direction.length !== 3) return;
 
-    const [x, , z] = player.position;
-    const distFromCenter = Math.sqrt(x * x + z * z);
+    const [px, , pz] = player.position;
+    const [ox, oy, oz] = data.origin;
+    const [dx, dy, dz] = data.direction;
+
+    const distFromPlayer = Math.sqrt((ox - px) ** 2 + (oz - pz) ** 2);
+    if (distFromPlayer > 3) {
+      console.log(`[!] Shoot hack: origin ${distFromPlayer.toFixed(2)}m from player`);
+      return;
+    }
+
+    if (oy < 0 || oy > 5) {
+      console.log(`[!] Shoot hack: invalid origin Y=${oy.toFixed(2)}`);
+      return;
+    }
+
+    const dirLength = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (dirLength < 0.001) return;
+    const direction = [dx / dirLength, dy / dirLength, dz / dirLength];
+
+    const distFromCenter = Math.sqrt(ox * ox + oz * oz);
     if (distFromCenter < 30) {
       safeSend(ws, { type: 'error', message: 'Cannot shoot in safe zone' });
       return;
@@ -550,7 +645,7 @@ wss.on('connection', (ws) => {
       type: 'shoot',
       id: playerId,
       origin: data.origin,
-      direction: data.direction,
+      direction: direction,
     }, playerId);
   }
 
@@ -589,7 +684,88 @@ wss.on('connection', (ws) => {
   }
 
   function handleHit(player, data) {
-    console.log(`[HIT] ${playerId} -> ${data.target}`);
+    if (!player.alive) return;
+
+    if (!data.target || typeof data.target !== 'string') return;
+    if (!Array.isArray(data.point) || data.point.length !== 3) return;
+
+    const target = players.get(data.target);
+    if (!target || !target.authenticated || !target.alive) return;
+    if (data.target === playerId) return;
+
+    const ping = Math.max(0, Date.now() - player.lastPong);
+    const shotTime = Date.now() - ping;
+    const historicalPos = getHistoricalPosition(target, shotTime);
+
+    const [px, , pz] = player.position;
+    const [tx, , tz] = historicalPos;
+    const dist = Math.sqrt((tx - px) ** 2 + (tz - pz) ** 2);
+    if (dist > 300) {
+      console.log(`[!] Hit hack: distance ${dist.toFixed(2)}m`);
+      return;
+    }
+
+    const [hx, , hz] = data.point;
+    const hitDist = Math.sqrt((tx - hx) ** 2 + (tz - hz) ** 2);
+    if (hitDist > 3) {
+      console.log(`[!] Hit hack: hit point ${hitDist.toFixed(2)}m from historical pos`);
+      return;
+    }
+
+    const targetDistFromCenter = Math.sqrt(tx * tx + tz * tz);
+    if (targetDistFromCenter < 30) {
+      safeSend(ws, { type: 'error', message: 'Target is in safe zone' });
+      return;
+    }
+
+    const damage = 25;
+    target.health = Math.max(0, target.health - damage);
+    target.lastDamageTime = Date.now();
+
+    broadcast({
+      type: 'playerDamaged',
+      targetId: data.target,
+      attackerId: playerId,
+      damage: damage,
+      health: target.health,
+      point: data.point,
+      historicalPosition: historicalPos,
+    }, null);
+
+    if (target.health <= 0) {
+      target.alive = false;
+      player.stats.kills++;
+      target.stats.deaths++;
+
+      broadcast({
+        type: 'playerDeath',
+        playerId: data.target,
+        killerId: playerId,
+        position: historicalPos,
+      }, null);
+
+      setTimeout(() => {
+        if (target.ws.readyState !== WebSocket.OPEN) return;
+
+        target.health = target.maxHealth;
+        target.alive = true;
+        spawnInSafeZone(target);
+        target.justTeleported = true;
+
+        safeSend(target.ws, {
+          type: 'respawn',
+          position: target.position,
+          health: target.health,
+        });
+
+        broadcast({
+          type: 'playerRespawn',
+          id: target.id,
+          position: target.position,
+          health: target.health,
+        }, target.id);
+      }, 3000);
+    }
   }
 
   function handleSaveProgress(player, data) {
