@@ -55,12 +55,10 @@ const wss = new WebSocket.Server({
 const players = new Map();
 const rateLimits = new Map();
 
-// 🔥 FIX #16: Whitelist валидных состояний
 const VALID_STATES = new Set(['idle', 'walk', 'sprint', 'jump']);
 
-// 🔥 FIX #8: Кэш для broadcast сообщений
 const broadcastCache = new Map();
-const CACHE_TTL = 100; // 100ms
+const CACHE_TTL = 100;
 
 function getCachedMessage(data) {
   const key = JSON.stringify(data);
@@ -74,7 +72,6 @@ function getCachedMessage(data) {
   const message = key;
   broadcastCache.set(key, { message, time: now });
 
-  // Очистка старых записей
   if (broadcastCache.size > 1000) {
     for (const [k, v] of broadcastCache) {
       if (now - v.time > CACHE_TTL * 10) {
@@ -86,7 +83,6 @@ function getCachedMessage(data) {
   return message;
 }
 
-// 🔥 FIX #17: Санитизация сообщений для предотвращения XSS
 function sanitizeMessage(msg) {
   return msg
     .replace(/&/g, '&amp;')
@@ -94,8 +90,8 @@ function sanitizeMessage(msg) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;')
-    .replace(/\x00/g, '') // Null bytes
-    .replace(/[\u0000-\u001F\u007F-\u009F]/g, ''); // Control characters
+    .replace(/\x00/g, '')
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, '');
 }
 
 function checkRateLimit(playerId, type, limit) {
@@ -187,7 +183,6 @@ function generateUniqueNickname(base = 'Player') {
   return `${base}${suffix}`;
 }
 
-// 🔥 FIX #18: Криптографически стойкий генератор ID
 function generateId() {
   return crypto.randomBytes(16).toString('hex');
 }
@@ -366,7 +361,7 @@ wss.on('connection', (ws) => {
     positionHistory: [],
     weaponEquipped: true,
     isShooting: false,
-    respawnToken: null, // 🔥 FIX #12: Токен для предотвращения race condition
+    respawnToken: null,  
     stats: {
       kills: 0,
       deaths: 0,
@@ -629,7 +624,6 @@ wss.on('connection', (ws) => {
     player.rotation = typeof data.rotation === 'number' ? data.rotation : 0;
     player.pitch = typeof data.pitch === 'number' ? data.pitch : 0;
     
-    // 🔥 FIX #16: Валидация состояния через whitelist
     player.state = VALID_STATES.has(data.state) ? data.state : 'idle';
     
     player.jumping = !!data.jumping;
@@ -679,7 +673,6 @@ wss.on('connection', (ws) => {
     if (dirLength < 0.001) return;
     const direction = [dx / dirLength, dy / dirLength, dz / dirLength];
 
-    // 🔥 FIX #13: Проверка safe zone по позиции игрока, а не выстрела
     const distFromCenter = Math.sqrt(px * px + pz * pz);
     if (distFromCenter < 30) {
       safeSend(ws, { type: 'error', message: 'Cannot shoot in safe zone' });
@@ -719,7 +712,6 @@ wss.on('connection', (ws) => {
   function handleChat(player, data) {
     if (typeof data.message !== 'string') return;
     
-    // 🔥 FIX #17: Санитизация сообщения
     const msg = sanitizeMessage(data.message.trim().slice(0, 200));
     if (msg.length === 0) return;
 
@@ -793,15 +785,13 @@ wss.on('connection', (ws) => {
         position: historicalPos,
       }, null);
 
-      // 🔥 FIX #12: Генерация токена для предотвращения race condition
       const respawnToken = Date.now() + Math.random();
       target.respawnToken = respawnToken;
 
       setTimeout(() => {
-        // Проверяем, что токен не изменился (игрок не респавнился раньше)
         if (target.respawnToken !== respawnToken) return;
         if (target.ws.readyState !== WebSocket.OPEN) return;
-        if (!target.alive) { // Всё ещё мёртв
+        if (!target.alive) {
           target.health = target.maxHealth;
           target.alive = true;
           spawnInSafeZone(target);
@@ -836,7 +826,6 @@ wss.on('connection', (ws) => {
   }
 });
 
-// 🔥 FIX #8: Использование кэша в broadcast
 function broadcast(data, excludeId = null) {
   const message = getCachedMessage(data);
   players.forEach((p, id) => {
@@ -850,7 +839,6 @@ function broadcast(data, excludeId = null) {
   });
 }
 
-// 🔥 FIX #8: Использование кэша в broadcastCount
 function broadcastCount() {
   const count = Array.from(players.values()).filter(p => p.authenticated).length;
   const msg = getCachedMessage({ type: 'count', count });
