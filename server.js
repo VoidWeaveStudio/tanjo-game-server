@@ -2,7 +2,7 @@
 const WebSocket = require('ws');
 const http = require('http');
 const https = require('https');
-const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3001;
 const MAX_PLAYERS = 100;
@@ -55,6 +55,49 @@ const wss = new WebSocket.Server({
 const players = new Map();
 const rateLimits = new Map();
 
+// 🔥 FIX #16: Whitelist валидных состояний
+const VALID_STATES = new Set(['idle', 'walk', 'sprint', 'jump']);
+
+// 🔥 FIX #8: Кэш для broadcast сообщений
+const broadcastCache = new Map();
+const CACHE_TTL = 100; // 100ms
+
+function getCachedMessage(data) {
+  const key = JSON.stringify(data);
+  const cached = broadcastCache.get(key);
+  const now = Date.now();
+
+  if (cached && now - cached.time < CACHE_TTL) {
+    return cached.message;
+  }
+
+  const message = key;
+  broadcastCache.set(key, { message, time: now });
+
+  // Очистка старых записей
+  if (broadcastCache.size > 1000) {
+    for (const [k, v] of broadcastCache) {
+      if (now - v.time > CACHE_TTL * 10) {
+        broadcastCache.delete(k);
+      }
+    }
+  }
+
+  return message;
+}
+
+// 🔥 FIX #17: Санитизация сообщений для предотвращения XSS
+function sanitizeMessage(msg) {
+  return msg
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;')
+    .replace(/\x00/g, '') // Null bytes
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, ''); // Control characters
+}
+
 function checkRateLimit(playerId, type, limit) {
   const now = Date.now();
   const key = `${playerId}:${type}`;
@@ -76,7 +119,7 @@ function isValidPosition(pos) {
     typeof x === 'number' && typeof y === 'number' && typeof z === 'number' &&
     !isNaN(x) && !isNaN(y) && !isNaN(z) &&
     Math.abs(x) <= halfSize && Math.abs(z) <= halfSize &&
-    y >= 0 && y <= 50 &&
+    y >= -30 && y <= 50 &&
     isFinite(x) && isFinite(y) && isFinite(z)
   );
 }
@@ -144,14 +187,10 @@ function generateUniqueNickname(base = 'Player') {
   return `${base}${suffix}`;
 }
 
+// 🔥 FIX #18: Криптографически стойкий генератор ID
 function generateId() {
-  return (
-    Math.random().toString(36).substr(2, 9) +
-    Date.now().toString(36).substr(-4) +
-    Math.random().toString(36).substr(2, 4)
-  );
+  return crypto.randomBytes(16).toString('hex');
 }
-
 
 async function callInternalApi(endpoint, data) {
   if (!CONFIG.internalSecret) {
@@ -236,7 +275,6 @@ async function savePlayerProgress(userId, gameId, data) {
   }
 }
 
-
 setInterval(() => {
   const now = Date.now();
   players.forEach((player) => {
@@ -289,7 +327,6 @@ setInterval(() => {
   });
 }, CONFIG.autoSaveInterval);
 
-
 wss.on('connection', (ws) => {
   if (players.size >= MAX_PLAYERS) {
     ws.close(1013, 'Server full');
@@ -327,6 +364,9 @@ wss.on('connection', (ws) => {
     alive: true,
     lastDamageTime: 0,
     positionHistory: [],
+    weaponEquipped: true,
+    isShooting: false,
+    respawnToken: null, // 🔥 FIX #12: Токен для предотвращения race condition
     stats: {
       kills: 0,
       deaths: 0,
@@ -429,7 +469,6 @@ wss.on('connection', (ws) => {
   ws.on('error', (err) => {
     console.error(`[!] WS error for ${playerId}:`, err.message);
   });
-
 
   async function handleAuth(player, data) {
     const token = data.token;
@@ -589,9 +628,14 @@ wss.on('connection', (ws) => {
     player.position = data.position;
     player.rotation = typeof data.rotation === 'number' ? data.rotation : 0;
     player.pitch = typeof data.pitch === 'number' ? data.pitch : 0;
-    player.state = typeof data.state === 'string' ? data.state.slice(0, 20) : 'idle';
+    
+    // 🔥 FIX #16: Валидация состояния через whitelist
+    player.state = VALID_STATES.has(data.state) ? data.state : 'idle';
+    
     player.jumping = !!data.jumping;
     player.velocityY = typeof data.velocityY === 'number' ? data.velocityY : 0;
+    player.weaponEquipped = data.weaponEquipped !== false;
+    player.isShooting = !!data.isShooting;
     player.lastUpdate = now;
 
     broadcast({
@@ -605,6 +649,8 @@ wss.on('connection', (ws) => {
       velocityY: player.velocityY,
       health: player.health,
       alive: player.alive,
+      weaponEquipped: player.weaponEquipped,
+      isShooting: player.isShooting,
     }, playerId);
   }
 
@@ -633,7 +679,8 @@ wss.on('connection', (ws) => {
     if (dirLength < 0.001) return;
     const direction = [dx / dirLength, dy / dirLength, dz / dirLength];
 
-    const distFromCenter = Math.sqrt(ox * ox + oz * oz);
+    // 🔥 FIX #13: Проверка safe zone по позиции игрока, а не выстрела
+    const distFromCenter = Math.sqrt(px * px + pz * pz);
     if (distFromCenter < 30) {
       safeSend(ws, { type: 'error', message: 'Cannot shoot in safe zone' });
       return;
@@ -671,7 +718,9 @@ wss.on('connection', (ws) => {
 
   function handleChat(player, data) {
     if (typeof data.message !== 'string') return;
-    const msg = data.message.trim().slice(0, 200);
+    
+    // 🔥 FIX #17: Санитизация сообщения
+    const msg = sanitizeMessage(data.message.trim().slice(0, 200));
     if (msg.length === 0) return;
 
     broadcast({
@@ -744,26 +793,34 @@ wss.on('connection', (ws) => {
         position: historicalPos,
       }, null);
 
+      // 🔥 FIX #12: Генерация токена для предотвращения race condition
+      const respawnToken = Date.now() + Math.random();
+      target.respawnToken = respawnToken;
+
       setTimeout(() => {
+        // Проверяем, что токен не изменился (игрок не респавнился раньше)
+        if (target.respawnToken !== respawnToken) return;
         if (target.ws.readyState !== WebSocket.OPEN) return;
+        if (!target.alive) { // Всё ещё мёртв
+          target.health = target.maxHealth;
+          target.alive = true;
+          spawnInSafeZone(target);
+          target.justTeleported = true;
+          target.respawnToken = null;
 
-        target.health = target.maxHealth;
-        target.alive = true;
-        spawnInSafeZone(target);
-        target.justTeleported = true;
+          safeSend(target.ws, {
+            type: 'respawn',
+            position: target.position,
+            health: target.health,
+          });
 
-        safeSend(target.ws, {
-          type: 'respawn',
-          position: target.position,
-          health: target.health,
-        });
-
-        broadcast({
-          type: 'playerRespawn',
-          id: target.id,
-          position: target.position,
-          health: target.health,
-        }, target.id);
+          broadcast({
+            type: 'playerRespawn',
+            id: target.id,
+            position: target.position,
+            health: target.health,
+          }, target.id);
+        }
       }, 3000);
     }
   }
@@ -779,8 +836,9 @@ wss.on('connection', (ws) => {
   }
 });
 
+// 🔥 FIX #8: Использование кэша в broadcast
 function broadcast(data, excludeId = null) {
-  const message = JSON.stringify(data);
+  const message = getCachedMessage(data);
   players.forEach((p, id) => {
     if (id !== excludeId && p.authenticated && p.ws.readyState === WebSocket.OPEN) {
       try {
@@ -792,9 +850,10 @@ function broadcast(data, excludeId = null) {
   });
 }
 
+// 🔥 FIX #8: Использование кэша в broadcastCount
 function broadcastCount() {
   const count = Array.from(players.values()).filter(p => p.authenticated).length;
-  const msg = JSON.stringify({ type: 'count', count });
+  const msg = getCachedMessage({ type: 'count', count });
   players.forEach((p) => {
     if (p.authenticated && p.ws.readyState === WebSocket.OPEN) {
       try {
@@ -825,7 +884,7 @@ function shutdown(signal) {
   });
 
   Promise.all(savePromises).finally(() => {
-    const msg = JSON.stringify({ type: 'serverShutdown', reason: 'Server restarting' });
+    const msg = getCachedMessage({ type: 'serverShutdown', reason: 'Server restarting' });
     players.forEach((p) => {
       try {
         p.ws.send(msg);
