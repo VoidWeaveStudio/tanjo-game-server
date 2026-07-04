@@ -718,7 +718,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    const damage = 25;
+    const damage = 5;
     target.health = Math.max(0, target.health - damage);
     target.lastDamageTime = Date.now();
 
