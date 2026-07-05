@@ -1,4 +1,4 @@
-//server.js
+// server.js
 const WebSocket = require('ws');
 const http = require('http');
 const https = require('https');
@@ -9,7 +9,9 @@ const MAX_PLAYERS = 100;
 
 const CONFIG = {
   world: {
-    size: 500,
+    size: 1000,
+    zoneSize: 100,
+    aoiRadius: 2, // Радиус видимости в зонах (2 = 5x5 зон)
     maxSpeed: 15,
     maxPositionUpdateRate: 50,
   },
@@ -185,6 +187,22 @@ function generateUniqueNickname(base = 'Player') {
 
 function generateId() {
   return crypto.randomBytes(16).toString('hex');
+}
+
+// Area of Interest функции
+function getPlayerZone(player) {
+  const halfSize = CONFIG.world.size / 2;
+  const zoneX = Math.floor((player.position[0] + halfSize) / CONFIG.world.zoneSize);
+  const zoneZ = Math.floor((player.position[2] + halfSize) / CONFIG.world.zoneSize);
+  return { zoneX, zoneZ };
+}
+
+function isInAOI(player, other) {
+  const pZone = getPlayerZone(player);
+  const oZone = getPlayerZone(other);
+  const dx = Math.abs(pZone.zoneX - oZone.zoneX);
+  const dz = Math.abs(pZone.zoneZ - oZone.zoneZ);
+  return dx <= CONFIG.world.aoiRadius && dz <= CONFIG.world.aoiRadius;
 }
 
 async function callInternalApi(endpoint, data) {
@@ -456,7 +474,7 @@ wss.on('connection', (ws) => {
     console.log(`[-] Player left: ${playerId} (${player.userId || 'unauth'}). Total: ${players.size}`);
 
     if (player.authenticated) {
-      broadcast({ type: 'playerLeave', playerId }, playerId);
+      broadcast({ type: 'playerLeave', playerId }, playerId, true, player);
       broadcastCount();
     }
   });
@@ -525,22 +543,25 @@ wss.on('connection', (ws) => {
 
     console.log(`[+] Authenticated: ${playerId} (${player.userId}, ${player.nickname}). Total: ${players.size}`);
 
+    // Отправляем только игроков в Area of Interest
     const existingPlayers = [];
     players.forEach((p, id) => {
       if (id !== playerId && p.authenticated) {
-        existingPlayers.push({
-          type: 'playerJoin',
-          id: p.id,
-          nickname: p.nickname,
-          position: p.position,
-          rotation: p.rotation,
-          pitch: p.pitch,
-          state: p.state || 'idle',
-          jumping: p.jumping || false,
-          velocityY: p.velocityY || 0,
-          health: p.health,
-          alive: p.alive,
-        });
+        if (isInAOI(player, p)) {
+          existingPlayers.push({
+            type: 'playerJoin',
+            id: p.id,
+            nickname: p.nickname,
+            position: p.position,
+            rotation: p.rotation,
+            pitch: p.pitch,
+            state: p.state || 'idle',
+            jumping: p.jumping || false,
+            velocityY: p.velocityY || 0,
+            health: p.health,
+            alive: p.alive,
+          });
+        }
       }
     });
 
@@ -568,6 +589,7 @@ wss.on('connection', (ws) => {
       });
     }
 
+    // Broadcast с AoI
     broadcast({
       type: 'playerJoin',
       id: playerId,
@@ -580,7 +602,7 @@ wss.on('connection', (ws) => {
       velocityY: 0,
       health: player.health,
       alive: player.alive,
-    }, playerId);
+    }, playerId, true, player);
 
     broadcastCount();
   }
@@ -632,6 +654,7 @@ wss.on('connection', (ws) => {
     player.isShooting = !!data.isShooting;
     player.lastUpdate = now;
 
+    // Broadcast с AoI
     broadcast({
       type: 'playerUpdate',
       id: playerId,
@@ -645,7 +668,7 @@ wss.on('connection', (ws) => {
       alive: player.alive,
       weaponEquipped: player.weaponEquipped,
       isShooting: player.isShooting,
-    }, playerId);
+    }, playerId, true, player);
   }
 
   function handleShoot(player, data) {
@@ -681,12 +704,13 @@ wss.on('connection', (ws) => {
 
     player.stats.shotsFired++;
 
+    // Broadcast с AoI
     broadcast({
       type: 'shoot',
       id: playerId,
       origin: data.origin,
       direction: direction,
-    }, playerId);
+    }, playerId, true, player);
   }
 
   function handleNicknameChange(player, data) {
@@ -704,7 +728,7 @@ wss.on('connection', (ws) => {
       type: 'nicknameChange',
       id: playerId,
       nickname: player.nickname,
-    }, playerId);
+    }, playerId, true, player);
 
     safeSend(ws, { type: 'nicknameChanged', nickname: player.nickname });
   }
@@ -715,13 +739,14 @@ wss.on('connection', (ws) => {
     const msg = sanitizeMessage(data.message.trim().slice(0, 200));
     if (msg.length === 0) return;
 
+    // Чат шлём всем (без AoI)
     broadcast({
       type: 'chat',
       id: generateId(),
       sender: player.nickname,
       message: msg,
       timestamp: Date.now(),
-    }, null);
+    }, null, false);
   }
 
   function handleHit(player, data) {
@@ -763,6 +788,7 @@ wss.on('connection', (ws) => {
     target.health = Math.max(0, target.health - damage);
     target.lastDamageTime = Date.now();
 
+    // Broadcast с AoI
     broadcast({
       type: 'playerDamaged',
       targetId: data.target,
@@ -771,7 +797,7 @@ wss.on('connection', (ws) => {
       health: target.health,
       point: data.point,
       historicalPosition: historicalPos,
-    }, null);
+    }, null, true, player);
 
     if (target.health <= 0) {
       target.alive = false;
@@ -783,7 +809,7 @@ wss.on('connection', (ws) => {
         playerId: data.target,
         killerId: playerId,
         position: historicalPos,
-      }, null);
+      }, null, true, player);
 
       const respawnToken = Date.now() + Math.random();
       target.respawnToken = respawnToken;
@@ -809,7 +835,7 @@ wss.on('connection', (ws) => {
             id: target.id,
             position: target.position,
             health: target.health,
-          }, target.id);
+          }, target.id, true, target);
         }
       }, 3000);
     }
@@ -826,15 +852,22 @@ wss.on('connection', (ws) => {
   }
 });
 
-function broadcast(data, excludeId = null) {
+// Обновлённая функция broadcast с поддержкой AoI
+function broadcast(data, excludeId = null, useAOI = false, senderPlayer = null) {
   const message = getCachedMessage(data);
   players.forEach((p, id) => {
-    if (id !== excludeId && p.authenticated && p.ws.readyState === WebSocket.OPEN) {
-      try {
-        p.ws.send(message);
-      } catch (err) {
-        console.error('[!] Broadcast error:', err.message);
-      }
+    if (id === excludeId) return;
+    if (!p.authenticated || p.ws.readyState !== WebSocket.OPEN) return;
+    
+    // Если используем AoI — проверяем зону
+    if (useAOI && senderPlayer) {
+      if (!isInAOI(senderPlayer, p)) return;
+    }
+    
+    try {
+      p.ws.send(message);
+    } catch (err) {
+      console.error('[!] Broadcast error:', err.message);
     }
   });
 }
@@ -899,4 +932,5 @@ server.listen(PORT, () => {
   console.log(`[TANJO] Health check: http://localhost:${PORT}/health`);
   console.log(`[TANJO] Site URL: ${CONFIG.siteUrl}`);
   console.log(`[TANJO] Persistence: ${CONFIG.internalSecret ? 'enabled' : 'DISABLED'}`);
+  console.log(`[TANJO] AoI: ${CONFIG.world.zoneSize}m zones, radius ${CONFIG.world.aoiRadius}`);
 });
