@@ -58,6 +58,7 @@ const players = new Map();
 const rateLimits = new Map();
 
 const VALID_STATES = new Set(['idle', 'walk', 'sprint', 'jump']);
+const VALID_LOCATIONS = new Set(['main-world', 'cave']);
 
 const broadcastCache = new Map();
 const CACHE_TTL = 100;
@@ -197,6 +198,8 @@ function getPlayerZone(player) {
 }
 
 function isInAOI(player, other) {
+  if (player.locationId !== other.locationId) return false;
+
   const pZone = getPlayerZone(player);
   const oZone = getPlayerZone(other);
   const dx = Math.abs(pZone.zoneX - oZone.zoneX);
@@ -378,7 +381,7 @@ wss.on('connection', (ws) => {
     positionHistory: [],
     weaponEquipped: true,
     isShooting: false,
-    respawnToken: null,  
+    respawnToken: null,
     stats: {
       kills: 0,
       deaths: 0,
@@ -441,6 +444,7 @@ wss.on('connection', (ws) => {
         case 'chat': handleChat(player, data); break;
         case 'hit': handleHit(player, data); break;
         case 'saveProgress': handleSaveProgress(player, data); break;
+        case 'locationChange': handleLocationChange(player, data); break;
       }
     } catch (error) {
       console.error('[!] Message parse error:', error.message);
@@ -521,7 +525,9 @@ wss.on('connection', (ws) => {
         player.position = savedProgress.progress.position || [0, 0, 0];
         player.rotation = savedProgress.progress.rotation || 0;
         player.health = savedProgress.progress.health || 100;
-        player.locationId = savedProgress.progress.locationId || 'main-world';
+        player.locationId = VALID_LOCATIONS.has(savedProgress.progress.locationId)
+          ? savedProgress.progress.locationId
+          : 'main-world';
       } else {
         spawnInSafeZone(player);
       }
@@ -540,7 +546,7 @@ wss.on('connection', (ws) => {
     player.justSpawned = true;
     players.set(playerId, player);
 
-    console.log(`[+] Authenticated: ${playerId} (${player.userId}, ${player.nickname}). Total: ${players.size}`);
+    console.log(`[+] Authenticated: ${playerId} (${player.userId}, ${player.nickname}, loc:${player.locationId}). Total: ${players.size}`);
 
     const existingPlayers = [];
     players.forEach((p, id) => {
@@ -558,6 +564,7 @@ wss.on('connection', (ws) => {
             velocityY: p.velocityY || 0,
             health: p.health,
             alive: p.alive,
+            locationId: p.locationId,
           });
         }
       }
@@ -599,6 +606,7 @@ wss.on('connection', (ws) => {
       velocityY: 0,
       health: player.health,
       alive: player.alive,
+      locationId: player.locationId,
     }, playerId, true, player);
 
     broadcastCount();
@@ -642,9 +650,9 @@ wss.on('connection', (ws) => {
     player.position = data.position;
     player.rotation = typeof data.rotation === 'number' ? data.rotation : 0;
     player.pitch = typeof data.pitch === 'number' ? data.pitch : 0;
-    
+
     player.state = VALID_STATES.has(data.state) ? data.state : 'idle';
-    
+
     player.jumping = !!data.jumping;
     player.velocityY = typeof data.velocityY === 'number' ? data.velocityY : 0;
     player.weaponEquipped = data.weaponEquipped !== false;
@@ -669,6 +677,11 @@ wss.on('connection', (ws) => {
 
   function handleShoot(player, data) {
     if (!player.alive) return;
+
+    if (player.locationId !== 'main-world') {
+      safeSend(ws, { type: 'error', message: 'Cannot shoot in this location' });
+      return;
+    }
 
     if (!Array.isArray(data.origin) || !Array.isArray(data.direction)) return;
     if (data.origin.length !== 3 || data.direction.length !== 3) return;
@@ -730,7 +743,7 @@ wss.on('connection', (ws) => {
 
   function handleChat(player, data) {
     if (typeof data.message !== 'string') return;
-    
+
     const msg = sanitizeMessage(data.message.trim().slice(0, 200));
     if (msg.length === 0) return;
 
@@ -752,6 +765,11 @@ wss.on('connection', (ws) => {
     const target = players.get(data.target);
     if (!target || !target.authenticated || !target.alive) return;
     if (data.target === playerId) return;
+
+    if (player.locationId !== target.locationId) {
+      console.log(`[!] Hit hack: different locations ${player.locationId} vs ${target.locationId}`);
+      return;
+    }
 
     const ping = Math.max(0, Date.now() - player.lastPong);
     const shotTime = Date.now() - ping;
@@ -843,6 +861,48 @@ wss.on('connection', (ws) => {
       inventory: data.inventory,
     }).catch(err => console.error('[Save] Error:', err.message));
   }
+
+  function handleLocationChange(player, data) {
+    if (!player.alive) return;
+    if (typeof data.locationId !== 'string') return;
+
+    if (!VALID_LOCATIONS.has(data.locationId)) {
+      console.log(`[!] Invalid location: ${data.locationId} from ${player.id}`);
+      return;
+    }
+
+    const oldLocation = player.locationId;
+    if (oldLocation === data.locationId) return;
+
+    player.locationId = data.locationId;
+    player.justTeleported = true;
+
+    console.log(`[~] Player ${player.id} (${player.nickname}) moved: ${oldLocation} -> ${data.locationId}`);
+
+    broadcast({
+      type: 'playerLeaveLocation',
+      playerId: player.id,
+      fromLocation: oldLocation,
+      toLocation: data.locationId,
+    }, playerId, true, { ...player, locationId: oldLocation });
+
+    broadcast({
+      type: 'playerJoinLocation',
+      id: player.id,
+      nickname: player.nickname,
+      position: player.position,
+      rotation: player.rotation,
+      pitch: player.pitch,
+      state: player.state || 'idle',
+      jumping: player.jumping || false,
+      velocityY: player.velocityY || 0,
+      health: player.health,
+      alive: player.alive,
+      weaponEquipped: player.weaponEquipped,
+      isShooting: player.isShooting,
+      locationId: data.locationId,
+    }, playerId, true, player);
+  }
 });
 
 function broadcast(data, excludeId = null, useAOI = false, senderPlayer = null) {
@@ -850,11 +910,11 @@ function broadcast(data, excludeId = null, useAOI = false, senderPlayer = null) 
   players.forEach((p, id) => {
     if (id === excludeId) return;
     if (!p.authenticated || p.ws.readyState !== WebSocket.OPEN) return;
-    
+
     if (useAOI && senderPlayer) {
       if (!isInAOI(senderPlayer, p)) return;
     }
-    
+
     try {
       p.ws.send(message);
     } catch (err) {
