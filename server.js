@@ -11,7 +11,7 @@ const CONFIG = {
   world: {
     size: 1000,
     zoneSize: 100,
-    aoiRadius: 2, // Радиус видимости в зонах (2 = 5x5 зон)
+    aoiRadius: 2,
     maxSpeed: 15,
     maxPositionUpdateRate: 50,
   },
@@ -189,7 +189,6 @@ function generateId() {
   return crypto.randomBytes(16).toString('hex');
 }
 
-// Area of Interest функции
 function getPlayerZone(player) {
   const halfSize = CONFIG.world.size / 2;
   const zoneX = Math.floor((player.position[0] + halfSize) / CONFIG.world.zoneSize);
@@ -543,7 +542,6 @@ wss.on('connection', (ws) => {
 
     console.log(`[+] Authenticated: ${playerId} (${player.userId}, ${player.nickname}). Total: ${players.size}`);
 
-    // Отправляем только игроков в Area of Interest
     const existingPlayers = [];
     players.forEach((p, id) => {
       if (id !== playerId && p.authenticated) {
@@ -589,7 +587,6 @@ wss.on('connection', (ws) => {
       });
     }
 
-    // Broadcast с AoI
     broadcast({
       type: 'playerJoin',
       id: playerId,
@@ -654,7 +651,6 @@ wss.on('connection', (ws) => {
     player.isShooting = !!data.isShooting;
     player.lastUpdate = now;
 
-    // Broadcast с AoI
     broadcast({
       type: 'playerUpdate',
       id: playerId,
@@ -704,7 +700,6 @@ wss.on('connection', (ws) => {
 
     player.stats.shotsFired++;
 
-    // Broadcast с AoI
     broadcast({
       type: 'shoot',
       id: playerId,
@@ -739,7 +734,6 @@ wss.on('connection', (ws) => {
     const msg = sanitizeMessage(data.message.trim().slice(0, 200));
     if (msg.length === 0) return;
 
-    // Чат шлём всем (без AoI)
     broadcast({
       type: 'chat',
       id: generateId(),
@@ -788,7 +782,6 @@ wss.on('connection', (ws) => {
     target.health = Math.max(0, target.health - damage);
     target.lastDamageTime = Date.now();
 
-    // Broadcast с AoI
     broadcast({
       type: 'playerDamaged',
       targetId: data.target,
@@ -852,14 +845,12 @@ wss.on('connection', (ws) => {
   }
 });
 
-// Обновлённая функция broadcast с поддержкой AoI
 function broadcast(data, excludeId = null, useAOI = false, senderPlayer = null) {
   const message = getCachedMessage(data);
   players.forEach((p, id) => {
     if (id === excludeId) return;
     if (!p.authenticated || p.ws.readyState !== WebSocket.OPEN) return;
     
-    // Если используем AoI — проверяем зону
     if (useAOI && senderPlayer) {
       if (!isInAOI(senderPlayer, p)) return;
     }
