@@ -61,6 +61,13 @@ const ENEMY_CONFIG = {
   patrolPauseMaxMs: 5000,
 };
 
+const WEAPON_CONFIG = {
+  maxAmmo: 30,
+  fireRateMs: 120,
+  fireRateToleranceMs: 20, 
+  reloadDurationMs: 2000,
+};
+
 const CRYSTAL_POSITION = [0, 0];
 const CRYSTAL_EXCLUSION_RADIUS = 50;
 
@@ -102,6 +109,7 @@ const wss = new WebSocket.Server({
 });
 
 const players = new Map();
+const userIdToPlayer = new Map();
 const rateLimits = new Map();
 const enemies = new Map();
 let nextEnemyId = 0;
@@ -116,6 +124,30 @@ const VALID_LOCATIONS = new Set([
   'open-world-canyon',
   ...Array.from({ length: 39 }, (_, i) => `canyon-token-${String(i + 1).padStart(2, '0')}`),
 ]);
+
+const LOCATION_MAX_RADIUS = {
+  'tower-main-hall': 70,
+  'tower-first-floor': 70,
+  'tower-basement': 70,
+  cave: 180,
+  'open-world-canyon': 150,
+};
+const MIN_LOCATION_CHANGE_INTERVAL_MS = 1000;
+const TELEPORT_SETTLE_TOLERANCE = 20;
+
+function getLocationMaxRadius(locationId) {
+  if (LOCATION_MAX_RADIUS[locationId] != null) return LOCATION_MAX_RADIUS[locationId];
+  if (locationId.startsWith('canyon-token-')) return 150;
+  return null; 
+}
+
+function isValidPositionForLocation(locationId, pos) {
+  if (!isValidPosition(pos)) return false;
+  const maxRadius = getLocationMaxRadius(locationId);
+  if (maxRadius == null) return true;
+  const [x, , z] = pos;
+  return Math.sqrt(x * x + z * z) <= maxRadius;
+}
 
 function getCachedMessage(data) {
   return JSON.stringify(data);
@@ -164,15 +196,15 @@ function isValidMovement(player, newPosition, deltaTimeMs) {
   const dx = nx - ox;
   const dz = nz - oz;
   const distance = Math.sqrt(dx * dx + dz * dz);
-  const seconds = deltaTimeMs / 1000;
-  const speed = distance / seconds;
 
   if (player.justSpawned || player.justTeleported) {
     player.justSpawned = false;
     player.justTeleported = false;
-    return true;
+    return distance <= TELEPORT_SETTLE_TOLERANCE;
   }
 
+  const seconds = deltaTimeMs / 1000;
+  const speed = distance / seconds;
   return speed <= CONFIG.world.maxSpeed * 1.5;
 }
 
@@ -217,6 +249,42 @@ function distanceFromRay(origin, direction, point, maxRange) {
   const cz = origin[2] + direction[2] * clampedT;
 
   return Math.sqrt((point[0] - cx) ** 2 + (point[1] - cy) ** 2 + (point[2] - cz) ** 2);
+}
+
+const ENTITY_OCCLUSION_RADIUS = 0.6;
+
+function isPathBlockedByEntity(origin, target, locationId, excludeIds) {
+  const segX = target[0] - origin[0];
+  const segZ = target[2] - origin[2];
+  const segLenSq = segX * segX + segZ * segZ;
+  if (segLenSq < 0.0001) return false;
+
+  function blocks(pos) {
+    const px = pos[0] - origin[0];
+    const pz = pos[2] - origin[2];
+    const t = (px * segX + pz * segZ) / segLenSq;
+    if (t <= 0.02 || t >= 0.98) return false; 
+    const cx = origin[0] + segX * t;
+    const cz = origin[2] + segZ * t;
+    const dx = pos[0] - cx;
+    const dz = pos[2] - cz;
+    return Math.sqrt(dx * dx + dz * dz) <= ENTITY_OCCLUSION_RADIUS;
+  }
+
+  for (const p of players.values()) {
+    if (!p.authenticated || !p.alive) continue;
+    if (excludeIds.has(p.id)) continue;
+    if (p.locationId !== locationId) continue;
+    if (blocks(p.position)) return true;
+  }
+  if (locationId === 'main-world') {
+    for (const e of enemies.values()) {
+      if (!e.alive) continue;
+      if (excludeIds.has(e.id)) continue;
+      if (blocks(e.position)) return true;
+    }
+  }
+  return false;
 }
 
 function findMatchingShot(player, targetHistoricalPos, now, tolerance = CONFIG.combat.hitTolerance) {
@@ -805,6 +873,10 @@ wss.on('connection', (ws) => {
     lastUpdate: 0,
     justSpawned: false,
     justTeleported: false,
+    lastLocationChangeAt: 0,
+    weaponAmmo: WEAPON_CONFIG.maxAmmo,
+    lastShotAt: 0,
+    ammoEmptyAt: 0,
     sessionStart: Date.now(),
     health: 100,
     maxHealth: 100,
@@ -830,7 +902,10 @@ wss.on('connection', (ws) => {
         ws.close(4001, 'Authentication timeout');
       }
     }, 10000),
+    authAttempts: 0,
   };
+
+  players.set(playerId, player);
 
   ws.on('message', (raw) => {
     try {
@@ -839,7 +914,19 @@ wss.on('connection', (ws) => {
 
       if (!player.authenticated) {
         if (data.type === 'auth') {
-          handleAuth(player, data);
+          player.authAttempts++;
+          if (player.authAttempts > 5) {
+            safeSend(ws, { type: 'auth_error', error: 'too_many_attempts' });
+            ws.close(4008, 'too_many_auth_attempts');
+            return;
+          }
+          handleAuth(player, data).catch((err) => {
+            console.error(`[!] handleAuth error for ${playerId}:`, err.message);
+            if (player.userId && userIdToPlayer.get(player.userId) === player) {
+              userIdToPlayer.delete(player.userId);
+            }
+            try { ws.close(4000, 'auth_error'); } catch (e) { }
+          });
           return;
         } else {
           safeSend(ws, { type: 'auth_error', error: 'auth_required' });
@@ -911,6 +998,10 @@ wss.on('connection', (ws) => {
       persistPlayer(player);
     }
 
+    if (player.userId && userIdToPlayer.get(player.userId) === player) {
+      userIdToPlayer.delete(player.userId);
+    }
+
     players.delete(playerId);
     console.log(`[-] Player left: ${playerId} (${player.userId || 'unauth'}). Total: ${players.size}`);
 
@@ -942,16 +1033,18 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    for (const [otherId, otherPlayer] of players) {
-      if (otherPlayer.authenticated && otherPlayer.userId === verifyResult.userId) {
-        console.log(`[~] Duplicate session for user ${verifyResult.userId}, closing old connection ${otherId}`);
-        otherPlayer.authenticated = false;
-        safeSend(otherPlayer.ws, { type: 'auth_error', error: 'duplicate_session' });
-        try { otherPlayer.ws.close(4009, 'duplicate_session'); } catch (e) { }
-        players.delete(otherId);
-        broadcast({ type: 'playerLeave', playerId: otherId }, otherId, true, otherPlayer);
+    const existingOwner = userIdToPlayer.get(verifyResult.userId);
+    if (existingOwner && existingOwner !== player) {
+      console.log(`[~] Duplicate session for user ${verifyResult.userId}, closing old connection ${existingOwner.id}`);
+      existingOwner.authenticated = false;
+      safeSend(existingOwner.ws, { type: 'auth_error', error: 'duplicate_session' });
+      try { existingOwner.ws.close(4009, 'duplicate_session'); } catch (e) { }
+      if (players.get(existingOwner.id) === existingOwner) {
+        players.delete(existingOwner.id);
+        broadcast({ type: 'playerLeave', playerId: existingOwner.id }, existingOwner.id, true, existingOwner);
       }
     }
+    userIdToPlayer.set(verifyResult.userId, player);
 
     player.userId = verifyResult.userId;
     player.wallet = verifyResult.wallet;
@@ -1049,7 +1142,7 @@ wss.on('connection', (ws) => {
       type: 'init',
       playerId,
       players: existingPlayers,
-      count: players.size,
+      count: Array.from(players.values()).filter((p) => p.authenticated).length,
       spawnPosition: player.position,
     });
 
@@ -1087,7 +1180,7 @@ wss.on('connection', (ws) => {
 
   function handlePlayerUpdate(player, data) {
     if (!player.alive) return;
-    if (!isValidPosition(data.position)) return;
+    if (!isValidPositionForLocation(player.locationId, data.position)) return;
 
     const now = Date.now();
     const delta = now - player.lastUpdate;
@@ -1148,6 +1241,21 @@ wss.on('connection', (ws) => {
     if (!Array.isArray(data.origin) || !Array.isArray(data.direction)) return;
     if (data.origin.length !== 3 || data.direction.length !== 3) return;
 
+    const now = Date.now();
+
+    if (player.weaponAmmo <= 0) {
+      if (now - player.ammoEmptyAt >= WEAPON_CONFIG.reloadDurationMs) {
+        player.weaponAmmo = WEAPON_CONFIG.maxAmmo;
+      } else {
+        return; 
+      }
+    }
+
+    if (now - player.lastShotAt < WEAPON_CONFIG.fireRateMs - WEAPON_CONFIG.fireRateToleranceMs) {
+      console.log(`[!] Shoot hack: ${playerId} firing faster than weapon fire rate`);
+      return;
+    }
+
     const [px, , pz] = player.position;
     const [ox, oy, oz] = data.origin;
     const [dx, dy, dz] = data.direction;
@@ -1175,9 +1283,12 @@ wss.on('connection', (ws) => {
       }
     }
 
+    player.weaponAmmo--;
+    player.lastShotAt = now;
+    if (player.weaponAmmo <= 0) player.ammoEmptyAt = now;
+
     player.stats.shotsFired++;
 
-    const now = Date.now();
     player.recentShots.push({ time: now, origin: [ox, oy, oz], direction });
     player.recentShots = player.recentShots.filter(
       s => now - s.time < CONFIG.combat.shotMatchWindowMs
@@ -1265,6 +1376,11 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (isPathBlockedByEntity(player.position, historicalPos, player.locationId, new Set([playerId, data.target]))) {
+      console.log(`[!] Hit rejected: shot from ${playerId} to ${data.target} blocked by another entity`);
+      return;
+    }
+
     const targetDistFromCenter = Math.sqrt(tx * tx + tz * tz);
     if (inMainWorld && targetDistFromCenter < 30) {
       safeSend(ws, { type: 'error', message: 'Target is in safe zone' });
@@ -1319,6 +1435,11 @@ wss.on('connection', (ws) => {
     const matchedShot = findMatchingShot(player, historicalPos, Date.now(), ENEMY_CONFIG.hitTolerance);
     if (!matchedShot) {
       console.log(`[!] Enemy hit hack: no matching recent shot from ${playerId} explains hit on ${data.target}`);
+      return;
+    }
+
+    if (isPathBlockedByEntity(player.position, historicalPos, player.locationId, new Set([playerId, enemy.id]))) {
+      console.log(`[!] Enemy hit rejected: shot from ${playerId} to ${data.target} blocked by another entity`);
       return;
     }
 
@@ -1396,6 +1517,11 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (player.sellInFlight) {
+      safeSend(ws, { type: 'error', message: 'A sell is already in progress' });
+      return;
+    }
+
     const entry = player.inventory.find((e) => e.address === data.address);
     if (!entry || entry.quantity <= 0) {
       safeSend(ws, { type: 'error', message: 'You no longer have that item' });
@@ -1406,40 +1532,45 @@ wss.on('connection', (ws) => {
     const sellQty = Math.min(requestedQty, entry.quantity);
     if (sellQty <= 0) return;
 
-    let marketCap = 0;
+    player.sellInFlight = true;
     try {
-      const url = new URL('/api/token-by-ca', CONFIG.siteUrl);
-      url.searchParams.set('ca', data.address);
-      const res = await fetch(url.toString());
-      const json = await res.json();
-      marketCap = Number(json?.mc) || 0;
-    } catch (err) {
-      console.error('[Vendor] Market cap lookup failed:', err.message);
-      safeSend(ws, { type: 'error', message: 'Could not price token right now' });
-      return;
+      let marketCap = 0;
+      try {
+        const url = new URL('/api/token-by-ca', CONFIG.siteUrl);
+        url.searchParams.set('ca', data.address);
+        const res = await fetch(url.toString());
+        const json = await res.json();
+        marketCap = Number(json?.mc) || 0;
+      } catch (err) {
+        console.error('[Vendor] Market cap lookup failed:', err.message);
+        safeSend(ws, { type: 'error', message: 'Could not price token right now' });
+        return;
+      }
+
+      const current = player.inventory.find((e) => e.address === data.address);
+      if (!current || current.quantity <= 0) return;
+      const finalQty = Math.min(sellQty, current.quantity);
+
+      const ashPerToken = ashForMarketCap(marketCap);
+      const ashEarned = ashPerToken * finalQty;
+
+      current.quantity -= finalQty;
+      player.inventory = player.inventory.filter((e) => e.quantity > 0);
+      player.ash += ashEarned;
+
+      persistPlayer(player);
+
+      safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
+      safeSend(ws, {
+        type: 'sellResult',
+        address: data.address,
+        quantitySold: finalQty,
+        ashEarned,
+        marketCap,
+      });
+    } finally {
+      player.sellInFlight = false;
     }
-
-    const current = player.inventory.find((e) => e.address === data.address);
-    if (!current || current.quantity <= 0) return;
-    const finalQty = Math.min(sellQty, current.quantity);
-
-    const ashPerToken = ashForMarketCap(marketCap);
-    const ashEarned = ashPerToken * finalQty;
-
-    current.quantity -= finalQty;
-    player.inventory = player.inventory.filter((e) => e.quantity > 0);
-    player.ash += ashEarned;
-
-    persistPlayer(player);
-
-    safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
-    safeSend(ws, {
-      type: 'sellResult',
-      address: data.address,
-      quantitySold: finalQty,
-      ashEarned,
-      marketCap,
-    });
   }
 
   function handleSaveProgress(player) {
@@ -1458,7 +1589,14 @@ wss.on('connection', (ws) => {
     const oldLocation = player.locationId;
     if (oldLocation === data.locationId) return;
 
+    const now = Date.now();
+    if (now - player.lastLocationChangeAt < MIN_LOCATION_CHANGE_INTERVAL_MS) {
+      return;
+    }
+    player.lastLocationChangeAt = now;
+
     player.locationId = data.locationId;
+    spawnInSafeZone(player);
     player.justTeleported = true;
     player.positionHistory = [];
     player.recentShots = [];
