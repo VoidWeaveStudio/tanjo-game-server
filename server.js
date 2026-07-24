@@ -25,6 +25,11 @@ const CONFIG = {
     shootRateLimit: 10,
     hitRateLimit: 15,
   },
+  combat: {
+    maxShotRange: 200,
+    hitTolerance: 3,
+    shotMatchWindowMs: 500,
+  },
   siteUrl: process.env.SITE_URL || 'https://theadvenjo.online',
   internalSecret: process.env.INTERNAL_API_SECRET,
   gameTokenSecret: process.env.GAME_TOKEN_SECRET || process.env.JWT_SECRET,
@@ -58,7 +63,15 @@ const players = new Map();
 const rateLimits = new Map();
 
 const VALID_STATES = new Set(['idle', 'walk', 'sprint', 'jump']);
-const VALID_LOCATIONS = new Set(['main-world', 'cave']);
+const VALID_LOCATIONS = new Set([
+  'main-world',
+  'cave',
+  'tower-main-hall',
+  'tower-first-floor',
+  'tower-basement',
+  'open-world-canyon',
+  ...Array.from({ length: 39 }, (_, i) => `canyon-token-${String(i + 1).padStart(2, '0')}`),
+]);
 
 const broadcastCache = new Map();
 const CACHE_TTL = 100;
@@ -145,11 +158,17 @@ function getHistoricalPosition(player, targetTime) {
   const history = player.positionHistory || [];
   if (history.length === 0) return player.position;
 
+  // Never look outside the retained window - clamping here means a bad
+  // targetTime (e.g. from a stale/garbage ping estimate) degrades to "use
+  // the oldest/newest known sample" instead of extrapolating the movement
+  // vector arbitrarily far and landing nowhere near the real position.
+  const clampedTime = Math.max(history[0].time, Math.min(history[history.length - 1].time, targetTime));
+
   let before = history[0];
   let after = history[history.length - 1];
 
   for (let i = 0; i < history.length - 1; i++) {
-    if (history[i].time <= targetTime && history[i + 1].time >= targetTime) {
+    if (history[i].time <= clampedTime && history[i + 1].time >= clampedTime) {
       before = history[i];
       after = history[i + 1];
       break;
@@ -159,12 +178,42 @@ function getHistoricalPosition(player, targetTime) {
   const timeDiff = after.time - before.time;
   if (timeDiff <= 0) return before.position;
 
-  const t = (targetTime - before.time) / timeDiff;
+  const t = (clampedTime - before.time) / timeDiff;
   return [
     before.position[0] + (after.position[0] - before.position[0]) * t,
     before.position[1] + (after.position[1] - before.position[1]) * t,
     before.position[2] + (after.position[2] - before.position[2]) * t,
   ];
+}
+
+function distanceFromRay(origin, direction, point, maxRange) {
+  const ox = point[0] - origin[0];
+  const oy = point[1] - origin[1];
+  const oz = point[2] - origin[2];
+
+  const t = ox * direction[0] + oy * direction[1] + oz * direction[2];
+  const clampedT = Math.max(0, Math.min(maxRange, t));
+
+  const cx = origin[0] + direction[0] * clampedT;
+  const cy = origin[1] + direction[1] * clampedT;
+  const cz = origin[2] + direction[2] * clampedT;
+
+  return Math.sqrt((point[0] - cx) ** 2 + (point[1] - cy) ** 2 + (point[2] - cz) ** 2);
+}
+
+function findMatchingShot(player, targetHistoricalPos, now) {
+  const shots = player.recentShots || [];
+  for (let i = shots.length - 1; i >= 0; i--) {
+    const shot = shots[i];
+    if (now - shot.time > CONFIG.combat.shotMatchWindowMs) continue;
+
+    const dist = distanceFromRay(shot.origin, shot.direction, targetHistoricalPos, CONFIG.combat.maxShotRange);
+    if (dist <= CONFIG.combat.hitTolerance) {
+      shots.splice(i, 1);
+      return shot;
+    }
+  }
+  return null;
 }
 
 function safeSend(ws, data) {
@@ -294,6 +343,7 @@ setInterval(() => {
   const now = Date.now();
   players.forEach((player) => {
     if (!player.authenticated) return;
+    player.lastPingSentAt = now;
     safeSend(player.ws, { type: 'ping', t: now });
     if (now - player.lastPong > CONFIG.network.heartbeatTimeout) {
       console.log(`[!] Heartbeat timeout: ${player.id}`);
@@ -370,6 +420,8 @@ wss.on('connection', (ws) => {
     authenticated: false,
     lastSeen: Date.now(),
     lastPong: Date.now(),
+    lastPingSentAt: 0,
+    rtt: 50,
     lastUpdate: 0,
     justSpawned: false,
     justTeleported: false,
@@ -379,6 +431,7 @@ wss.on('connection', (ws) => {
     alive: true,
     lastDamageTime: 0,
     positionHistory: [],
+    recentShots: [],
     weaponEquipped: true,
     isShooting: false,
     respawnToken: null,
@@ -414,7 +467,11 @@ wss.on('connection', (ws) => {
       }
 
       if (data.type === 'pong') {
-        player.lastPong = Date.now();
+        const now = Date.now();
+        player.lastPong = now;
+        if (typeof data.t === 'number' && data.t === player.lastPingSentAt) {
+          player.rtt = Math.max(0, Math.min(1000, now - data.t));
+        }
         return;
       }
 
@@ -443,7 +500,7 @@ wss.on('connection', (ws) => {
         case 'nicknameChange': handleNicknameChange(player, data); break;
         case 'chat': handleChat(player, data); break;
         case 'hit': handleHit(player, data); break;
-        case 'saveProgress': handleSaveProgress(player, data); break;
+        case 'saveProgress': handleSaveProgress(player); break;
         case 'locationChange': handleLocationChange(player, data); break;
       }
     } catch (error) {
@@ -502,6 +559,22 @@ wss.on('connection', (ws) => {
       safeSend(ws, { type: 'auth_error', error });
       ws.close(4003, error);
       return;
+    }
+
+    for (const [otherId, otherPlayer] of players) {
+      if (otherPlayer.authenticated && otherPlayer.userId === verifyResult.userId) {
+        console.log(`[~] Duplicate session for user ${verifyResult.userId}, closing old connection ${otherId}`);
+        // Mark unauthenticated *before* closing so its own 'close' handler
+        // (fired async by the WS close handshake) skips the final-save and
+        // playerLeave/broadcastCount it would otherwise redo, and - most
+        // importantly - doesn't overwrite the new session's progress with
+        // this stale connection's state.
+        otherPlayer.authenticated = false;
+        safeSend(otherPlayer.ws, { type: 'auth_error', error: 'duplicate_session' });
+        try { otherPlayer.ws.close(4009, 'duplicate_session'); } catch (e) { /* ignore */ }
+        players.delete(otherId);
+        broadcast({ type: 'playerLeave', playerId: otherId }, otherId, true, otherPlayer);
+      }
     }
 
     player.userId = verifyResult.userId;
@@ -678,11 +751,6 @@ wss.on('connection', (ws) => {
   function handleShoot(player, data) {
     if (!player.alive) return;
 
-    if (player.locationId !== 'main-world') {
-      safeSend(ws, { type: 'error', message: 'Cannot shoot in this location' });
-      return;
-    }
-
     if (!Array.isArray(data.origin) || !Array.isArray(data.direction)) return;
     if (data.origin.length !== 3 || data.direction.length !== 3) return;
 
@@ -712,6 +780,12 @@ wss.on('connection', (ws) => {
     }
 
     player.stats.shotsFired++;
+
+    const now = Date.now();
+    player.recentShots.push({ time: now, origin: [ox, oy, oz], direction });
+    player.recentShots = player.recentShots.filter(
+      s => now - s.time < CONFIG.combat.shotMatchWindowMs
+    );
 
     broadcast({
       type: 'shoot',
@@ -771,11 +845,16 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    const ping = Math.max(0, Date.now() - player.lastPong);
-    const shotTime = Date.now() - ping;
+    const [px, , pz] = player.position;
+    const attackerDistFromCenter = Math.sqrt(px * px + pz * pz);
+    if (attackerDistFromCenter < 30) {
+      console.log(`[!] Hit hack: attacker ${playerId} shooting from safe zone`);
+      return;
+    }
+
+    const shotTime = Date.now() - player.rtt;
     const historicalPos = getHistoricalPosition(target, shotTime);
 
-    const [px, , pz] = player.position;
     const [tx, , tz] = historicalPos;
     const dist = Math.sqrt((tx - px) ** 2 + (tz - pz) ** 2);
     if (dist > 300) {
@@ -783,10 +862,9 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    const [hx, , hz] = data.point;
-    const hitDist = Math.sqrt((tx - hx) ** 2 + (tz - hz) ** 2);
-    if (hitDist > 3) {
-      console.log(`[!] Hit hack: hit point ${hitDist.toFixed(2)}m from historical pos`);
+    const matchedShot = findMatchingShot(player, historicalPos, Date.now());
+    if (!matchedShot) {
+      console.log(`[!] Hit hack: no matching recent shot from ${playerId} explains hit on ${data.target}`);
       return;
     }
 
@@ -806,7 +884,7 @@ wss.on('connection', (ws) => {
       attackerId: playerId,
       damage: damage,
       health: target.health,
-      point: data.point,
+      point: historicalPos,
       historicalPosition: historicalPos,
     }, null, true, player);
 
@@ -852,13 +930,16 @@ wss.on('connection', (ws) => {
     }
   }
 
-  function handleSaveProgress(player, data) {
+  function handleSaveProgress(player) {
     if (!CONFIG.internalSecret) return;
 
     savePlayerProgress(player.userId, player.gameId, {
-      progress: data.progress,
-      buildings: data.buildings,
-      inventory: data.inventory,
+      progress: {
+        locationId: player.locationId,
+        position: player.position,
+        rotation: player.rotation,
+        health: player.health,
+      },
     }).catch(err => console.error('[Save] Error:', err.message));
   }
 
@@ -876,6 +957,10 @@ wss.on('connection', (ws) => {
 
     player.locationId = data.locationId;
     player.justTeleported = true;
+    // Stale samples/shots from the old location's coordinate space must
+    // not be usable for hit validation against players in the new one.
+    player.positionHistory = [];
+    player.recentShots = [];
 
     console.log(`[~] Player ${player.id} (${player.nickname}) moved: ${oldLocation} -> ${data.locationId}`);
 
