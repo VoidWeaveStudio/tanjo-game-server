@@ -1,4 +1,5 @@
 // server.js
+require('dotenv').config();
 const WebSocket = require('ws');
 const http = require('http');
 const https = require('https');
@@ -24,6 +25,10 @@ const CONFIG = {
     updateRateLimit: 25,
     shootRateLimit: 10,
     hitRateLimit: 15,
+    sellRateLimit: 20,
+    locationChangeRateLimit: 10,
+    nicknameChangeRateLimit: 3,
+    saveProgressRateLimit: 5,
   },
   combat: {
     maxShotRange: 200,
@@ -35,6 +40,43 @@ const CONFIG = {
   gameTokenSecret: process.env.GAME_TOKEN_SECRET || process.env.JWT_SECRET,
   autoSaveInterval: 30000,
 };
+
+const ENEMY_CONFIG = {
+  maxHealth: 100,
+  aggroRadius: 20,
+  aggroLeash: 150,
+  attackRange: 1.5,
+  attackDamage: 10,
+  attackCooldown: 1000,
+  weaponDamage: 25,
+  respawnDelay: 15000,
+  tickRate: 100,
+  hitTolerance: 5,
+  chaseSpeedNear: 5,
+  chaseSpeedFar: 5 * 3.5,
+  chaseNearThreshold: 10,
+  patrolSpeed: 1.8,
+  patrolRadius: 22,
+  patrolPauseMinMs: 2000,
+  patrolPauseMaxMs: 5000,
+};
+
+const CRYSTAL_POSITION = [0, 0];
+const CRYSTAL_EXCLUSION_RADIUS = 50;
+
+const ENEMY_SPAWN_POINTS = [
+  [60, 0, 60],
+  [-70, 0, 50],
+  [90, 0, -40],
+  [-50, 0, -80],
+  [120, 0, 20],
+];
+
+const DAY_NIGHT_CONFIG = {
+  dayDurationMs: 40 * 60 * 1000,
+  nightDurationMs: 20 * 60 * 1000,
+};
+const dayNightEpoch = Date.now();
 
 if (!CONFIG.internalSecret) {
   console.error('[!] INTERNAL_API_SECRET not set. Persistence disabled.');
@@ -61,6 +103,8 @@ const wss = new WebSocket.Server({
 
 const players = new Map();
 const rateLimits = new Map();
+const enemies = new Map();
+let nextEnemyId = 0;
 
 const VALID_STATES = new Set(['idle', 'walk', 'sprint', 'jump']);
 const VALID_LOCATIONS = new Set([
@@ -73,30 +117,8 @@ const VALID_LOCATIONS = new Set([
   ...Array.from({ length: 39 }, (_, i) => `canyon-token-${String(i + 1).padStart(2, '0')}`),
 ]);
 
-const broadcastCache = new Map();
-const CACHE_TTL = 100;
-
 function getCachedMessage(data) {
-  const key = JSON.stringify(data);
-  const cached = broadcastCache.get(key);
-  const now = Date.now();
-
-  if (cached && now - cached.time < CACHE_TTL) {
-    return cached.message;
-  }
-
-  const message = key;
-  broadcastCache.set(key, { message, time: now });
-
-  if (broadcastCache.size > 1000) {
-    for (const [k, v] of broadcastCache) {
-      if (now - v.time > CACHE_TTL * 10) {
-        broadcastCache.delete(k);
-      }
-    }
-  }
-
-  return message;
+  return JSON.stringify(data);
 }
 
 function sanitizeMessage(msg) {
@@ -158,10 +180,6 @@ function getHistoricalPosition(player, targetTime) {
   const history = player.positionHistory || [];
   if (history.length === 0) return player.position;
 
-  // Never look outside the retained window - clamping here means a bad
-  // targetTime (e.g. from a stale/garbage ping estimate) degrades to "use
-  // the oldest/newest known sample" instead of extrapolating the movement
-  // vector arbitrarily far and landing nowhere near the real position.
   const clampedTime = Math.max(history[0].time, Math.min(history[history.length - 1].time, targetTime));
 
   let before = history[0];
@@ -201,14 +219,14 @@ function distanceFromRay(origin, direction, point, maxRange) {
   return Math.sqrt((point[0] - cx) ** 2 + (point[1] - cy) ** 2 + (point[2] - cz) ** 2);
 }
 
-function findMatchingShot(player, targetHistoricalPos, now) {
+function findMatchingShot(player, targetHistoricalPos, now, tolerance = CONFIG.combat.hitTolerance) {
   const shots = player.recentShots || [];
   for (let i = shots.length - 1; i >= 0; i--) {
     const shot = shots[i];
     if (now - shot.time > CONFIG.combat.shotMatchWindowMs) continue;
 
     const dist = distanceFromRay(shot.origin, shot.direction, targetHistoricalPos, CONFIG.combat.maxShotRange);
-    if (dist <= CONFIG.combat.hitTolerance) {
+    if (dist <= tolerance) {
       shots.splice(i, 1);
       return shot;
     }
@@ -239,6 +257,16 @@ function generateId() {
   return crypto.randomBytes(16).toString('hex');
 }
 
+function safeInterval(fn, ms) {
+  return setInterval(() => {
+    try {
+      fn();
+    } catch (err) {
+      console.error('[!] Interval tick error:', err.message);
+    }
+  }, ms);
+}
+
 function getPlayerZone(player) {
   const halfSize = CONFIG.world.size / 2;
   const zoneX = Math.floor((player.position[0] + halfSize) / CONFIG.world.zoneSize);
@@ -255,6 +283,344 @@ function isInAOI(player, other) {
   const dz = Math.abs(pZone.zoneZ - oZone.zoneZ);
   return dx <= CONFIG.world.aoiRadius && dz <= CONFIG.world.aoiRadius;
 }
+
+function spawnInSafeZone(player) {
+  const angle = Math.random() * Math.PI * 2;
+  const r = 10 + Math.random() * 15;
+  player.position = [Math.cos(angle) * r, 0, Math.sin(angle) * r];
+}
+
+function broadcastToLocation(locationId, data, excludeId = null) {
+  const message = getCachedMessage(data);
+  players.forEach((p, id) => {
+    if (id === excludeId) return;
+    if (!p.authenticated || p.ws.readyState !== WebSocket.OPEN) return;
+    if (p.locationId !== locationId) return;
+    try {
+      p.ws.send(message);
+    } catch (err) {
+      console.error('[!] Broadcast error:', err.message);
+    }
+  });
+}
+
+function spawnEnemy(spawnPoint) {
+  const id = `enemy-${nextEnemyId++}`;
+  enemies.set(id, {
+    id,
+    position: [...spawnPoint],
+    spawnPoint: [...spawnPoint],
+    health: ENEMY_CONFIG.maxHealth,
+    alive: true,
+    targetId: null,
+    lastAttackTime: 0,
+    patrolTarget: null,
+    patrolWaitUntil: 0,
+    positionHistory: [],
+  });
+}
+
+function clampFromCrystal(x, z) {
+  const dx = x - CRYSTAL_POSITION[0];
+  const dz = z - CRYSTAL_POSITION[1];
+  const dist = Math.sqrt(dx * dx + dz * dz);
+  if (dist >= CRYSTAL_EXCLUSION_RADIUS || dist < 0.0001) return [x, z];
+  const scale = CRYSTAL_EXCLUSION_RADIUS / dist;
+  return [CRYSTAL_POSITION[0] + dx * scale, CRYSTAL_POSITION[1] + dz * scale];
+}
+
+function pickPatrolPoint(enemy) {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const angle = Math.random() * Math.PI * 2;
+    const r = Math.random() * ENEMY_CONFIG.patrolRadius;
+    const x = enemy.spawnPoint[0] + Math.cos(angle) * r;
+    const z = enemy.spawnPoint[2] + Math.sin(angle) * r;
+    const dx = x - CRYSTAL_POSITION[0];
+    const dz = z - CRYSTAL_POSITION[1];
+    if (Math.sqrt(dx * dx + dz * dz) >= CRYSTAL_EXCLUSION_RADIUS) {
+      return [x, z];
+    }
+  }
+  return [enemy.spawnPoint[0], enemy.spawnPoint[2]];
+}
+
+function updatePatrol(enemy, now) {
+  if (!enemy.patrolTarget) {
+    if (now < enemy.patrolWaitUntil) return;
+    enemy.patrolTarget = pickPatrolPoint(enemy);
+  }
+
+  const dx = enemy.patrolTarget[0] - enemy.position[0];
+  const dz = enemy.patrolTarget[1] - enemy.position[2];
+  const dist = Math.sqrt(dx * dx + dz * dz);
+
+  if (dist < 0.5) {
+    enemy.patrolTarget = null;
+    enemy.patrolWaitUntil = now + ENEMY_CONFIG.patrolPauseMinMs +
+      Math.random() * (ENEMY_CONFIG.patrolPauseMaxMs - ENEMY_CONFIG.patrolPauseMinMs);
+    return;
+  }
+
+  const len = dist || 1;
+  const step = ENEMY_CONFIG.patrolSpeed * (ENEMY_CONFIG.tickRate / 1000);
+  const [nx, nz] = clampFromCrystal(
+    enemy.position[0] + (dx / len) * step,
+    enemy.position[2] + (dz / len) * step
+  );
+  enemy.position[0] = nx;
+  enemy.position[2] = nz;
+}
+
+function serializeEnemies() {
+  return Array.from(enemies.values()).map((e) => ({
+    id: e.id,
+    position: e.position,
+    health: e.health,
+    maxHealth: ENEMY_CONFIG.maxHealth,
+    alive: e.alive,
+    targetId: e.targetId,
+  }));
+}
+
+function killPlayerAndRespawn(target, killerId, position, respawnDelayMs = 3000) {
+  target.alive = false;
+  target.stats.deaths++;
+
+  broadcast({
+    type: 'playerDeath',
+    playerId: target.id,
+    killerId,
+    position,
+  }, null, true, target);
+
+  const respawnToken = Date.now() + Math.random();
+  target.respawnToken = respawnToken;
+
+  setTimeout(() => {
+    if (target.respawnToken !== respawnToken) return;
+    if (target.ws.readyState !== WebSocket.OPEN) return;
+    if (!target.alive) {
+      target.health = target.maxHealth;
+      target.alive = true;
+      spawnInSafeZone(target);
+      target.justTeleported = true;
+      target.respawnToken = null;
+
+      safeSend(target.ws, {
+        type: 'respawn',
+        position: target.position,
+        health: target.health,
+      });
+
+      broadcast({
+        type: 'playerRespawn',
+        id: target.id,
+        position: target.position,
+        health: target.health,
+      }, target.id, true, target);
+    }
+  }, respawnDelayMs);
+}
+
+function damagePlayerByEnemy(target, enemy) {
+  if (!target.alive) return;
+
+  const damage = ENEMY_CONFIG.attackDamage;
+  target.health = Math.max(0, target.health - damage);
+  target.lastDamageTime = Date.now();
+
+  broadcast({
+    type: 'playerDamaged',
+    targetId: target.id,
+    attackerId: enemy.id,
+    damage,
+    health: target.health,
+    point: target.position,
+    historicalPosition: target.position,
+  }, null, true, target);
+
+  if (target.health <= 0) {
+    killPlayerAndRespawn(target, enemy.id, target.position);
+  }
+}
+
+function enemyTick() {
+  const now = Date.now();
+
+  for (const enemy of enemies.values()) {
+    if (!enemy.alive) continue;
+
+    let target = enemy.targetId ? players.get(enemy.targetId) : null;
+    if (target && (!target.authenticated || !target.alive || target.locationId !== 'main-world')) {
+      target = null;
+      enemy.targetId = null;
+    }
+
+    if (target) {
+      const dx = target.position[0] - enemy.position[0];
+      const dz = target.position[2] - enemy.position[2];
+      if (Math.sqrt(dx * dx + dz * dz) > ENEMY_CONFIG.aggroLeash) {
+        target = null;
+        enemy.targetId = null;
+      }
+    } else {
+      let nearest = null;
+      let nearestDist = Infinity;
+      for (const p of players.values()) {
+        if (!p.authenticated || !p.alive || p.locationId !== 'main-world') continue;
+        const dx = p.position[0] - enemy.position[0];
+        const dz = p.position[2] - enemy.position[2];
+        const dist = Math.sqrt(dx * dx + dz * dz);
+        if (dist < nearestDist) {
+          nearestDist = dist;
+          nearest = p;
+        }
+      }
+      if (nearest && nearestDist <= ENEMY_CONFIG.aggroRadius) {
+        target = nearest;
+        enemy.targetId = nearest.id;
+      }
+    }
+
+    if (target) {
+      enemy.patrolTarget = null;
+
+      const dx = target.position[0] - enemy.position[0];
+      const dz = target.position[2] - enemy.position[2];
+      const dist = Math.sqrt(dx * dx + dz * dz);
+
+      if (dist > ENEMY_CONFIG.attackRange) {
+        const speed = dist > ENEMY_CONFIG.chaseNearThreshold
+          ? ENEMY_CONFIG.chaseSpeedFar
+          : ENEMY_CONFIG.chaseSpeedNear;
+        const len = dist || 1;
+        const step = speed * (ENEMY_CONFIG.tickRate / 1000);
+        const [nx, nz] = clampFromCrystal(
+          enemy.position[0] + (dx / len) * step,
+          enemy.position[2] + (dz / len) * step
+        );
+        enemy.position[0] = nx;
+        enemy.position[2] = nz;
+      } else if (now - enemy.lastAttackTime >= ENEMY_CONFIG.attackCooldown) {
+        enemy.lastAttackTime = now;
+        damagePlayerByEnemy(target, enemy);
+      }
+    } else {
+      updatePatrol(enemy, now);
+    }
+
+    enemy.positionHistory.push({ position: [...enemy.position], time: now });
+    enemy.positionHistory = enemy.positionHistory.filter((p) => now - p.time < 1000);
+  }
+
+  broadcastToLocation('main-world', {
+    type: 'enemyState',
+    enemies: serializeEnemies(),
+  });
+}
+
+ENEMY_SPAWN_POINTS.forEach(spawnEnemy);
+safeInterval(enemyTick, ENEMY_CONFIG.tickRate);
+
+const LOOT_CONFIG = {
+  pollIntervalMs: 10000,
+  minDrop: 1,
+  maxDrop: 3,
+  pickupRadius: 3,
+  despawnMs: 5 * 60 * 1000,
+  maxInventory: 200,
+};
+
+let tokenPool = [];
+const lootDrops = new Map();
+let nextLootId = 0;
+
+async function refreshTokenPool() {
+  try {
+    const url = new URL('/api/new-tokens', CONFIG.siteUrl).toString();
+    const res = await fetch(url);
+    if (!res.ok) return;
+    const tokens = await res.json();
+    if (Array.isArray(tokens) && tokens.length > 0) {
+      tokenPool = tokens;
+    }
+  } catch (err) {
+    console.error('[TokenPool] refresh error:', err.message);
+  }
+}
+
+refreshTokenPool();
+safeInterval(refreshTokenPool, LOOT_CONFIG.pollIntervalMs);
+
+function serializeLoot() {
+  return Array.from(lootDrops.values()).map((l) => ({
+    id: l.id,
+    position: l.position,
+    tokens: l.tokens,
+  }));
+}
+
+function addTokensToInventory(player, tokens) {
+  for (const t of tokens) {
+    const existing = player.inventory.find((e) => e.address === t.address);
+    if (existing) {
+      existing.quantity++;
+    } else if (player.inventory.length < LOOT_CONFIG.maxInventory) {
+      player.inventory.push({
+        address: t.address,
+        name: t.name,
+        symbol: t.symbol,
+        image: t.image,
+        quantity: 1,
+      });
+    }
+  }
+}
+
+function ashForMarketCap(mc) {
+  if (mc < 10000) return 1;
+  if (mc < 50000) return 2;
+  if (mc < 100000) return 4;
+  if (mc < 500000) return 10;
+  return 20;
+}
+
+function dropLoot(position) {
+  if (tokenPool.length === 0) return;
+
+  const count = LOOT_CONFIG.minDrop + Math.floor(Math.random() * (LOOT_CONFIG.maxDrop - LOOT_CONFIG.minDrop + 1));
+  const tokens = [];
+  for (let i = 0; i < count; i++) {
+    const t = tokenPool[Math.floor(Math.random() * tokenPool.length)];
+    tokens.push({
+      address: t.address,
+      name: t.name,
+      symbol: t.symbol,
+      image: t.image,
+    });
+  }
+
+  const id = `loot-${nextLootId++}`;
+  const loot = { id, position: [...position], tokens, createdAt: Date.now() };
+  lootDrops.set(id, loot);
+
+  broadcastToLocation('main-world', {
+    type: 'lootSpawn',
+    id: loot.id,
+    position: loot.position,
+    tokens: loot.tokens,
+  });
+}
+
+safeInterval(() => {
+  const now = Date.now();
+  for (const [id, loot] of lootDrops) {
+    if (now - loot.createdAt > LOOT_CONFIG.despawnMs) {
+      lootDrops.delete(id);
+      broadcastToLocation('main-world', { type: 'lootDespawn', id });
+    }
+  }
+}, 30000);
 
 async function callInternalApi(endpoint, data) {
   if (!CONFIG.internalSecret) {
@@ -339,7 +705,39 @@ async function savePlayerProgress(userId, gameId, data) {
   }
 }
 
-setInterval(() => {
+function buildSavePayload(player) {
+  return {
+    progress: {
+      locationId: player.locationId,
+      position: player.position,
+      rotation: player.rotation,
+      health: player.health,
+      data: { ash: player.ash },
+    },
+    nickname: player.nickname,
+    inventory: player.inventory.map((entry, index) => ({
+      slot: index,
+      itemId: entry.address,
+      quantity: entry.quantity,
+      data: { name: entry.name, symbol: entry.symbol, image: entry.image },
+    })),
+    statistics: {
+      playtimeSeconds: Math.floor((Date.now() - player.sessionStart) / 1000),
+      kills: player.stats.kills,
+      deaths: player.stats.deaths,
+      shotsFired: player.stats.shotsFired,
+      buildingsPlaced: player.stats.buildingsPlaced,
+    },
+  };
+}
+
+function persistPlayer(player) {
+  if (!CONFIG.internalSecret) return;
+  savePlayerProgress(player.userId, player.gameId, buildSavePayload(player))
+    .catch((err) => console.error(`[Save] Error for ${player.id}:`, err.message));
+}
+
+safeInterval(() => {
   const now = Date.now();
   players.forEach((player) => {
     if (!player.authenticated) return;
@@ -352,7 +750,7 @@ setInterval(() => {
   });
 }, CONFIG.network.heartbeatInterval);
 
-setInterval(() => {
+safeInterval(() => {
   const now = Date.now();
   players.forEach((p) => {
     if (now - p.lastSeen > CONFIG.network.staleTimeout) {
@@ -365,30 +763,12 @@ setInterval(() => {
   });
 }, 10000);
 
-setInterval(() => {
+safeInterval(() => {
   if (!CONFIG.internalSecret) return;
 
   players.forEach((player) => {
     if (!player.authenticated) return;
-
-    savePlayerProgress(player.userId, player.gameId, {
-      progress: {
-        locationId: player.locationId,
-        position: player.position,
-        rotation: player.rotation,
-        health: player.health,
-      },
-      nickname: player.nickname,
-      statistics: {
-        playtimeSeconds: Math.floor((Date.now() - player.sessionStart) / 1000),
-        kills: player.stats.kills,
-        deaths: player.stats.deaths,
-        shotsFired: player.stats.shotsFired,
-        buildingsPlaced: player.stats.buildingsPlaced,
-      },
-    }).catch(err => {
-      console.error(`[AutoSave] Error for ${player.id}:`, err.message);
-    });
+    persistPlayer(player);
   });
 }, CONFIG.autoSaveInterval);
 
@@ -415,7 +795,7 @@ wss.on('connection', (ws) => {
     jumping: false,
     velocityY: 0,
     lastJump: 0,
-    locationId: 'main-world',
+    locationId: 'tower-main-hall',
     ws,
     authenticated: false,
     lastSeen: Date.now(),
@@ -435,6 +815,8 @@ wss.on('connection', (ws) => {
     weaponEquipped: true,
     isShooting: false,
     respawnToken: null,
+    inventory: [],
+    ash: 0,
     stats: {
       kills: 0,
       deaths: 0,
@@ -487,11 +869,22 @@ wss.on('connection', (ws) => {
           safeSend(ws, { type: 'error', message: 'Shoot rate limit exceeded' });
           return;
         }
-      } else if (data.type === 'hit') {
+      } else if (data.type === 'hit' || data.type === 'enemyHit' || data.type === 'lootPickup') {
         if (!checkRateLimit(playerId, 'hit', CONFIG.network.hitRateLimit)) {
           safeSend(ws, { type: 'error', message: 'Hit rate limit exceeded' });
           return;
         }
+      } else if (data.type === 'sellToken') {
+        if (!checkRateLimit(playerId, 'sell', CONFIG.network.sellRateLimit)) {
+          safeSend(ws, { type: 'error', message: 'Sell rate limit exceeded' });
+          return;
+        }
+      } else if (data.type === 'locationChange') {
+        if (!checkRateLimit(playerId, 'locationChange', CONFIG.network.locationChangeRateLimit)) return;
+      } else if (data.type === 'nicknameChange') {
+        if (!checkRateLimit(playerId, 'nicknameChange', CONFIG.network.nicknameChangeRateLimit)) return;
+      } else if (data.type === 'saveProgress') {
+        if (!checkRateLimit(playerId, 'saveProgress', CONFIG.network.saveProgressRateLimit)) return;
       }
 
       switch (data.type) {
@@ -500,6 +893,9 @@ wss.on('connection', (ws) => {
         case 'nicknameChange': handleNicknameChange(player, data); break;
         case 'chat': handleChat(player, data); break;
         case 'hit': handleHit(player, data); break;
+        case 'enemyHit': handleEnemyHit(player, data); break;
+        case 'lootPickup': handleLootPickup(player, data); break;
+        case 'sellToken': handleSellToken(player, data); break;
         case 'saveProgress': handleSaveProgress(player); break;
         case 'locationChange': handleLocationChange(player, data); break;
       }
@@ -511,23 +907,8 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     clearTimeout(player.authTimeout);
 
-    if (player.authenticated && CONFIG.internalSecret) {
-      savePlayerProgress(player.userId, player.gameId, {
-        progress: {
-          locationId: player.locationId,
-          position: player.position,
-          rotation: player.rotation,
-          health: player.health,
-        },
-        nickname: player.nickname,
-        statistics: {
-          playtimeSeconds: Math.floor((Date.now() - player.sessionStart) / 1000),
-          kills: player.stats.kills,
-          deaths: player.stats.deaths,
-          shotsFired: player.stats.shotsFired,
-          buildingsPlaced: player.stats.buildingsPlaced,
-        },
-      }).catch(err => console.error('[FinalSave] Error:', err.message));
+    if (player.authenticated) {
+      persistPlayer(player);
     }
 
     players.delete(playerId);
@@ -564,14 +945,9 @@ wss.on('connection', (ws) => {
     for (const [otherId, otherPlayer] of players) {
       if (otherPlayer.authenticated && otherPlayer.userId === verifyResult.userId) {
         console.log(`[~] Duplicate session for user ${verifyResult.userId}, closing old connection ${otherId}`);
-        // Mark unauthenticated *before* closing so its own 'close' handler
-        // (fired async by the WS close handshake) skips the final-save and
-        // playerLeave/broadcastCount it would otherwise redo, and - most
-        // importantly - doesn't overwrite the new session's progress with
-        // this stale connection's state.
         otherPlayer.authenticated = false;
         safeSend(otherPlayer.ws, { type: 'auth_error', error: 'duplicate_session' });
-        try { otherPlayer.ws.close(4009, 'duplicate_session'); } catch (e) { /* ignore */ }
+        try { otherPlayer.ws.close(4009, 'duplicate_session'); } catch (e) { }
         players.delete(otherId);
         broadcast({ type: 'playerLeave', playerId: otherId }, otherId, true, otherPlayer);
       }
@@ -600,7 +976,7 @@ wss.on('connection', (ws) => {
         player.health = savedProgress.progress.health || 100;
         player.locationId = VALID_LOCATIONS.has(savedProgress.progress.locationId)
           ? savedProgress.progress.locationId
-          : 'main-world';
+          : 'tower-main-hall';
       } else {
         spawnInSafeZone(player);
       }
@@ -610,6 +986,20 @@ wss.on('connection', (ws) => {
         player.stats.deaths = savedProgress.statistics.deaths || 0;
         player.stats.shotsFired = savedProgress.statistics.shotsFired || 0;
         player.stats.buildingsPlaced = savedProgress.statistics.buildingsPlaced || 0;
+      }
+
+      player.ash = Math.max(0, Math.floor(Number(savedProgress.progress?.data?.ash) || 0));
+
+      if (Array.isArray(savedProgress.inventory)) {
+        player.inventory = savedProgress.inventory
+          .filter((i) => i && typeof i.itemId === 'string' && i.quantity > 0)
+          .map((i) => ({
+            address: i.itemId,
+            quantity: i.quantity,
+            name: i.data?.name || '',
+            symbol: i.data?.symbol || '',
+            image: i.data?.image || '',
+          }));
       }
     } else {
       player.nickname = generateUniqueNickname(`Player_${player.wallet.slice(0, 4)}`);
@@ -650,6 +1040,9 @@ wss.on('connection', (ws) => {
       userId: player.userId,
       wallet: player.wallet,
       gameId: player.gameId,
+      daySyncEpoch: dayNightEpoch,
+      dayDurationMs: DAY_NIGHT_CONFIG.dayDurationMs,
+      nightDurationMs: DAY_NIGHT_CONFIG.nightDurationMs,
     });
 
     safeSend(ws, {
@@ -659,6 +1052,13 @@ wss.on('connection', (ws) => {
       count: players.size,
       spawnPosition: player.position,
     });
+
+    if (player.locationId === 'main-world') {
+      safeSend(ws, { type: 'enemyState', enemies: serializeEnemies() });
+      safeSend(ws, { type: 'lootState', loot: serializeLoot() });
+    }
+
+    safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
 
     if (savedProgress) {
       safeSend(ws, {
@@ -683,12 +1083,6 @@ wss.on('connection', (ws) => {
     }, playerId, true, player);
 
     broadcastCount();
-  }
-
-  function spawnInSafeZone(player) {
-    const angle = Math.random() * Math.PI * 2;
-    const r = 10 + Math.random() * 15;
-    player.position = [Math.cos(angle) * r, 0, Math.sin(angle) * r];
   }
 
   function handlePlayerUpdate(player, data) {
@@ -773,10 +1167,12 @@ wss.on('connection', (ws) => {
     if (dirLength < 0.001) return;
     const direction = [dx / dirLength, dy / dirLength, dz / dirLength];
 
-    const distFromCenter = Math.sqrt(px * px + pz * pz);
-    if (distFromCenter < 30) {
-      safeSend(ws, { type: 'error', message: 'Cannot shoot in safe zone' });
-      return;
+    if (player.locationId === 'main-world') {
+      const distFromCenter = Math.sqrt(px * px + pz * pz);
+      if (distFromCenter < 30) {
+        safeSend(ws, { type: 'error', message: 'Cannot shoot in safe zone' });
+        return;
+      }
     }
 
     player.stats.shotsFired++;
@@ -846,8 +1242,9 @@ wss.on('connection', (ws) => {
     }
 
     const [px, , pz] = player.position;
+    const inMainWorld = player.locationId === 'main-world';
     const attackerDistFromCenter = Math.sqrt(px * px + pz * pz);
-    if (attackerDistFromCenter < 30) {
+    if (inMainWorld && attackerDistFromCenter < 30) {
       console.log(`[!] Hit hack: attacker ${playerId} shooting from safe zone`);
       return;
     }
@@ -869,7 +1266,7 @@ wss.on('connection', (ws) => {
     }
 
     const targetDistFromCenter = Math.sqrt(tx * tx + tz * tz);
-    if (targetDistFromCenter < 30) {
+    if (inMainWorld && targetDistFromCenter < 30) {
       safeSend(ws, { type: 'error', message: 'Target is in safe zone' });
       return;
     }
@@ -889,58 +1286,164 @@ wss.on('connection', (ws) => {
     }, null, true, player);
 
     if (target.health <= 0) {
-      target.alive = false;
       player.stats.kills++;
-      target.stats.deaths++;
-
-      broadcast({
-        type: 'playerDeath',
-        playerId: data.target,
-        killerId: playerId,
-        position: historicalPos,
-      }, null, true, player);
-
-      const respawnToken = Date.now() + Math.random();
-      target.respawnToken = respawnToken;
-
-      setTimeout(() => {
-        if (target.respawnToken !== respawnToken) return;
-        if (target.ws.readyState !== WebSocket.OPEN) return;
-        if (!target.alive) {
-          target.health = target.maxHealth;
-          target.alive = true;
-          spawnInSafeZone(target);
-          target.justTeleported = true;
-          target.respawnToken = null;
-
-          safeSend(target.ws, {
-            type: 'respawn',
-            position: target.position,
-            health: target.health,
-          });
-
-          broadcast({
-            type: 'playerRespawn',
-            id: target.id,
-            position: target.position,
-            health: target.health,
-          }, target.id, true, target);
-        }
-      }, 3000);
+      killPlayerAndRespawn(target, playerId, historicalPos);
     }
   }
 
-  function handleSaveProgress(player) {
-    if (!CONFIG.internalSecret) return;
+  function handleEnemyHit(player, data) {
+    if (!player.alive) return;
+    if (typeof data.target !== 'string') return;
+    if (!Array.isArray(data.point) || data.point.length !== 3) return;
+    if (player.locationId !== 'main-world') return;
 
-    savePlayerProgress(player.userId, player.gameId, {
-      progress: {
-        locationId: player.locationId,
-        position: player.position,
-        rotation: player.rotation,
-        health: player.health,
-      },
-    }).catch(err => console.error('[Save] Error:', err.message));
+    const enemy = enemies.get(data.target);
+    if (!enemy || !enemy.alive) return;
+
+    const [px, , pz] = player.position;
+    const attackerDistFromCenter = Math.sqrt(px * px + pz * pz);
+    if (attackerDistFromCenter < 30) {
+      console.log(`[!] Enemy hit hack: attacker ${playerId} shooting from safe zone`);
+      return;
+    }
+
+    const shotTime = Date.now() - player.rtt;
+    const historicalPos = getHistoricalPosition(enemy, shotTime);
+
+    const dist = Math.sqrt((historicalPos[0] - px) ** 2 + (historicalPos[2] - pz) ** 2);
+    if (dist > 300) {
+      console.log(`[!] Enemy hit hack: distance ${dist.toFixed(2)}m`);
+      return;
+    }
+
+    const matchedShot = findMatchingShot(player, historicalPos, Date.now(), ENEMY_CONFIG.hitTolerance);
+    if (!matchedShot) {
+      console.log(`[!] Enemy hit hack: no matching recent shot from ${playerId} explains hit on ${data.target}`);
+      return;
+    }
+
+    enemy.health = Math.max(0, enemy.health - ENEMY_CONFIG.weaponDamage);
+
+    broadcastToLocation('main-world', {
+      type: 'enemyDamaged',
+      id: enemy.id,
+      health: enemy.health,
+      attackerId: playerId,
+      point: data.point,
+    });
+
+    if (enemy.health <= 0) {
+      enemy.alive = false;
+      enemy.targetId = null;
+
+      broadcastToLocation('main-world', {
+        type: 'enemyDeath',
+        id: enemy.id,
+        killerId: playerId,
+      });
+
+      dropLoot(enemy.position);
+
+      setTimeout(() => {
+        enemy.health = ENEMY_CONFIG.maxHealth;
+        enemy.alive = true;
+        enemy.position = [...enemy.spawnPoint];
+        enemy.targetId = null;
+        enemy.lastAttackTime = 0;
+        enemy.patrolTarget = null;
+        enemy.patrolWaitUntil = 0;
+        enemy.positionHistory = [];
+
+        broadcastToLocation('main-world', {
+          type: 'enemyRespawn',
+          id: enemy.id,
+          position: enemy.position,
+          health: enemy.health,
+          maxHealth: ENEMY_CONFIG.maxHealth,
+        });
+      }, ENEMY_CONFIG.respawnDelay);
+    } else {
+      enemy.targetId = playerId;
+    }
+  }
+
+  function handleLootPickup(player, data) {
+    if (!player.alive) return;
+    if (typeof data.id !== 'string') return;
+    if (player.locationId !== 'main-world') return;
+
+    const loot = lootDrops.get(data.id);
+    if (!loot) return;
+
+    const [px, , pz] = player.position;
+    const dist = Math.sqrt((loot.position[0] - px) ** 2 + (loot.position[2] - pz) ** 2);
+    if (dist > LOOT_CONFIG.pickupRadius) return;
+
+    lootDrops.delete(data.id);
+
+    addTokensToInventory(player, loot.tokens);
+    persistPlayer(player);
+
+    safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
+    broadcastToLocation('main-world', { type: 'lootDespawn', id: data.id });
+  }
+
+  async function handleSellToken(player, data) {
+    if (!player.alive) return;
+    if (typeof data.address !== 'string') return;
+    if (player.locationId !== 'tower-main-hall') {
+      safeSend(ws, { type: 'error', message: 'You need to be at the vendor in the main hall to sell' });
+      return;
+    }
+
+    const entry = player.inventory.find((e) => e.address === data.address);
+    if (!entry || entry.quantity <= 0) {
+      safeSend(ws, { type: 'error', message: 'You no longer have that item' });
+      return;
+    }
+
+    const requestedQty = Number.isInteger(data.quantity) && data.quantity > 0 ? data.quantity : entry.quantity;
+    const sellQty = Math.min(requestedQty, entry.quantity);
+    if (sellQty <= 0) return;
+
+    let marketCap = 0;
+    try {
+      const url = new URL('/api/token-by-ca', CONFIG.siteUrl);
+      url.searchParams.set('ca', data.address);
+      const res = await fetch(url.toString());
+      const json = await res.json();
+      marketCap = Number(json?.mc) || 0;
+    } catch (err) {
+      console.error('[Vendor] Market cap lookup failed:', err.message);
+      safeSend(ws, { type: 'error', message: 'Could not price token right now' });
+      return;
+    }
+
+    const current = player.inventory.find((e) => e.address === data.address);
+    if (!current || current.quantity <= 0) return;
+    const finalQty = Math.min(sellQty, current.quantity);
+
+    const ashPerToken = ashForMarketCap(marketCap);
+    const ashEarned = ashPerToken * finalQty;
+
+    current.quantity -= finalQty;
+    player.inventory = player.inventory.filter((e) => e.quantity > 0);
+    player.ash += ashEarned;
+
+    persistPlayer(player);
+
+    safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
+    safeSend(ws, {
+      type: 'sellResult',
+      address: data.address,
+      quantitySold: finalQty,
+      ashEarned,
+      marketCap,
+    });
+  }
+
+  function handleSaveProgress(player) {
+    persistPlayer(player);
   }
 
   function handleLocationChange(player, data) {
@@ -957,12 +1460,8 @@ wss.on('connection', (ws) => {
 
     player.locationId = data.locationId;
     player.justTeleported = true;
-    // Stale samples/shots from the old location's coordinate space must
-    // not be usable for hit validation against players in the new one.
     player.positionHistory = [];
     player.recentShots = [];
-
-    console.log(`[~] Player ${player.id} (${player.nickname}) moved: ${oldLocation} -> ${data.locationId}`);
 
     broadcast({
       type: 'playerLeaveLocation',
@@ -987,6 +1486,11 @@ wss.on('connection', (ws) => {
       isShooting: player.isShooting,
       locationId: data.locationId,
     }, playerId, true, player);
+
+    if (data.locationId === 'main-world') {
+      safeSend(ws, { type: 'enemyState', enemies: serializeEnemies() });
+      safeSend(ws, { type: 'lootState', loot: serializeLoot() });
+    }
   }
 });
 
@@ -1015,7 +1519,7 @@ function broadcastCount() {
     if (p.authenticated && p.ws.readyState === WebSocket.OPEN) {
       try {
         p.ws.send(msg);
-      } catch (err) { /* ignore */ }
+      } catch (err) { }
     }
   });
 }
@@ -1027,15 +1531,7 @@ function shutdown(signal) {
   players.forEach((player) => {
     if (player.authenticated && CONFIG.internalSecret) {
       savePromises.push(
-        savePlayerProgress(player.userId, player.gameId, {
-          progress: {
-            locationId: player.locationId,
-            position: player.position,
-            rotation: player.rotation,
-            health: player.health,
-          },
-          nickname: player.nickname,
-        }).catch(() => { })
+        savePlayerProgress(player.userId, player.gameId, buildSavePayload(player)).catch(() => { })
       );
     }
   });
@@ -1046,7 +1542,7 @@ function shutdown(signal) {
       try {
         p.ws.send(msg);
         p.ws.close(1001, 'Server shutdown');
-      } catch (err) { /* ignore */ }
+      } catch (err) { }
     });
 
     setTimeout(() => {
@@ -1062,6 +1558,13 @@ function shutdown(signal) {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+process.on('uncaughtException', (err) => {
+  console.error('[!] Uncaught exception:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[!] Unhandled rejection:', reason);
+});
 
 server.listen(PORT, () => {
   console.log(`[TANJO] Game server running on port ${PORT}`);
