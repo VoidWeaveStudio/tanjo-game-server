@@ -29,6 +29,8 @@ const CONFIG = {
     locationChangeRateLimit: 10,
     nicknameChangeRateLimit: 3,
     saveProgressRateLimit: 5,
+    questRateLimit: 10,
+    canyonRateLimit: 10,
   },
   combat: {
     maxShotRange: 200,
@@ -41,43 +43,89 @@ const CONFIG = {
   autoSaveInterval: 30000,
 };
 
-const ENEMY_CONFIG = {
-  maxHealth: 100,
-  aggroRadius: 20,
-  aggroLeash: 150,
-  attackRange: 1.5,
-  attackDamage: 10,
-  attackCooldown: 1000,
-  weaponDamage: 25,
-  respawnDelay: 15000,
+const WEAPON_CONFIG = {
+  maxAmmo: 30,
+  fireRateMs: 120,
+  fireRateToleranceMs: 20,
+  reloadDurationMs: 2000,
+};
+
+const PLAYER_WEAPON_DAMAGE_TO_ENEMY = 25;
+
+const CANYON_CONFIG = {
   tickRate: 100,
   hitTolerance: 5,
-  chaseSpeedNear: 5,
-  chaseSpeedFar: 5 * 3.5,
-  chaseNearThreshold: 10,
-  patrolSpeed: 1.8,
-  patrolRadius: 22,
   patrolPauseMinMs: 2000,
   patrolPauseMaxMs: 5000,
 };
 
-const WEAPON_CONFIG = {
-  maxAmmo: 30,
-  fireRateMs: 120,
-  fireRateToleranceMs: 20, 
-  reloadDurationMs: 2000,
+const CANYON_HALF_WIDTH = 50;
+const CANYON_HUB_LENGTH = 100;
+const CANYON_START_Z = CANYON_HUB_LENGTH;
+const CANYON_SAFE_ENTRANCE_DEPTH = 100;
+const CANYON_COMBAT_DEPTH = 360;
+const CANYON_BOSS_ZONE_DEPTH = 40;
+const CANYON_SEGMENT_LENGTH = CANYON_SAFE_ENTRANCE_DEPTH + CANYON_COMBAT_DEPTH + CANYON_BOSS_ZONE_DEPTH;
+const CANYON_MAX_SEGMENT_CAP = 200;
+const CANYON_HUB_POSITION = [0, 0, 40];
+
+function canyonSegmentStartZ(segment) {
+  return CANYON_START_Z + (segment - 1) * CANYON_SEGMENT_LENGTH;
+}
+
+function canyonSegmentName(segment) {
+  return segment === 1 ? 'Slime Valley' : `Slime Valley — Segment ${segment}`;
+}
+
+const ENEMY_TYPES = {
+  slime: {
+    name: 'Slime',
+    maxHealth: 100,
+    attackDamage: 10,
+    attackRange: 1.5,
+    aggroRadius: 20,
+    aggroLeash: 150,
+    attackCooldown: 1000,
+    chaseSpeedNear: 5,
+    chaseSpeedFar: 17.5,
+    chaseNearThreshold: 10,
+    patrolSpeed: 1.8,
+    patrolRadius: 18,
+    scale: 1,
+    lootMin: 1,
+    lootMax: 3,
+  },
+  slime_boss: {
+    name: 'Slime Boss',
+    maxHealth: 600,
+    attackDamage: 25,
+    attackRange: 2.5,
+    aggroRadius: 30,
+    aggroLeash: 180,
+    attackCooldown: 1200,
+    chaseSpeedNear: 4,
+    chaseSpeedFar: 10,
+    chaseNearThreshold: 12,
+    patrolSpeed: 1.2,
+    patrolRadius: 10,
+    scale: 3,
+    lootMin: 10,
+    lootMax: 20,
+  },
 };
 
-const CRYSTAL_POSITION = [0, 0];
-const CRYSTAL_EXCLUSION_RADIUS = 50;
-
-const ENEMY_SPAWN_POINTS = [
-  [60, 0, 60],
-  [-70, 0, 50],
-  [90, 0, -40],
-  [-50, 0, -80],
-  [120, 0, 20],
-];
+const QUESTS = {
+  sola_kill_10: {
+    id: 'sola_kill_10',
+    npc: 'sola',
+    title: 'Pest Control',
+    description: 'Kill 10 slimes in Slime Valley.',
+    type: 'kill_enemies',
+    locationId: 'tower-first-floor',
+    targetCount: 10,
+    rewardAsh: 30,
+  },
+};
 
 const DAY_NIGHT_CONFIG = {
   dayDurationMs: 40 * 60 * 1000,
@@ -111,8 +159,6 @@ const wss = new WebSocket.Server({
 const players = new Map();
 const userIdToPlayer = new Map();
 const rateLimits = new Map();
-const enemies = new Map();
-let nextEnemyId = 0;
 
 const VALID_STATES = new Set(['idle', 'walk', 'sprint', 'jump']);
 const VALID_LOCATIONS = new Set([
@@ -120,14 +166,15 @@ const VALID_LOCATIONS = new Set([
   'cave',
   'tower-main-hall',
   'tower-first-floor',
+  'tower-token-gates',
   'tower-basement',
   'open-world-canyon',
   ...Array.from({ length: 39 }, (_, i) => `canyon-token-${String(i + 1).padStart(2, '0')}`),
 ]);
 
 const LOCATION_MAX_RADIUS = {
-  'tower-main-hall': 70,
-  'tower-first-floor': 70,
+  'tower-main-hall': 140,
+  'tower-token-gates': 70,
   'tower-basement': 70,
   cave: 180,
   'open-world-canyon': 150,
@@ -142,7 +189,7 @@ function getLocationMaxRadius(locationId) {
 }
 
 function isValidPositionForLocation(locationId, pos) {
-  if (!isValidPosition(pos)) return false;
+  if (!isValidPosition(pos, locationId)) return false;
   const maxRadius = getLocationMaxRadius(locationId);
   if (maxRadius == null) return true;
   const [x, , z] = pos;
@@ -177,17 +224,24 @@ function checkRateLimit(playerId, type, limit) {
   return data.count <= limit;
 }
 
-function isValidPosition(pos) {
+function isValidPosition(pos, locationId) {
   if (!Array.isArray(pos) || pos.length !== 3) return false;
   const [x, y, z] = pos;
+  if (
+    typeof x !== 'number' || typeof y !== 'number' || typeof z !== 'number' ||
+    isNaN(x) || isNaN(y) || isNaN(z) ||
+    !isFinite(x) || !isFinite(y) || !isFinite(z) ||
+    y < -30 || y > 50
+  ) {
+    return false;
+  }
+
+  if (locationId === 'tower-first-floor') {
+    return Math.abs(x) <= CANYON_HALF_WIDTH + 70 && z >= -50 && z <= CANYON_START_Z + CANYON_SEGMENT_LENGTH * CANYON_MAX_SEGMENT_CAP;
+  }
+
   const halfSize = CONFIG.world.size / 2;
-  return (
-    typeof x === 'number' && typeof y === 'number' && typeof z === 'number' &&
-    !isNaN(x) && !isNaN(y) && !isNaN(z) &&
-    Math.abs(x) <= halfSize && Math.abs(z) <= halfSize &&
-    y >= -30 && y <= 50 &&
-    isFinite(x) && isFinite(y) && isFinite(z)
-  );
+  return Math.abs(x) <= halfSize && Math.abs(z) <= halfSize;
 }
 
 function isValidMovement(player, newPosition, deltaTimeMs) {
@@ -253,7 +307,7 @@ function distanceFromRay(origin, direction, point, maxRange) {
 
 const ENTITY_OCCLUSION_RADIUS = 0.6;
 
-function isPathBlockedByEntity(origin, target, locationId, excludeIds) {
+function isPathBlockedByEntity(origin, target, locationId, excludeIds, enemyPool) {
   const segX = target[0] - origin[0];
   const segZ = target[2] - origin[2];
   const segLenSq = segX * segX + segZ * segZ;
@@ -277,8 +331,8 @@ function isPathBlockedByEntity(origin, target, locationId, excludeIds) {
     if (p.locationId !== locationId) continue;
     if (blocks(p.position)) return true;
   }
-  if (locationId === 'main-world') {
-    for (const e of enemies.values()) {
+  if (enemyPool) {
+    for (const e of enemyPool) {
       if (!e.alive) continue;
       if (excludeIds.has(e.id)) continue;
       if (blocks(e.position)) return true;
@@ -345,6 +399,10 @@ function getPlayerZone(player) {
 function isInAOI(player, other) {
   if (player.locationId !== other.locationId) return false;
 
+  if (player.locationId === 'tower-first-floor') {
+    return !!(player.canyon && other.canyon && player.canyon.inHub && other.canyon.inHub);
+  }
+
   const pZone = getPlayerZone(player);
   const oZone = getPlayerZone(other);
   const dx = Math.abs(pZone.zoneX - oZone.zoneX);
@@ -372,13 +430,58 @@ function broadcastToLocation(locationId, data, excludeId = null) {
   });
 }
 
-function spawnEnemy(spawnPoint) {
-  const id = `enemy-${nextEnemyId++}`;
-  enemies.set(id, {
+function getSegmentDifficulty(segment) {
+  const healthMult = 1 + (segment - 1) * 0.2;
+  const damageMult = 1 + (segment - 1) * 0.15;
+  const slimeCount = Math.min(10 + (segment - 1) * 2, 24);
+  return { healthMult, damageMult, slimeCount };
+}
+
+function canyonPathOffsetX(z) {
+  if (z <= CANYON_START_Z) return 0;
+  const rel = z - CANYON_START_Z;
+  return Math.sin(rel * 0.008) * 22 + Math.sin(rel * 0.021 + 1.7) * 9;
+}
+
+function canyonHalfWidthAt(z) {
+  if (z <= CANYON_START_Z) return CANYON_HALF_WIDTH;
+  const rel = z - CANYON_START_Z;
+  return Math.max(25, CANYON_HALF_WIDTH + Math.sin(rel * 0.006 + 0.5) * 15);
+}
+
+function randomCanyonCombatPoint(segment) {
+  const start = canyonSegmentStartZ(segment) + CANYON_SAFE_ENTRANCE_DEPTH;
+  const end = start + CANYON_COMBAT_DEPTH;
+  const z = start + Math.random() * (end - start);
+  const x = canyonPathOffsetX(z) + (Math.random() * 2 - 1) * (canyonHalfWidthAt(z) - 6);
+  return [x, 0, z];
+}
+
+function randomCanyonBossPoint(segment) {
+  const start = canyonSegmentStartZ(segment) + CANYON_SAFE_ENTRANCE_DEPTH + CANYON_COMBAT_DEPTH;
+  const end = canyonSegmentStartZ(segment) + CANYON_SEGMENT_LENGTH - 10;
+  const z = start + Math.random() * (end - start);
+  const x = canyonPathOffsetX(z) + (Math.random() * 2 - 1) * (canyonHalfWidthAt(z) - 10);
+  return [x, 0, z];
+}
+
+function canyonSegmentEntrancePosition(segment) {
+  const z = canyonSegmentStartZ(segment) + 10;
+  return [canyonPathOffsetX(z), 0, z];
+}
+
+function spawnCanyonEnemy(player, type, position, healthMult = 1, damageMult = 1) {
+  const cfg = ENEMY_TYPES[type];
+  const id = `canyon-${player.id}-${player.canyon.nextEnemySeq++}`;
+  const maxHealth = Math.round(cfg.maxHealth * healthMult);
+  player.canyon.enemies.set(id, {
     id,
-    position: [...spawnPoint],
-    spawnPoint: [...spawnPoint],
-    health: ENEMY_CONFIG.maxHealth,
+    type,
+    position: [...position],
+    spawnPoint: [...position],
+    health: maxHealth,
+    maxHealth,
+    attackDamage: Math.round(cfg.attackDamage * damageMult),
     alive: true,
     targetId: null,
     lastAttackTime: 0,
@@ -386,36 +489,73 @@ function spawnEnemy(spawnPoint) {
     patrolWaitUntil: 0,
     positionHistory: [],
   });
+  return id;
 }
 
-function clampFromCrystal(x, z) {
-  const dx = x - CRYSTAL_POSITION[0];
-  const dz = z - CRYSTAL_POSITION[1];
-  const dist = Math.sqrt(dx * dx + dz * dz);
-  if (dist >= CRYSTAL_EXCLUSION_RADIUS || dist < 0.0001) return [x, z];
-  const scale = CRYSTAL_EXCLUSION_RADIUS / dist;
-  return [CRYSTAL_POSITION[0] + dx * scale, CRYSTAL_POSITION[1] + dz * scale];
-}
+function preparePlayerEnemiesForSegment(player, segment) {
+  player.canyon.segment = segment;
+  player.canyon.enemies.clear();
+  clearCanyonLoot(player);
 
-function pickPatrolPoint(enemy) {
-  for (let attempt = 0; attempt < 10; attempt++) {
-    const angle = Math.random() * Math.PI * 2;
-    const r = Math.random() * ENEMY_CONFIG.patrolRadius;
-    const x = enemy.spawnPoint[0] + Math.cos(angle) * r;
-    const z = enemy.spawnPoint[2] + Math.sin(angle) * r;
-    const dx = x - CRYSTAL_POSITION[0];
-    const dz = z - CRYSTAL_POSITION[1];
-    if (Math.sqrt(dx * dx + dz * dz) >= CRYSTAL_EXCLUSION_RADIUS) {
-      return [x, z];
-    }
+  const { healthMult, damageMult, slimeCount } = getSegmentDifficulty(segment);
+  for (let i = 0; i < slimeCount; i++) {
+    spawnCanyonEnemy(player, 'slime', randomCanyonCombatPoint(segment), healthMult, damageMult);
   }
-  return [enemy.spawnPoint[0], enemy.spawnPoint[2]];
+  spawnCanyonEnemy(player, 'slime_boss', randomCanyonBossPoint(segment), healthMult, damageMult);
 }
 
-function updatePatrol(enemy, now) {
+function populateCanyonSegment(player, segment) {
+  player.canyon.inHub = false;
+  preparePlayerEnemiesForSegment(player, segment);
+  player.position = canyonSegmentEntrancePosition(segment);
+  player.justTeleported = true;
+
+  safeSend(player.ws, {
+    type: 'canyonSegment',
+    segment,
+    maxSegmentReached: player.canyon.maxSegmentReached,
+    cleared: player.canyon.clearedSegments.has(segment),
+    name: canyonSegmentName(segment),
+  });
+  safeSend(player.ws, { type: 'enemyState', enemies: serializeCanyonEnemies(player) });
+}
+
+function enterCanyonHub(player) {
+  player.canyon.inHub = true;
+  player.canyon.enemies.clear();
+  clearCanyonLoot(player);
+  player.position = [...CANYON_HUB_POSITION];
+  player.justTeleported = true;
+
+  safeSend(player.ws, {
+    type: 'canyonHub',
+    maxSegmentReached: player.canyon.maxSegmentReached,
+  });
+  safeSend(player.ws, { type: 'enemyState', enemies: [] });
+}
+
+function serializeCanyonEnemies(player) {
+  if (!player.canyon) return [];
+  return Array.from(player.canyon.enemies.values()).map((e) => ({
+    id: e.id,
+    type: e.type,
+    position: e.position,
+    health: e.health,
+    maxHealth: e.maxHealth,
+    alive: e.alive,
+    targetId: e.targetId,
+  }));
+}
+
+function updateCanyonPatrol(enemy, cfg, now) {
   if (!enemy.patrolTarget) {
     if (now < enemy.patrolWaitUntil) return;
-    enemy.patrolTarget = pickPatrolPoint(enemy);
+    const angle = Math.random() * Math.PI * 2;
+    const r = Math.random() * cfg.patrolRadius;
+    enemy.patrolTarget = [
+      enemy.spawnPoint[0] + Math.cos(angle) * r,
+      enemy.spawnPoint[2] + Math.sin(angle) * r,
+    ];
   }
 
   const dx = enemy.patrolTarget[0] - enemy.position[0];
@@ -424,30 +564,15 @@ function updatePatrol(enemy, now) {
 
   if (dist < 0.5) {
     enemy.patrolTarget = null;
-    enemy.patrolWaitUntil = now + ENEMY_CONFIG.patrolPauseMinMs +
-      Math.random() * (ENEMY_CONFIG.patrolPauseMaxMs - ENEMY_CONFIG.patrolPauseMinMs);
+    enemy.patrolWaitUntil = now + CANYON_CONFIG.patrolPauseMinMs +
+      Math.random() * (CANYON_CONFIG.patrolPauseMaxMs - CANYON_CONFIG.patrolPauseMinMs);
     return;
   }
 
   const len = dist || 1;
-  const step = ENEMY_CONFIG.patrolSpeed * (ENEMY_CONFIG.tickRate / 1000);
-  const [nx, nz] = clampFromCrystal(
-    enemy.position[0] + (dx / len) * step,
-    enemy.position[2] + (dz / len) * step
-  );
-  enemy.position[0] = nx;
-  enemy.position[2] = nz;
-}
-
-function serializeEnemies() {
-  return Array.from(enemies.values()).map((e) => ({
-    id: e.id,
-    position: e.position,
-    health: e.health,
-    maxHealth: ENEMY_CONFIG.maxHealth,
-    alive: e.alive,
-    targetId: e.targetId,
-  }));
+  const step = cfg.patrolSpeed * (CANYON_CONFIG.tickRate / 1000);
+  enemy.position[0] += (dx / len) * step;
+  enemy.position[2] += (dz / len) * step;
 }
 
 function killPlayerAndRespawn(target, killerId, position, respawnDelayMs = 3000) {
@@ -470,7 +595,11 @@ function killPlayerAndRespawn(target, killerId, position, respawnDelayMs = 3000)
     if (!target.alive) {
       target.health = target.maxHealth;
       target.alive = true;
-      spawnInSafeZone(target);
+      if (target.locationId === 'tower-first-floor' && target.canyon) {
+        enterCanyonHub(target);
+      } else {
+        spawnInSafeZone(target);
+      }
       target.justTeleported = true;
       target.respawnToken = null;
 
@@ -490,105 +619,88 @@ function killPlayerAndRespawn(target, killerId, position, respawnDelayMs = 3000)
   }, respawnDelayMs);
 }
 
-function damagePlayerByEnemy(target, enemy) {
-  if (!target.alive) return;
+function damagePlayerByCanyonEnemy(player, enemy) {
+  if (!player.alive) return;
 
-  const damage = ENEMY_CONFIG.attackDamage;
-  target.health = Math.max(0, target.health - damage);
-  target.lastDamageTime = Date.now();
+  const damage = enemy.attackDamage;
+  player.health = Math.max(0, player.health - damage);
+  player.lastDamageTime = Date.now();
 
-  broadcast({
+  safeSend(player.ws, {
     type: 'playerDamaged',
-    targetId: target.id,
+    targetId: player.id,
     attackerId: enemy.id,
     damage,
-    health: target.health,
-    point: target.position,
-    historicalPosition: target.position,
-  }, null, true, target);
+    health: player.health,
+    point: player.position,
+    historicalPosition: player.position,
+  });
 
-  if (target.health <= 0) {
-    killPlayerAndRespawn(target, enemy.id, target.position);
+  if (player.health <= 0) {
+    killPlayerAndRespawn(player, enemy.id, player.position);
   }
 }
 
-function enemyTick() {
+function canyonTick() {
   const now = Date.now();
 
-  for (const enemy of enemies.values()) {
-    if (!enemy.alive) continue;
+  for (const player of players.values()) {
+    if (!player.authenticated || player.locationId !== 'tower-first-floor') continue;
+    if (!player.canyon || player.canyon.enemies.size === 0) continue;
 
-    let target = enemy.targetId ? players.get(enemy.targetId) : null;
-    if (target && (!target.authenticated || !target.alive || target.locationId !== 'main-world')) {
-      target = null;
-      enemy.targetId = null;
-    }
+    for (const enemy of player.canyon.enemies.values()) {
+      if (!enemy.alive) continue;
+      const cfg = ENEMY_TYPES[enemy.type];
 
-    if (target) {
-      const dx = target.position[0] - enemy.position[0];
-      const dz = target.position[2] - enemy.position[2];
-      if (Math.sqrt(dx * dx + dz * dz) > ENEMY_CONFIG.aggroLeash) {
-        target = null;
-        enemy.targetId = null;
-      }
-    } else {
-      let nearest = null;
-      let nearestDist = Infinity;
-      for (const p of players.values()) {
-        if (!p.authenticated || !p.alive || p.locationId !== 'main-world') continue;
-        const dx = p.position[0] - enemy.position[0];
-        const dz = p.position[2] - enemy.position[2];
+      let hasTarget = enemy.targetId === player.id;
+      if (player.alive) {
+        const dx = player.position[0] - enemy.position[0];
+        const dz = player.position[2] - enemy.position[2];
         const dist = Math.sqrt(dx * dx + dz * dz);
-        if (dist < nearestDist) {
-          nearestDist = dist;
-          nearest = p;
+        if (!hasTarget) {
+          if (dist <= cfg.aggroRadius) {
+            enemy.targetId = player.id;
+            hasTarget = true;
+          }
+        } else if (dist > cfg.aggroLeash) {
+          enemy.targetId = null;
+          hasTarget = false;
         }
+      } else {
+        enemy.targetId = null;
+        hasTarget = false;
       }
-      if (nearest && nearestDist <= ENEMY_CONFIG.aggroRadius) {
-        target = nearest;
-        enemy.targetId = nearest.id;
+
+      if (hasTarget) {
+        enemy.patrolTarget = null;
+
+        const dx = player.position[0] - enemy.position[0];
+        const dz = player.position[2] - enemy.position[2];
+        const dist = Math.sqrt(dx * dx + dz * dz);
+
+        if (dist > cfg.attackRange) {
+          const speed = dist > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear;
+          const len = dist || 1;
+          const step = speed * (CANYON_CONFIG.tickRate / 1000);
+          enemy.position[0] += (dx / len) * step;
+          enemy.position[2] += (dz / len) * step;
+        } else if (now - enemy.lastAttackTime >= cfg.attackCooldown) {
+          enemy.lastAttackTime = now;
+          damagePlayerByCanyonEnemy(player, enemy);
+        }
+      } else {
+        updateCanyonPatrol(enemy, cfg, now);
       }
+
+      enemy.positionHistory.push({ position: [...enemy.position], time: now });
+      enemy.positionHistory = enemy.positionHistory.filter((p) => now - p.time < 1000);
     }
 
-    if (target) {
-      enemy.patrolTarget = null;
-
-      const dx = target.position[0] - enemy.position[0];
-      const dz = target.position[2] - enemy.position[2];
-      const dist = Math.sqrt(dx * dx + dz * dz);
-
-      if (dist > ENEMY_CONFIG.attackRange) {
-        const speed = dist > ENEMY_CONFIG.chaseNearThreshold
-          ? ENEMY_CONFIG.chaseSpeedFar
-          : ENEMY_CONFIG.chaseSpeedNear;
-        const len = dist || 1;
-        const step = speed * (ENEMY_CONFIG.tickRate / 1000);
-        const [nx, nz] = clampFromCrystal(
-          enemy.position[0] + (dx / len) * step,
-          enemy.position[2] + (dz / len) * step
-        );
-        enemy.position[0] = nx;
-        enemy.position[2] = nz;
-      } else if (now - enemy.lastAttackTime >= ENEMY_CONFIG.attackCooldown) {
-        enemy.lastAttackTime = now;
-        damagePlayerByEnemy(target, enemy);
-      }
-    } else {
-      updatePatrol(enemy, now);
-    }
-
-    enemy.positionHistory.push({ position: [...enemy.position], time: now });
-    enemy.positionHistory = enemy.positionHistory.filter((p) => now - p.time < 1000);
+    safeSend(player.ws, { type: 'enemyState', enemies: serializeCanyonEnemies(player) });
   }
-
-  broadcastToLocation('main-world', {
-    type: 'enemyState',
-    enemies: serializeEnemies(),
-  });
 }
 
-ENEMY_SPAWN_POINTS.forEach(spawnEnemy);
-safeInterval(enemyTick, ENEMY_CONFIG.tickRate);
+safeInterval(canyonTick, CANYON_CONFIG.tickRate);
 
 const LOOT_CONFIG = {
   pollIntervalMs: 10000,
@@ -621,11 +733,13 @@ refreshTokenPool();
 safeInterval(refreshTokenPool, LOOT_CONFIG.pollIntervalMs);
 
 function serializeLoot() {
-  return Array.from(lootDrops.values()).map((l) => ({
-    id: l.id,
-    position: l.position,
-    tokens: l.tokens,
-  }));
+  return Array.from(lootDrops.values())
+    .filter((l) => !l.ownerId)
+    .map((l) => ({
+      id: l.id,
+      position: l.position,
+      tokens: l.tokens,
+    }));
 }
 
 function addTokensToInventory(player, tokens) {
@@ -653,10 +767,9 @@ function ashForMarketCap(mc) {
   return 20;
 }
 
-function dropLoot(position) {
-  if (tokenPool.length === 0) return;
-
-  const count = LOOT_CONFIG.minDrop + Math.floor(Math.random() * (LOOT_CONFIG.maxDrop - LOOT_CONFIG.minDrop + 1));
+function rollLootTokens(minCount, maxCount) {
+  if (tokenPool.length === 0) return [];
+  const count = minCount + Math.floor(Math.random() * (maxCount - minCount + 1));
   const tokens = [];
   for (let i = 0; i < count; i++) {
     const t = tokenPool[Math.floor(Math.random() * tokenPool.length)];
@@ -667,12 +780,43 @@ function dropLoot(position) {
       image: t.image,
     });
   }
+  return tokens;
+}
+
+function dropLoot(position) {
+  const tokens = rollLootTokens(LOOT_CONFIG.minDrop, LOOT_CONFIG.maxDrop);
+  if (tokens.length === 0) return;
 
   const id = `loot-${nextLootId++}`;
-  const loot = { id, position: [...position], tokens, createdAt: Date.now() };
+  const loot = { id, ownerId: null, position: [...position], tokens, createdAt: Date.now() };
   lootDrops.set(id, loot);
 
   broadcastToLocation('main-world', {
+    type: 'lootSpawn',
+    id: loot.id,
+    position: loot.position,
+    tokens: loot.tokens,
+  });
+}
+
+function clearCanyonLoot(player) {
+  for (const [id, loot] of lootDrops) {
+    if (loot.ownerId === player.id) {
+      lootDrops.delete(id);
+      safeSend(player.ws, { type: 'lootDespawn', id });
+    }
+  }
+}
+
+function dropCanyonLoot(player, position, minCount, maxCount) {
+  const tokens = rollLootTokens(minCount, maxCount);
+  if (tokens.length === 0) return;
+
+  const id = `loot-${nextLootId++}`;
+  const loot = { id, ownerId: player.id, position: [...position], tokens, createdAt: Date.now() };
+  lootDrops.set(id, loot);
+
+  safeSend(player.ws, {
     type: 'lootSpawn',
     id: loot.id,
     position: loot.position,
@@ -685,7 +829,12 @@ safeInterval(() => {
   for (const [id, loot] of lootDrops) {
     if (now - loot.createdAt > LOOT_CONFIG.despawnMs) {
       lootDrops.delete(id);
-      broadcastToLocation('main-world', { type: 'lootDespawn', id });
+      if (loot.ownerId) {
+        const owner = players.get(loot.ownerId);
+        if (owner) safeSend(owner.ws, { type: 'lootDespawn', id });
+      } else {
+        broadcastToLocation('main-world', { type: 'lootDespawn', id });
+      }
     }
   }
 }, 30000);
@@ -780,7 +929,14 @@ function buildSavePayload(player) {
       position: player.position,
       rotation: player.rotation,
       health: player.health,
-      data: { ash: player.ash },
+      data: {
+        ash: player.ash,
+        quests: player.quests,
+        canyonProgress: {
+          maxSegmentReached: player.canyon.maxSegmentReached,
+          clearedSegments: Array.from(player.canyon.clearedSegments),
+        },
+      },
     },
     nickname: player.nickname,
     inventory: player.inventory.map((entry, index) => ({
@@ -889,6 +1045,16 @@ wss.on('connection', (ws) => {
     respawnToken: null,
     inventory: [],
     ash: 0,
+    quests: {},
+    canyon: {
+      inHub: true,
+      segment: 1,
+      maxSegmentReached: 1,
+      clearedSegments: new Set(),
+      enemies: new Map(),
+      nextEnemySeq: 0,
+      pendingSegment: null,
+    },
     stats: {
       kills: 0,
       deaths: 0,
@@ -972,6 +1138,10 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'nicknameChange', CONFIG.network.nicknameChangeRateLimit)) return;
       } else if (data.type === 'saveProgress') {
         if (!checkRateLimit(playerId, 'saveProgress', CONFIG.network.saveProgressRateLimit)) return;
+      } else if (data.type === 'questInteract' || data.type === 'questAccept' || data.type === 'questTurnIn') {
+        if (!checkRateLimit(playerId, 'quest', CONFIG.network.questRateLimit)) return;
+      } else if (data.type === 'canyonWarp' || data.type === 'canyonMapRequest' || data.type === 'canyonEnterDungeon' || data.type === 'canyonReturnToHub' || data.type === 'canyonCrossThreshold') {
+        if (!checkRateLimit(playerId, 'canyon', CONFIG.network.canyonRateLimit)) return;
       }
 
       switch (data.type) {
@@ -985,6 +1155,14 @@ wss.on('connection', (ws) => {
         case 'sellToken': handleSellToken(player, data); break;
         case 'saveProgress': handleSaveProgress(player); break;
         case 'locationChange': handleLocationChange(player, data); break;
+        case 'questInteract': handleQuestInteract(player, data); break;
+        case 'questAccept': handleQuestAccept(player, data); break;
+        case 'questTurnIn': handleQuestTurnIn(player, data); break;
+        case 'canyonWarp': handleCanyonWarp(player, data); break;
+        case 'canyonMapRequest': handleCanyonMapRequest(player); break;
+        case 'canyonEnterDungeon': handleCanyonEnterDungeon(player); break;
+        case 'canyonReturnToHub': handleCanyonReturnToHub(player); break;
+        case 'canyonCrossThreshold': handleCanyonCrossThreshold(player); break;
       }
     } catch (error) {
       console.error('[!] Message parse error:', error.message);
@@ -1083,6 +1261,34 @@ wss.on('connection', (ws) => {
 
       player.ash = Math.max(0, Math.floor(Number(savedProgress.progress?.data?.ash) || 0));
 
+      const savedQuests = savedProgress.progress?.data?.quests;
+      if (savedQuests && typeof savedQuests === 'object') {
+        for (const questId of Object.keys(QUESTS)) {
+          const state = savedQuests[questId];
+          if (!state || typeof state !== 'object') continue;
+          const validStatuses = new Set(['active', 'ready_to_turn_in', 'completed']);
+          if (!validStatuses.has(state.status)) continue;
+          player.quests[questId] = {
+            status: state.status,
+            progress: Math.max(0, Math.min(QUESTS[questId].targetCount, Math.floor(Number(state.progress) || 0))),
+          };
+        }
+      }
+
+      const savedCanyon = savedProgress.progress?.data?.canyonProgress;
+      if (savedCanyon && typeof savedCanyon === 'object') {
+        const maxReached = Math.floor(Number(savedCanyon.maxSegmentReached));
+        if (Number.isInteger(maxReached) && maxReached >= 1) {
+          player.canyon.maxSegmentReached = maxReached;
+        }
+        if (Array.isArray(savedCanyon.clearedSegments)) {
+          for (const s of savedCanyon.clearedSegments) {
+            const seg = Math.floor(Number(s));
+            if (Number.isInteger(seg) && seg >= 1) player.canyon.clearedSegments.add(seg);
+          }
+        }
+      }
+
       if (Array.isArray(savedProgress.inventory)) {
         player.inventory = savedProgress.inventory
           .filter((i) => i && typeof i.itemId === 'string' && i.quantity > 0)
@@ -1147,8 +1353,11 @@ wss.on('connection', (ws) => {
     });
 
     if (player.locationId === 'main-world') {
-      safeSend(ws, { type: 'enemyState', enemies: serializeEnemies() });
       safeSend(ws, { type: 'lootState', loot: serializeLoot() });
+    }
+
+    if (player.locationId === 'tower-first-floor') {
+      enterCanyonHub(player);
     }
 
     safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
@@ -1158,6 +1367,23 @@ wss.on('connection', (ws) => {
         type: 'progress_loaded',
         progress: savedProgress,
       });
+    }
+
+    for (const quest of Object.values(QUESTS)) {
+      const state = getQuestState(player, quest.id);
+      if (state.status === 'active' || state.status === 'ready_to_turn_in') {
+        safeSend(ws, {
+          type: 'questInfo',
+          questId: quest.id,
+          npc: quest.npc,
+          title: quest.title,
+          description: quest.description,
+          targetCount: quest.targetCount,
+          rewardAsh: quest.rewardAsh,
+          status: state.status,
+          progress: state.progress,
+        });
+      }
     }
 
     broadcast({
@@ -1275,12 +1501,9 @@ wss.on('connection', (ws) => {
     if (dirLength < 0.001) return;
     const direction = [dx / dirLength, dy / dirLength, dz / dirLength];
 
-    if (player.locationId === 'main-world') {
-      const distFromCenter = Math.sqrt(px * px + pz * pz);
-      if (distFromCenter < 30) {
-        safeSend(ws, { type: 'error', message: 'Cannot shoot in safe zone' });
-        return;
-      }
+    if (player.locationId === 'tower-main-hall') {
+      safeSend(ws, { type: 'error', message: 'Cannot shoot in safe zone' });
+      return;
     }
 
     player.weaponAmmo--;
@@ -1352,13 +1575,11 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    const [px, , pz] = player.position;
-    const inMainWorld = player.locationId === 'main-world';
-    const attackerDistFromCenter = Math.sqrt(px * px + pz * pz);
-    if (inMainWorld && attackerDistFromCenter < 30) {
-      console.log(`[!] Hit hack: attacker ${playerId} shooting from safe zone`);
+    if (player.locationId === 'tower-main-hall') {
       return;
     }
+
+    const [px, , pz] = player.position;
 
     const shotTime = Date.now() - player.rtt;
     const historicalPos = getHistoricalPosition(target, shotTime);
@@ -1378,12 +1599,6 @@ wss.on('connection', (ws) => {
 
     if (isPathBlockedByEntity(player.position, historicalPos, player.locationId, new Set([playerId, data.target]))) {
       console.log(`[!] Hit rejected: shot from ${playerId} to ${data.target} blocked by another entity`);
-      return;
-    }
-
-    const targetDistFromCenter = Math.sqrt(tx * tx + tz * tz);
-    if (inMainWorld && targetDistFromCenter < 30) {
-      safeSend(ws, { type: 'error', message: 'Target is in safe zone' });
       return;
     }
 
@@ -1411,17 +1626,12 @@ wss.on('connection', (ws) => {
     if (!player.alive) return;
     if (typeof data.target !== 'string') return;
     if (!Array.isArray(data.point) || data.point.length !== 3) return;
-    if (player.locationId !== 'main-world') return;
+    if (player.locationId !== 'tower-first-floor' || !player.canyon) return;
 
-    const enemy = enemies.get(data.target);
+    const enemy = player.canyon.enemies.get(data.target);
     if (!enemy || !enemy.alive) return;
 
     const [px, , pz] = player.position;
-    const attackerDistFromCenter = Math.sqrt(px * px + pz * pz);
-    if (attackerDistFromCenter < 30) {
-      console.log(`[!] Enemy hit hack: attacker ${playerId} shooting from safe zone`);
-      return;
-    }
 
     const shotTime = Date.now() - player.rtt;
     const historicalPos = getHistoricalPosition(enemy, shotTime);
@@ -1432,20 +1642,20 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    const matchedShot = findMatchingShot(player, historicalPos, Date.now(), ENEMY_CONFIG.hitTolerance);
+    const matchedShot = findMatchingShot(player, historicalPos, Date.now(), CANYON_CONFIG.hitTolerance);
     if (!matchedShot) {
       console.log(`[!] Enemy hit hack: no matching recent shot from ${playerId} explains hit on ${data.target}`);
       return;
     }
 
-    if (isPathBlockedByEntity(player.position, historicalPos, player.locationId, new Set([playerId, enemy.id]))) {
+    if (isPathBlockedByEntity(player.position, historicalPos, player.locationId, new Set([playerId, enemy.id]), player.canyon.enemies.values())) {
       console.log(`[!] Enemy hit rejected: shot from ${playerId} to ${data.target} blocked by another entity`);
       return;
     }
 
-    enemy.health = Math.max(0, enemy.health - ENEMY_CONFIG.weaponDamage);
+    enemy.health = Math.max(0, enemy.health - PLAYER_WEAPON_DAMAGE_TO_ENEMY);
 
-    broadcastToLocation('main-world', {
+    safeSend(player.ws, {
       type: 'enemyDamaged',
       id: enemy.id,
       health: enemy.health,
@@ -1457,44 +1667,193 @@ wss.on('connection', (ws) => {
       enemy.alive = false;
       enemy.targetId = null;
 
-      broadcastToLocation('main-world', {
+      safeSend(player.ws, {
         type: 'enemyDeath',
         id: enemy.id,
         killerId: playerId,
       });
 
-      dropLoot(enemy.position);
+      incrementKillQuests(player);
 
-      setTimeout(() => {
-        enemy.health = ENEMY_CONFIG.maxHealth;
-        enemy.alive = true;
-        enemy.position = [...enemy.spawnPoint];
-        enemy.targetId = null;
-        enemy.lastAttackTime = 0;
-        enemy.patrolTarget = null;
-        enemy.patrolWaitUntil = 0;
-        enemy.positionHistory = [];
+      const alreadyCleared = player.canyon.clearedSegments.has(player.canyon.segment);
+      if (!alreadyCleared) {
+        const cfg = ENEMY_TYPES[enemy.type];
+        dropCanyonLoot(player, enemy.position, cfg.lootMin, cfg.lootMax);
+      }
 
-        broadcastToLocation('main-world', {
-          type: 'enemyRespawn',
-          id: enemy.id,
-          position: enemy.position,
-          health: enemy.health,
-          maxHealth: ENEMY_CONFIG.maxHealth,
+      if (enemy.type === 'slime_boss') {
+        const clearedSegment = player.canyon.segment;
+        if (!alreadyCleared) {
+          player.canyon.clearedSegments.add(clearedSegment);
+        }
+        const nextSegment = Math.min(clearedSegment + 1, CANYON_MAX_SEGMENT_CAP);
+        if (nextSegment > player.canyon.maxSegmentReached) {
+          player.canyon.maxSegmentReached = nextSegment;
+        }
+        persistPlayer(player);
+
+        player.canyon.pendingSegment = nextSegment;
+
+        safeSend(player.ws, {
+          type: 'canyonCleared',
+          clearedSegment,
+          segment: nextSegment,
+          maxSegmentReached: player.canyon.maxSegmentReached,
+          name: canyonSegmentName(nextSegment),
         });
-      }, ENEMY_CONFIG.respawnDelay);
+      }
     } else {
       enemy.targetId = playerId;
     }
   }
 
+  function handleCanyonWarp(player, data) {
+    if (player.locationId !== 'tower-first-floor' || !player.canyon) return;
+    if (!player.canyon.inHub) return;
+    const segment = Math.floor(Number(data.segment));
+    if (!Number.isInteger(segment) || segment < 1 || segment > player.canyon.maxSegmentReached) return;
+
+    populateCanyonSegment(player, segment);
+  }
+
+  function handleCanyonEnterDungeon(player) {
+    if (player.locationId !== 'tower-first-floor' || !player.canyon) return;
+    if (!player.canyon.inHub) return;
+
+    populateCanyonSegment(player, 1);
+  }
+
+  function handleCanyonCrossThreshold(player) {
+    if (player.locationId !== 'tower-first-floor' || !player.canyon) return;
+    if (player.canyon.inHub || player.canyon.pendingSegment == null) return;
+
+    const nextSegment = player.canyon.pendingSegment;
+    player.canyon.pendingSegment = null;
+    preparePlayerEnemiesForSegment(player, nextSegment);
+    safeSend(player.ws, { type: 'enemyState', enemies: serializeCanyonEnemies(player) });
+  }
+
+  function handleCanyonReturnToHub(player) {
+    if (player.locationId !== 'tower-first-floor' || !player.canyon) return;
+    if (player.canyon.inHub) return;
+
+    enterCanyonHub(player);
+  }
+
+  function handleCanyonMapRequest(player) {
+    if (player.locationId !== 'tower-first-floor' || !player.canyon) return;
+    safeSend(player.ws, {
+      type: 'canyonMap',
+      segment: player.canyon.segment,
+      maxSegmentReached: player.canyon.maxSegmentReached,
+      clearedSegments: Array.from(player.canyon.clearedSegments),
+    });
+  }
+
+  function getQuest(questId) {
+    return Object.prototype.hasOwnProperty.call(QUESTS, questId) ? QUESTS[questId] : null;
+  }
+
+  function getQuestState(player, questId) {
+    return player.quests[questId] || { status: 'not_started', progress: 0 };
+  }
+
+  function incrementKillQuests(player) {
+    for (const quest of Object.values(QUESTS)) {
+      if (quest.type !== 'kill_enemies') continue;
+      if (quest.locationId && player.locationId !== quest.locationId) continue;
+
+      const state = getQuestState(player, quest.id);
+      if (state.status !== 'active') continue;
+
+      state.progress = Math.min(quest.targetCount, state.progress + 1);
+      if (state.progress >= quest.targetCount) {
+        state.status = 'ready_to_turn_in';
+      }
+      player.quests[quest.id] = state;
+      persistPlayer(player);
+
+      safeSend(player.ws, {
+        type: 'questUpdate',
+        questId: quest.id,
+        status: state.status,
+        progress: state.progress,
+        targetCount: quest.targetCount,
+      });
+    }
+  }
+
+  function handleQuestInteract(player, data) {
+    if (typeof data.questId !== 'string') return;
+    const quest = getQuest(data.questId);
+    if (!quest) return;
+
+    const state = getQuestState(player, quest.id);
+    safeSend(player.ws, {
+      type: 'questInfo',
+      questId: quest.id,
+      npc: quest.npc,
+      title: quest.title,
+      description: quest.description,
+      targetCount: quest.targetCount,
+      rewardAsh: quest.rewardAsh,
+      status: state.status,
+      progress: state.progress,
+    });
+  }
+
+  function handleQuestAccept(player, data) {
+    if (typeof data.questId !== 'string') return;
+    const quest = getQuest(data.questId);
+    if (!quest) return;
+
+    const state = getQuestState(player, quest.id);
+    if (state.status !== 'not_started') return;
+
+    player.quests[quest.id] = { status: 'active', progress: 0 };
+    persistPlayer(player);
+
+    safeSend(player.ws, {
+      type: 'questUpdate',
+      questId: quest.id,
+      status: 'active',
+      progress: 0,
+      targetCount: quest.targetCount,
+    });
+  }
+
+  function handleQuestTurnIn(player, data) {
+    if (typeof data.questId !== 'string') return;
+    const quest = getQuest(data.questId);
+    if (!quest) return;
+
+    const state = getQuestState(player, quest.id);
+    if (state.status !== 'ready_to_turn_in') return;
+
+    player.quests[quest.id] = { status: 'completed', progress: quest.targetCount };
+    player.ash += quest.rewardAsh;
+    persistPlayer(player);
+
+    safeSend(player.ws, {
+      type: 'questUpdate',
+      questId: quest.id,
+      status: 'completed',
+      progress: quest.targetCount,
+      targetCount: quest.targetCount,
+      rewardAsh: quest.rewardAsh,
+    });
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
+  }
+
   function handleLootPickup(player, data) {
     if (!player.alive) return;
     if (typeof data.id !== 'string') return;
-    if (player.locationId !== 'main-world') return;
+    if (player.locationId !== 'main-world' && player.locationId !== 'tower-first-floor') return;
 
     const loot = lootDrops.get(data.id);
     if (!loot) return;
+    if (loot.ownerId && loot.ownerId !== player.id) return;
+    if (!loot.ownerId && player.locationId !== 'main-world') return;
 
     const [px, , pz] = player.position;
     const dist = Math.sqrt((loot.position[0] - px) ** 2 + (loot.position[2] - pz) ** 2);
@@ -1506,7 +1865,12 @@ wss.on('connection', (ws) => {
     persistPlayer(player);
 
     safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
-    broadcastToLocation('main-world', { type: 'lootDespawn', id: data.id });
+
+    if (loot.ownerId) {
+      safeSend(ws, { type: 'lootDespawn', id: data.id });
+    } else {
+      broadcastToLocation('main-world', { type: 'lootDespawn', id: data.id });
+    }
   }
 
   async function handleSellToken(player, data) {
@@ -1595,6 +1959,12 @@ wss.on('connection', (ws) => {
     }
     player.lastLocationChangeAt = now;
 
+    if (oldLocation === 'tower-first-floor' && player.canyon) {
+      player.canyon.enemies.clear();
+      player.canyon.pendingSegment = null;
+      clearCanyonLoot(player);
+    }
+
     player.locationId = data.locationId;
     spawnInSafeZone(player);
     player.justTeleported = true;
@@ -1626,8 +1996,11 @@ wss.on('connection', (ws) => {
     }, playerId, true, player);
 
     if (data.locationId === 'main-world') {
-      safeSend(ws, { type: 'enemyState', enemies: serializeEnemies() });
       safeSend(ws, { type: 'lootState', loot: serializeLoot() });
+    }
+
+    if (data.locationId === 'tower-first-floor' && player.canyon) {
+      enterCanyonHub(player);
     }
   }
 });
