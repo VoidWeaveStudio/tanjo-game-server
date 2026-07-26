@@ -579,12 +579,15 @@ function killPlayerAndRespawn(target, killerId, position, respawnDelayMs = 3000)
   target.alive = false;
   target.stats.deaths++;
 
-  broadcast({
+  const deathMessage = {
     type: 'playerDeath',
     playerId: target.id,
     killerId,
     position,
-  }, null, true, target);
+  };
+
+  safeSend(target.ws, deathMessage);
+  broadcast(deathMessage, target.id, true, target);
 
   const respawnToken = Date.now() + Math.random();
   target.respawnToken = respawnToken;
