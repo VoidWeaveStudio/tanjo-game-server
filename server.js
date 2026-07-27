@@ -26,6 +26,7 @@ const CONFIG = {
     shootRateLimit: 10,
     hitRateLimit: 15,
     sellRateLimit: 20,
+    voiceRateLimit: 4,
     locationChangeRateLimit: 10,
     nicknameChangeRateLimit: 3,
     saveProgressRateLimit: 5,
@@ -74,7 +75,11 @@ const CANYON_COMBAT_DEPTH = 360;
 const CANYON_BOSS_ZONE_DEPTH = 40;
 const CANYON_SEGMENT_LENGTH = CANYON_SAFE_ENTRANCE_DEPTH + CANYON_COMBAT_DEPTH + CANYON_BOSS_ZONE_DEPTH;
 const CANYON_MAX_SEGMENT_CAP = 200;
-const CANYON_HUB_POSITION = [0, 0, 40];
+// Must stay clear of the hub crystal/dispatcher, which sit at (0, _, 40) —
+// matches the client's FirstFloor.getSpawnPoint() hub position (0, 2, 20) so a
+// player whose position is persisted while in the hub doesn't get restored
+// standing inside the crystal mesh on their next login.
+const CANYON_HUB_POSITION = [0, 0, 20];
 
 function canyonSegmentStartZ(segment) {
   return CANYON_START_Z + (segment - 1) * CANYON_SEGMENT_LENGTH;
@@ -1147,6 +1152,8 @@ wss.on('connection', (ws) => {
           safeSend(ws, { type: 'error', message: 'Sell rate limit exceeded' });
           return;
         }
+      } else if (data.type === 'voiceClip') {
+        if (!checkRateLimit(playerId, 'voice', CONFIG.network.voiceRateLimit)) return;
       } else if (data.type === 'locationChange') {
         if (!checkRateLimit(playerId, 'locationChange', CONFIG.network.locationChangeRateLimit)) return;
       } else if (data.type === 'nicknameChange') {
@@ -1185,6 +1192,7 @@ wss.on('connection', (ws) => {
         case 'enemyHit': handleEnemyHit(player, data); break;
         case 'lootPickup': handleLootPickup(player, data); break;
         case 'sellToken': handleSellToken(player, data); break;
+        case 'voiceClip': handleVoiceClip(player, data); break;
         case 'saveProgress': handleSaveProgress(player); break;
         case 'locationChange': handleLocationChange(player, data); break;
         case 'questInteract': handleQuestInteract(player, data); break;
@@ -1619,6 +1627,21 @@ wss.on('connection', (ws) => {
       message: msg,
       timestamp: Date.now(),
     }, null, false);
+  }
+
+  function handleVoiceClip(player, data) {
+    if (typeof data.chunk !== 'string' || typeof data.mimeType !== 'string') return;
+    if (data.chunk.length === 0 || data.chunk.length > 20000) return;
+    if (!/^audio\//.test(data.mimeType)) return;
+
+    // Proximity chat: only players sharing the same location hear it.
+    broadcastToLocation(player.locationId, {
+      type: 'voiceClip',
+      senderId: player.id,
+      senderNickname: player.nickname,
+      chunk: data.chunk,
+      mimeType: data.mimeType,
+    }, player.id);
   }
 
   function handleHit(player, data) {
@@ -2297,16 +2320,11 @@ wss.on('connection', (ws) => {
     }
   }
 
-  async function handleSellToken(player, data) {
+  function handleSellToken(player, data) {
     if (!player.alive) return;
     if (typeof data.address !== 'string') return;
     if (player.locationId !== 'tower-main-hall') {
       safeSend(ws, { type: 'error', message: 'You need to be at the vendor in the main hall to sell' });
-      return;
-    }
-
-    if (player.sellInFlight) {
-      safeSend(ws, { type: 'error', message: 'A sell is already in progress' });
       return;
     }
 
@@ -2320,45 +2338,71 @@ wss.on('connection', (ws) => {
     const sellQty = Math.min(requestedQty, entry.quantity);
     if (sellQty <= 0) return;
 
-    player.sellInFlight = true;
-    try {
-      let marketCap = 0;
-      try {
-        const url = new URL('/api/token-by-ca', CONFIG.siteUrl);
-        url.searchParams.set('ca', data.address);
-        const res = await fetch(url.toString());
-        const json = await res.json();
-        marketCap = Number(json?.mc) || 0;
-      } catch (err) {
-        console.error('[Vendor] Market cap lookup failed:', err.message);
-        safeSend(ws, { type: 'error', message: 'Could not price token right now' });
-        return;
-      }
-
-      const current = player.inventory.find((e) => e.address === data.address);
-      if (!current || current.quantity <= 0) return;
-      const finalQty = Math.min(sellQty, current.quantity);
-
-      const ashPerToken = ashForMarketCap(marketCap);
-      const ashEarned = ashPerToken * finalQty;
-
-      current.quantity -= finalQty;
-      player.inventory = player.inventory.filter((e) => e.quantity > 0);
-      player.ash += ashEarned;
-
-      persistPlayer(player);
-
-      safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
-      safeSend(ws, {
-        type: 'sellResult',
-        address: data.address,
-        quantitySold: finalQty,
-        ashEarned,
-        marketCap,
-      });
-    } finally {
-      player.sellInFlight = false;
+    // Selling multiple stacks confirms them all in one burst from the client
+    // (no per-item round trip), so queue and drain sequentially per player
+    // instead of rejecting whichever requests land while one is in flight.
+    if (!player.sellQueue) player.sellQueue = [];
+    if (player.sellQueue.length >= 32) {
+      safeSend(ws, { type: 'error', message: 'Too many pending sells, slow down' });
+      return;
     }
+    player.sellQueue.push({ address: data.address, quantity: sellQty });
+    processSellQueue(player);
+  }
+
+  async function processSellQueue(player) {
+    if (player.sellProcessing) return;
+    player.sellProcessing = true;
+    try {
+      while (player.sellQueue && player.sellQueue.length > 0) {
+        const job = player.sellQueue.shift();
+        await performSell(player, job);
+      }
+    } finally {
+      player.sellProcessing = false;
+    }
+  }
+
+  async function performSell(player, job) {
+    const current = player.inventory.find((e) => e.address === job.address);
+    if (!current || current.quantity <= 0) return;
+    const sellQty = Math.min(job.quantity, current.quantity);
+    if (sellQty <= 0) return;
+
+    let marketCap = 0;
+    try {
+      const url = new URL('/api/token-by-ca', CONFIG.siteUrl);
+      url.searchParams.set('ca', job.address);
+      const res = await fetch(url.toString());
+      const json = await res.json();
+      marketCap = Number(json?.mc) || 0;
+    } catch (err) {
+      console.error('[Vendor] Market cap lookup failed:', err.message);
+      safeSend(ws, { type: 'error', message: 'Could not price token right now' });
+      return;
+    }
+
+    const finalEntry = player.inventory.find((e) => e.address === job.address);
+    if (!finalEntry || finalEntry.quantity <= 0) return;
+    const finalQty = Math.min(sellQty, finalEntry.quantity);
+
+    const ashPerToken = ashForMarketCap(marketCap);
+    const ashEarned = ashPerToken * finalQty;
+
+    finalEntry.quantity -= finalQty;
+    player.inventory = player.inventory.filter((e) => e.quantity > 0);
+    player.ash += ashEarned;
+
+    persistPlayer(player);
+
+    safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
+    safeSend(ws, {
+      type: 'sellResult',
+      address: job.address,
+      quantitySold: finalQty,
+      ashEarned,
+      marketCap,
+    });
   }
 
   function handleSaveProgress(player) {
