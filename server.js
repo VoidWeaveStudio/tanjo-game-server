@@ -1064,10 +1064,11 @@ wss.on('connection', (ws) => {
     inventory: [],
     ash: 0,
     quests: {},
-    factionId: null,
-    factionName: null,
-    factionSymbol: null,
-    factionImage: null,
+    factions: [],
+    displayedFactionId: null,
+    displayedFactionName: null,
+    displayedFactionSymbol: null,
+    displayedFactionImage: null,
     canyon: {
       inHub: true,
       segment: 1,
@@ -1168,7 +1169,7 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'quest', CONFIG.network.questRateLimit)) return;
       } else if (data.type === 'canyonWarp' || data.type === 'canyonMapRequest' || data.type === 'canyonEnterDungeon' || data.type === 'canyonReturnToHub' || data.type === 'canyonCrossThreshold') {
         if (!checkRateLimit(playerId, 'canyon', CONFIG.network.canyonRateLimit)) return;
-      } else if (data.type === 'factionCreate' || data.type === 'factionJoin' || data.type === 'factionLeave' || data.type === 'factionList' || data.type === 'factionInfo' || data.type === 'factionTaskListRequest' || data.type === 'factionAcceptTask' || data.type === 'factionClaimCreator') {
+      } else if (data.type === 'factionCreate' || data.type === 'factionJoin' || data.type === 'factionLeave' || data.type === 'factionList' || data.type === 'factionInfo' || data.type === 'factionTaskListRequest' || data.type === 'factionAcceptTask' || data.type === 'factionClaimCreator' || data.type === 'factionSetDisplayed' || data.type === 'factionMyListRequest') {
         if (!checkRateLimit(playerId, 'faction', CONFIG.network.factionRateLimit)) return;
       } else if (data.type === 'factionSearch') {
         if (!checkRateLimit(playerId, 'factionSearch', CONFIG.network.factionSearchRateLimit)) return;
@@ -1209,13 +1210,15 @@ wss.on('connection', (ws) => {
         case 'canyonCrossThreshold': handleCanyonCrossThreshold(player); break;
         case 'factionCreate': handleFactionCreate(player, data); break;
         case 'factionJoin': handleFactionJoin(player, data); break;
-        case 'factionLeave': handleFactionLeave(player); break;
+        case 'factionLeave': handleFactionLeave(player, data); break;
+        case 'factionSetDisplayed': handleFactionSetDisplayed(player, data); break;
+        case 'factionMyListRequest': handleFactionMyListRequest(player); break;
         case 'factionSearch': handleFactionSearch(player, data); break;
         case 'factionList': handleFactionList(player, data); break;
         case 'factionInfo': handleFactionInfo(player, data); break;
         case 'factionTaskListRequest': handleFactionTaskListRequest(player); break;
         case 'factionAcceptTask': handleFactionAcceptTask(player, data); break;
-        case 'factionClaimCreator': handleFactionClaimCreator(player); break;
+        case 'factionClaimCreator': handleFactionClaimCreator(player, data); break;
         case 'playerProfileRequest': handlePlayerProfileRequest(player, data); break;
         case 'leaderboardRequest': handleLeaderboardRequest(player, data); break;
         case 'factionLeaderboardRequest': handleFactionLeaderboardRequest(player, data); break;
@@ -1371,16 +1374,24 @@ wss.on('connection', (ws) => {
       spawnInSafeZone(player);
     }
 
-    const myFaction = await callInternalApi('/api/internal/game/faction/my-faction', {
-      userId: player.userId, gameId: player.gameId,
+    const verifyResult2 = await callInternalApi('/api/internal/game/faction/verify-memberships', {
+      userId: player.userId, gameId: player.gameId, wallet: player.wallet,
     }).catch((err) => {
-      console.error('[Faction] auth lookup error:', err.message);
+      console.error('[Faction] verify-memberships error:', err.message);
       return null;
     });
-    player.factionId = myFaction?.faction?.id || null;
-    player.factionName = myFaction?.faction?.name || null;
-    player.factionSymbol = myFaction?.faction?.symbol || null;
-    player.factionImage = myFaction?.faction?.image || null;
+
+    if (verifyResult2) {
+      applyPlayerFactions(player, verifyResult2.remaining);
+      if (verifyResult2.kicked && verifyResult2.kicked.length > 0) {
+        console.log(`[Faction] auto-kicked ${player.userId} from: ${verifyResult2.kicked.map((k) => k.factionName).join(', ')}`);
+      }
+    } else {
+      // The internal-API call itself failed (not an RPC/balance failure — that's
+      // already fail-open inside the route) — fall back to a plain unverified
+      // list so the player isn't stranded with no faction data this session.
+      await refreshPlayerFactions(player);
+    }
 
     player.justSpawned = true;
     players.set(playerId, player);
@@ -1395,8 +1406,8 @@ wss.on('connection', (ws) => {
             type: 'playerJoin',
             id: p.id,
             nickname: p.nickname,
-            factionSymbol: p.factionSymbol,
-            factionImage: p.factionImage,
+            factionSymbol: p.displayedFactionSymbol,
+            factionImage: p.displayedFactionImage,
             position: p.position,
             rotation: p.rotation,
             pitch: p.pitch,
@@ -1469,8 +1480,8 @@ wss.on('connection', (ws) => {
       type: 'playerJoin',
       id: playerId,
       nickname: player.nickname,
-      factionSymbol: player.factionSymbol,
-      factionImage: player.factionImage,
+      factionSymbol: player.displayedFactionSymbol,
+      factionImage: player.displayedFactionImage,
       position: player.position,
       rotation: player.rotation,
       pitch: 0,
@@ -1638,8 +1649,8 @@ wss.on('connection', (ws) => {
       id: generateId(),
       sender: player.nickname,
       senderWallet: player.wallet,
-      senderFactionSymbol: player.factionSymbol,
-      senderFactionImage: player.factionImage,
+      senderFactionSymbol: player.displayedFactionSymbol,
+      senderFactionImage: player.displayedFactionImage,
       message: msg,
       timestamp: Date.now(),
     }, null, false);
@@ -1853,11 +1864,13 @@ wss.on('connection', (ws) => {
 
   function factionErrorMessage(code) {
     switch (code) {
-      case 'already_in_faction': return 'You are already in a faction';
+      case 'already_in_faction': return 'You are already a member of that faction';
       case 'name_taken': return 'A faction for that token already exists';
       case 'faction_not_found': return 'That faction no longer exists';
       case 'invalid_name': return 'Could not determine a name for that token';
       case 'token_not_found': return 'Could not find a token for that address';
+      case 'insufficient_token_balance': return 'You need to hold this faction\'s token in your wallet to do that';
+      case 'balance_check_failed': return 'Could not verify your token balance right now, try again shortly';
       default: return 'Faction action failed';
     }
   }
@@ -1916,10 +1929,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    player.factionId = result.faction.id;
-    player.factionName = result.faction.name;
-    player.factionSymbol = result.faction.symbol || null;
-    player.factionImage = result.faction.image || null;
+    await refreshPlayerFactions(player);
     safeSend(player.ws, { type: 'factionCreated', faction: result.faction });
   }
 
@@ -1941,24 +1951,47 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    player.factionId = result.faction.id;
-    player.factionName = result.faction.name;
-    player.factionSymbol = result.faction.symbol || null;
-    player.factionImage = result.faction.image || null;
+    await refreshPlayerFactions(player);
     safeSend(player.ws, { type: 'factionJoined', faction: result.faction });
   }
 
-  async function handleFactionLeave(player) {
+  async function handleFactionLeave(player, data) {
+    if (typeof data.factionId !== 'string' || !data.factionId) return;
+
     await callInternalApi('/api/internal/game/faction/leave', {
       userId: player.userId,
       gameId: player.gameId,
+      factionId: data.factionId,
     }).catch((err) => console.error('[Faction] leave error:', err.message));
 
-    player.factionId = null;
-    player.factionName = null;
-    player.factionSymbol = null;
-    player.factionImage = null;
-    safeSend(player.ws, { type: 'factionLeft' });
+    await refreshPlayerFactions(player);
+    safeSend(player.ws, { type: 'factionLeft', factionId: data.factionId });
+  }
+
+  async function handleFactionSetDisplayed(player, data) {
+    if (typeof data.factionId !== 'string' || !data.factionId) return;
+
+    const result = await callInternalApi('/api/internal/game/faction/set-displayed', {
+      userId: player.userId,
+      gameId: player.gameId,
+      factionId: data.factionId,
+    }).catch((err) => {
+      console.error('[Faction] set-displayed error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not switch displayed faction' });
+      return;
+    }
+
+    await refreshPlayerFactions(player);
+    safeSend(player.ws, { type: 'factionDisplayedSet', faction: result.faction });
+  }
+
+  async function handleFactionMyListRequest(player) {
+    await refreshPlayerFactions(player);
+    safeSend(player.ws, { type: 'factionMyListResult', factions: player.factions });
   }
 
   async function handleFactionSearch(player, data) {
@@ -1998,28 +2031,14 @@ wss.on('connection', (ws) => {
   }
 
   async function handleFactionInfo(player, data) {
-    if (typeof data.factionId === 'string' && data.factionId) {
-      const result = await callInternalApi('/api/internal/game/faction/get-by-id', {
-        gameId: player.gameId, factionId: data.factionId,
-      }).catch((err) => {
-        console.error('[Faction] info error:', err.message);
-        return null;
-      });
-      safeSend(player.ws, { type: 'factionInfo', faction: result?.faction || null });
-      return;
-    }
+    if (typeof data.factionId !== 'string' || !data.factionId) return;
 
-    const result = await callInternalApi('/api/internal/game/faction/my-faction', {
-      userId: player.userId, gameId: player.gameId,
+    const result = await callInternalApi('/api/internal/game/faction/get-by-id', {
+      gameId: player.gameId, factionId: data.factionId,
     }).catch((err) => {
-      console.error('[Faction] my-faction error:', err.message);
+      console.error('[Faction] info error:', err.message);
       return null;
     });
-
-    player.factionId = result?.faction?.id || null;
-    player.factionName = result?.faction?.name || null;
-    player.factionSymbol = result?.faction?.symbol || null;
-    player.factionImage = result?.faction?.image || null;
     safeSend(player.ws, { type: 'factionInfo', faction: result?.faction || null });
   }
 
@@ -2062,9 +2081,28 @@ wss.on('connection', (ws) => {
     safeSend(player.ws, { type: 'factionLeaderboardResult', leaderboard: result?.leaderboard || [] });
   }
 
+  function applyPlayerFactions(player, factionsList) {
+    player.factions = factionsList || [];
+    const displayed = player.factions.find((f) => f.isDisplayed) || null;
+    player.displayedFactionId = displayed?.id || null;
+    player.displayedFactionName = displayed?.name || null;
+    player.displayedFactionSymbol = displayed?.symbol || null;
+    player.displayedFactionImage = displayed?.image || null;
+  }
+
+  async function refreshPlayerFactions(player) {
+    const result = await callInternalApi('/api/internal/game/faction/my-factions', {
+      userId: player.userId, gameId: player.gameId,
+    }).catch((err) => {
+      console.error('[Faction] my-factions error:', err.message);
+      return null;
+    });
+    applyPlayerFactions(player, result?.factions);
+  }
+
   function broadcastToFaction(factionId, message, excludePlayerId) {
     players.forEach((p) => {
-      if (p.factionId === factionId && p.authenticated && p.id !== excludePlayerId) {
+      if (p.authenticated && p.id !== excludePlayerId && p.factions?.some((f) => f.id === factionId)) {
         safeSend(p.ws, message);
       }
     });
@@ -2134,12 +2172,10 @@ wss.on('connection', (ws) => {
     }
   }
 
-  async function bumpFactionTaskProgress(player, metric, amount) {
-    if (!player.factionId || amount <= 0) return;
-
-    let state = factionTaskState.get(player.factionId);
+  async function bumpSingleFactionTask(factionId, gameId, metric, amount) {
+    let state = factionTaskState.get(factionId);
     if (!state) {
-      state = await hydrateFactionTaskState(player.factionId, player.gameId);
+      state = await hydrateFactionTaskState(factionId, gameId);
     }
     if (!state || !state.taskKey || state.metric !== metric) return;
 
@@ -2147,8 +2183,13 @@ wss.on('connection', (ws) => {
     state.dirty = true;
 
     if (state.progress >= state.target) {
-      await completeFactionTask(player.factionId, state.taskKey, player.gameId);
+      await completeFactionTask(factionId, state.taskKey, gameId);
     }
+  }
+
+  async function bumpFactionTaskProgress(player, metric, amount) {
+    if (!player.factions?.length || amount <= 0) return;
+    await Promise.all(player.factions.map((f) => bumpSingleFactionTask(f.id, player.gameId, metric, amount)));
   }
 
   safeInterval(() => {
@@ -2166,7 +2207,7 @@ wss.on('connection', (ws) => {
   }
 
   async function handleFactionAcceptTask(player, data) {
-    if (!player.factionId) return;
+    if (typeof data.factionId !== 'string' || !player.factions?.some((f) => f.id === data.factionId)) return;
     if (typeof data.taskKey !== 'string') return;
     const def = FACTION_TASKS_BY_KEY.get(data.taskKey);
     if (!def) {
@@ -2175,7 +2216,7 @@ wss.on('connection', (ws) => {
     }
 
     const result = await callInternalApi('/api/internal/game/faction/accept-task', {
-      userId: player.userId, gameId: player.gameId, factionId: player.factionId,
+      userId: player.userId, gameId: player.gameId, factionId: data.factionId,
       taskKey: def.key, target: def.target, rewardAsh: def.rewardAsh,
     }).catch((err) => {
       console.error('[FactionTask] accept error:', err.message);
@@ -2192,18 +2233,18 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    factionTaskState.set(player.factionId, {
+    factionTaskState.set(data.factionId, {
       taskKey: def.key, metric: def.metric, target: def.target, progress: 0, dirty: false,
     });
 
-    broadcastToFaction(player.factionId, { type: 'factionTaskAccepted', faction: result.faction }, null);
+    broadcastToFaction(data.factionId, { type: 'factionTaskAccepted', faction: result.faction }, null);
   }
 
-  async function handleFactionClaimCreator(player) {
-    if (!player.factionId) return;
+  async function handleFactionClaimCreator(player, data) {
+    if (typeof data.factionId !== 'string' || !player.factions?.some((f) => f.id === data.factionId)) return;
 
     const result = await callInternalApi('/api/internal/game/faction/claim-creator', {
-      userId: player.userId, gameId: player.gameId, wallet: player.wallet, factionId: player.factionId,
+      userId: player.userId, gameId: player.gameId, wallet: player.wallet, factionId: data.factionId,
     }).catch((err) => {
       console.error('[FactionTask] claim-creator error:', err.message);
       return null;
@@ -2217,7 +2258,7 @@ wss.on('connection', (ws) => {
     safeSend(player.ws, { type: 'factionCreatorClaimResult', isCreator: result.isCreator, faction: result.faction });
 
     if (result.isCreator) {
-      broadcastToFaction(player.factionId, { type: 'factionCreatorVerified', faction: result.faction }, player.id);
+      broadcastToFaction(data.factionId, { type: 'factionCreatorVerified', faction: result.faction }, player.id);
     }
   }
 
@@ -2250,6 +2291,16 @@ wss.on('connection', (ws) => {
     }
 
     safeSend(player.ws, { type: 'friendRequestSent', friend: result.friend, status: result.status });
+
+    if (result.status !== 'accepted') {
+      const targetPlayer = userIdToPlayer.get(result.friend.userId);
+      if (targetPlayer && targetPlayer.authenticated) {
+        safeSend(targetPlayer.ws, {
+          type: 'friendRequestReceived',
+          friend: { userId: player.userId, wallet: player.wallet, nickname: player.nickname },
+        });
+      }
+    }
   }
 
   async function handleFriendRequestAccept(player, data) {
@@ -2354,6 +2405,16 @@ wss.on('connection', (ws) => {
     }
 
     safeSend(player.ws, { type: 'mailSent', mailId: result.mailId });
+
+    const recipientPlayer = result.recipientUserId ? userIdToPlayer.get(result.recipientUserId) : null;
+    if (recipientPlayer && recipientPlayer.authenticated) {
+      safeSend(recipientPlayer.ws, {
+        type: 'mailReceived',
+        mailId: result.mailId,
+        senderNickname: player.nickname,
+        subject: data.subject,
+      });
+    }
   }
 
   async function handleMailInboxRequest(player) {
@@ -2636,8 +2697,8 @@ wss.on('connection', (ws) => {
       type: 'playerJoinLocation',
       id: player.id,
       nickname: player.nickname,
-      factionSymbol: player.factionSymbol,
-      factionImage: player.factionImage,
+      factionSymbol: player.displayedFactionSymbol,
+      factionImage: player.displayedFactionImage,
       position: player.position,
       rotation: player.rotation,
       pitch: player.pitch,
