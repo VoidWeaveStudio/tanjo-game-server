@@ -173,6 +173,11 @@ const players = new Map();
 const userIdToPlayer = new Map();
 const rateLimits = new Map();
 const factionTaskState = new Map();
+// In-flight hydrateFactionTaskState() promises, keyed by factionId — makes
+// concurrent bumpSingleFactionTask() calls on a cache miss share ONE hydrate
+// call and mutate the SAME resulting state object, instead of each racing its
+// own hydrate and one silently overwriting (dropping) the other's contribution.
+const factionTaskHydrating = new Map();
 
 const VALID_STATES = new Set(['idle', 'walk', 'sprint', 'jump']);
 const VALID_LOCATIONS = new Set([
@@ -1013,6 +1018,21 @@ safeInterval(() => {
     persistPlayer(player);
   });
 }, CONFIG.autoSaveInterval);
+
+// Flushes dirty faction-task progress to the DB. factionTaskState is shared
+// module-level state (not per-connection), so this must run once for the
+// whole process — it was previously (incorrectly) declared inside
+// wss.on('connection', ...), creating one leaked, never-cleared interval per
+// WebSocket connection ever made (including connections that never authenticate).
+safeInterval(() => {
+  factionTaskState.forEach((state, factionId) => {
+    if (!state.dirty || !state.taskKey) return;
+    state.dirty = false;
+    callInternalApi('/api/internal/game/faction/task-progress', {
+      factionId, taskKey: state.taskKey, progress: state.progress,
+    }).catch((err) => console.error('[FactionTask] progress flush error:', err.message));
+  });
+}, 20000);
 
 wss.on('connection', (ws) => {
   if (players.size >= MAX_PLAYERS) {
@@ -2172,11 +2192,22 @@ wss.on('connection', (ws) => {
     }
   }
 
-  async function bumpSingleFactionTask(factionId, gameId, metric, amount) {
-    let state = factionTaskState.get(factionId);
-    if (!state) {
-      state = await hydrateFactionTaskState(factionId, gameId);
+  async function getOrHydrateFactionTaskState(factionId, gameId) {
+    const cached = factionTaskState.get(factionId);
+    if (cached) return cached;
+
+    let inflight = factionTaskHydrating.get(factionId);
+    if (!inflight) {
+      inflight = hydrateFactionTaskState(factionId, gameId).finally(() => {
+        factionTaskHydrating.delete(factionId);
+      });
+      factionTaskHydrating.set(factionId, inflight);
     }
+    return inflight;
+  }
+
+  async function bumpSingleFactionTask(factionId, gameId, metric, amount) {
+    const state = await getOrHydrateFactionTaskState(factionId, gameId);
     if (!state || !state.taskKey || state.metric !== metric) return;
 
     state.progress += amount;
@@ -2191,16 +2222,6 @@ wss.on('connection', (ws) => {
     if (!player.factions?.length || amount <= 0) return;
     await Promise.all(player.factions.map((f) => bumpSingleFactionTask(f.id, player.gameId, metric, amount)));
   }
-
-  safeInterval(() => {
-    factionTaskState.forEach((state, factionId) => {
-      if (!state.dirty || !state.taskKey) return;
-      state.dirty = false;
-      callInternalApi('/api/internal/game/faction/task-progress', {
-        factionId, taskKey: state.taskKey, progress: state.progress,
-      }).catch((err) => console.error('[FactionTask] progress flush error:', err.message));
-    });
-  }, 20000);
 
   function handleFactionTaskListRequest(player) {
     safeSend(player.ws, { type: 'factionTaskListResult', tasks: FACTION_TASKS });
