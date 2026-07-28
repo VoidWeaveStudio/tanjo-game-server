@@ -4,6 +4,7 @@ const WebSocket = require('ws');
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
+const { FACTION_TASKS, FACTION_TASKS_BY_KEY } = require('./factionTasks');
 
 const PORT = process.env.PORT || 3001;
 const MAX_PLAYERS = 100;
@@ -171,6 +172,7 @@ const wss = new WebSocket.Server({
 const players = new Map();
 const userIdToPlayer = new Map();
 const rateLimits = new Map();
+const factionTaskState = new Map();
 
 const VALID_STATES = new Set(['idle', 'walk', 'sprint', 'jump']);
 const VALID_LOCATIONS = new Set([
@@ -1064,6 +1066,8 @@ wss.on('connection', (ws) => {
     quests: {},
     factionId: null,
     factionName: null,
+    factionSymbol: null,
+    factionImage: null,
     canyon: {
       inHub: true,
       segment: 1,
@@ -1164,7 +1168,7 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'quest', CONFIG.network.questRateLimit)) return;
       } else if (data.type === 'canyonWarp' || data.type === 'canyonMapRequest' || data.type === 'canyonEnterDungeon' || data.type === 'canyonReturnToHub' || data.type === 'canyonCrossThreshold') {
         if (!checkRateLimit(playerId, 'canyon', CONFIG.network.canyonRateLimit)) return;
-      } else if (data.type === 'factionCreate' || data.type === 'factionJoin' || data.type === 'factionLeave' || data.type === 'factionList' || data.type === 'factionInfo') {
+      } else if (data.type === 'factionCreate' || data.type === 'factionJoin' || data.type === 'factionLeave' || data.type === 'factionList' || data.type === 'factionInfo' || data.type === 'factionTaskListRequest' || data.type === 'factionAcceptTask' || data.type === 'factionClaimCreator') {
         if (!checkRateLimit(playerId, 'faction', CONFIG.network.factionRateLimit)) return;
       } else if (data.type === 'factionSearch') {
         if (!checkRateLimit(playerId, 'factionSearch', CONFIG.network.factionSearchRateLimit)) return;
@@ -1209,6 +1213,9 @@ wss.on('connection', (ws) => {
         case 'factionSearch': handleFactionSearch(player, data); break;
         case 'factionList': handleFactionList(player, data); break;
         case 'factionInfo': handleFactionInfo(player, data); break;
+        case 'factionTaskListRequest': handleFactionTaskListRequest(player); break;
+        case 'factionAcceptTask': handleFactionAcceptTask(player, data); break;
+        case 'factionClaimCreator': handleFactionClaimCreator(player); break;
         case 'playerProfileRequest': handlePlayerProfileRequest(player, data); break;
         case 'leaderboardRequest': handleLeaderboardRequest(player, data); break;
         case 'factionLeaderboardRequest': handleFactionLeaderboardRequest(player, data); break;
@@ -1372,6 +1379,8 @@ wss.on('connection', (ws) => {
     });
     player.factionId = myFaction?.faction?.id || null;
     player.factionName = myFaction?.faction?.name || null;
+    player.factionSymbol = myFaction?.faction?.symbol || null;
+    player.factionImage = myFaction?.faction?.image || null;
 
     player.justSpawned = true;
     players.set(playerId, player);
@@ -1386,6 +1395,8 @@ wss.on('connection', (ws) => {
             type: 'playerJoin',
             id: p.id,
             nickname: p.nickname,
+            factionSymbol: p.factionSymbol,
+            factionImage: p.factionImage,
             position: p.position,
             rotation: p.rotation,
             pitch: p.pitch,
@@ -1458,6 +1469,8 @@ wss.on('connection', (ws) => {
       type: 'playerJoin',
       id: playerId,
       nickname: player.nickname,
+      factionSymbol: player.factionSymbol,
+      factionImage: player.factionImage,
       position: player.position,
       rotation: player.rotation,
       pitch: 0,
@@ -1579,6 +1592,7 @@ wss.on('connection', (ws) => {
     if (player.weaponAmmo <= 0) player.ammoEmptyAt = now;
 
     player.stats.shotsFired++;
+    bumpFactionTaskProgress(player, 'shots', 1).catch((err) => console.error('[FactionTask] bump error:', err.message));
 
     player.recentShots.push({ time: now, origin: [ox, oy, oz], direction });
     player.recentShots = player.recentShots.filter(
@@ -1624,6 +1638,8 @@ wss.on('connection', (ws) => {
       id: generateId(),
       sender: player.nickname,
       senderWallet: player.wallet,
+      senderFactionSymbol: player.factionSymbol,
+      senderFactionImage: player.factionImage,
       message: msg,
       timestamp: Date.now(),
     }, null, false);
@@ -1702,6 +1718,7 @@ wss.on('connection', (ws) => {
 
     if (target.health <= 0) {
       player.stats.kills++;
+      bumpFactionTaskProgress(player, 'kills', 1).catch((err) => console.error('[FactionTask] bump error:', err.message));
       killPlayerAndRespawn(target, playerId, historicalPos);
     }
   }
@@ -1901,6 +1918,8 @@ wss.on('connection', (ws) => {
 
     player.factionId = result.faction.id;
     player.factionName = result.faction.name;
+    player.factionSymbol = result.faction.symbol || null;
+    player.factionImage = result.faction.image || null;
     safeSend(player.ws, { type: 'factionCreated', faction: result.faction });
   }
 
@@ -1924,6 +1943,8 @@ wss.on('connection', (ws) => {
 
     player.factionId = result.faction.id;
     player.factionName = result.faction.name;
+    player.factionSymbol = result.faction.symbol || null;
+    player.factionImage = result.faction.image || null;
     safeSend(player.ws, { type: 'factionJoined', faction: result.faction });
   }
 
@@ -1935,6 +1956,8 @@ wss.on('connection', (ws) => {
 
     player.factionId = null;
     player.factionName = null;
+    player.factionSymbol = null;
+    player.factionImage = null;
     safeSend(player.ws, { type: 'factionLeft' });
   }
 
@@ -1995,6 +2018,8 @@ wss.on('connection', (ws) => {
 
     player.factionId = result?.faction?.id || null;
     player.factionName = result?.faction?.name || null;
+    player.factionSymbol = result?.faction?.symbol || null;
+    player.factionImage = result?.faction?.image || null;
     safeSend(player.ws, { type: 'factionInfo', faction: result?.faction || null });
   }
 
@@ -2035,6 +2060,165 @@ wss.on('connection', (ws) => {
     });
 
     safeSend(player.ws, { type: 'factionLeaderboardResult', leaderboard: result?.leaderboard || [] });
+  }
+
+  function broadcastToFaction(factionId, message, excludePlayerId) {
+    players.forEach((p) => {
+      if (p.factionId === factionId && p.authenticated && p.id !== excludePlayerId) {
+        safeSend(p.ws, message);
+      }
+    });
+  }
+
+  async function hydrateFactionTaskState(factionId, gameId) {
+    const result = await callInternalApi('/api/internal/game/faction/get-by-id', {
+      gameId, factionId,
+    }).catch((err) => {
+      console.error('[FactionTask] hydrate error:', err.message);
+      return null;
+    });
+
+    const faction = result?.faction;
+    if (!faction || !faction.activeTask) {
+      factionTaskState.delete(factionId);
+      return null;
+    }
+
+    const def = FACTION_TASKS_BY_KEY.get(faction.activeTask.key);
+    const state = {
+      taskKey: faction.activeTask.key,
+      metric: def ? def.metric : null,
+      target: faction.activeTask.target,
+      progress: faction.activeTask.progress,
+      dirty: false,
+    };
+    factionTaskState.set(factionId, state);
+    return state;
+  }
+
+  async function completeFactionTask(factionId, taskKey, gameId) {
+    factionTaskState.delete(factionId);
+
+    const result = await callInternalApi('/api/internal/game/faction/complete-task', {
+      factionId, taskKey,
+    }).catch((err) => {
+      console.error('[FactionTask] complete error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) return;
+
+    const recipient = userIdToPlayer.get(result.rewardUserId);
+    if (recipient) {
+      recipient.ash += result.rewardAsh;
+      safeSend(recipient.ws, { type: 'inventoryUpdate', inventory: recipient.inventory, ash: recipient.ash });
+    }
+
+    const def = FACTION_TASKS_BY_KEY.get(taskKey);
+    broadcastToFaction(factionId, {
+      type: 'factionTaskCompleted',
+      taskKey,
+      label: def ? def.label : taskKey,
+      rewardAsh: result.rewardAsh,
+      rewardNickname: result.rewardNickname,
+    });
+
+    const fresh = await callInternalApi('/api/internal/game/faction/get-by-id', {
+      gameId, factionId,
+    }).catch((err) => {
+      console.error('[FactionTask] refresh error:', err.message);
+      return null;
+    });
+    if (fresh?.faction) {
+      broadcastToFaction(factionId, { type: 'factionInfo', faction: fresh.faction });
+    }
+  }
+
+  async function bumpFactionTaskProgress(player, metric, amount) {
+    if (!player.factionId || amount <= 0) return;
+
+    let state = factionTaskState.get(player.factionId);
+    if (!state) {
+      state = await hydrateFactionTaskState(player.factionId, player.gameId);
+    }
+    if (!state || !state.taskKey || state.metric !== metric) return;
+
+    state.progress += amount;
+    state.dirty = true;
+
+    if (state.progress >= state.target) {
+      await completeFactionTask(player.factionId, state.taskKey, player.gameId);
+    }
+  }
+
+  safeInterval(() => {
+    factionTaskState.forEach((state, factionId) => {
+      if (!state.dirty || !state.taskKey) return;
+      state.dirty = false;
+      callInternalApi('/api/internal/game/faction/task-progress', {
+        factionId, taskKey: state.taskKey, progress: state.progress,
+      }).catch((err) => console.error('[FactionTask] progress flush error:', err.message));
+    });
+  }, 20000);
+
+  function handleFactionTaskListRequest(player) {
+    safeSend(player.ws, { type: 'factionTaskListResult', tasks: FACTION_TASKS });
+  }
+
+  async function handleFactionAcceptTask(player, data) {
+    if (!player.factionId) return;
+    if (typeof data.taskKey !== 'string') return;
+    const def = FACTION_TASKS_BY_KEY.get(data.taskKey);
+    if (!def) {
+      safeSend(player.ws, { type: 'error', message: 'Unknown task' });
+      return;
+    }
+
+    const result = await callInternalApi('/api/internal/game/faction/accept-task', {
+      userId: player.userId, gameId: player.gameId, factionId: player.factionId,
+      taskKey: def.key, target: def.target, rewardAsh: def.rewardAsh,
+    }).catch((err) => {
+      console.error('[FactionTask] accept error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      const message = result?.error === 'task_already_active'
+        ? 'A task is already active for your faction'
+        : result?.error === 'not_authorized'
+          ? 'Only the faction leader or verified token creator can accept tasks'
+          : 'Could not accept task';
+      safeSend(player.ws, { type: 'error', message });
+      return;
+    }
+
+    factionTaskState.set(player.factionId, {
+      taskKey: def.key, metric: def.metric, target: def.target, progress: 0, dirty: false,
+    });
+
+    broadcastToFaction(player.factionId, { type: 'factionTaskAccepted', faction: result.faction }, null);
+  }
+
+  async function handleFactionClaimCreator(player) {
+    if (!player.factionId) return;
+
+    const result = await callInternalApi('/api/internal/game/faction/claim-creator', {
+      userId: player.userId, gameId: player.gameId, wallet: player.wallet, factionId: player.factionId,
+    }).catch((err) => {
+      console.error('[FactionTask] claim-creator error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not verify token creator right now' });
+      return;
+    }
+
+    safeSend(player.ws, { type: 'factionCreatorClaimResult', isCreator: result.isCreator, faction: result.faction });
+
+    if (result.isCreator) {
+      broadcastToFaction(player.factionId, { type: 'factionCreatorVerified', faction: result.faction }, player.id);
+    }
   }
 
   function friendErrorMessage(code) {
@@ -2279,6 +2463,7 @@ wss.on('connection', (ws) => {
 
     player.quests[quest.id] = { status: 'completed', progress: quest.targetCount };
     player.ash += quest.rewardAsh;
+    bumpFactionTaskProgress(player, 'ash', quest.rewardAsh).catch((err) => console.error('[FactionTask] bump error:', err.message));
     persistPlayer(player);
 
     safeSend(player.ws, {
@@ -2392,6 +2577,7 @@ wss.on('connection', (ws) => {
     finalEntry.quantity -= finalQty;
     player.inventory = player.inventory.filter((e) => e.quantity > 0);
     player.ash += ashEarned;
+    bumpFactionTaskProgress(player, 'ash', ashEarned).catch((err) => console.error('[FactionTask] bump error:', err.message));
 
     persistPlayer(player);
 
@@ -2450,6 +2636,8 @@ wss.on('connection', (ws) => {
       type: 'playerJoinLocation',
       id: player.id,
       nickname: player.nickname,
+      factionSymbol: player.factionSymbol,
+      factionImage: player.factionImage,
       position: player.position,
       rotation: player.rotation,
       pitch: player.pitch,
