@@ -423,6 +423,83 @@ function isInAOI(player, other) {
   return dx <= CONFIG.world.aoiRadius && dz <= CONFIG.world.aoiRadius;
 }
 
+function buildPlayerJoinPayload(p) {
+  return {
+    type: 'playerJoin',
+    id: p.id,
+    nickname: p.nickname,
+    factionSymbol: p.displayedFactionSymbol,
+    factionImage: p.displayedFactionImage,
+    position: p.position,
+    rotation: p.rotation,
+    pitch: p.pitch,
+    state: p.state || 'idle',
+    jumping: p.jumping || false,
+    velocityY: p.velocityY || 0,
+    health: p.health,
+    alive: p.alive,
+    weaponEquipped: p.weaponEquipped,
+    isShooting: p.isShooting,
+    locationId: p.locationId,
+  };
+}
+
+// Re-evaluates which currently-connected players are within `player`'s AOI
+// and diffs that against player.aoiNeighbors (the set established the last
+// time this ran). isInAOI is re-checked from scratch on every playerUpdate
+// broadcast, but without this diff+notify step a player who simply walks
+// into/out of someone's zone (no reconnect, no location change) never gets
+// a playerJoin/playerLeave for them — the client then silently drops their
+// playerUpdate packets (no local entity to apply them to), which is why
+// two players could see each other only in one direction until one of them
+// reloaded and got a fresh AOI snapshot from the init message.
+function recomputeAOI(player) {
+  const newNeighbors = new Set();
+
+  players.forEach((other, id) => {
+    if (id === player.id) return;
+    if (!other.authenticated || other.ws.readyState !== WebSocket.OPEN) return;
+    if (isInAOI(player, other)) newNeighbors.add(id);
+  });
+
+  const oldNeighbors = player.aoiNeighbors;
+
+  for (const id of newNeighbors) {
+    if (oldNeighbors.has(id)) continue;
+    const other = players.get(id);
+    if (!other) continue;
+    safeSend(player.ws, buildPlayerJoinPayload(other));
+    safeSend(other.ws, buildPlayerJoinPayload(player));
+    other.aoiNeighbors.add(player.id);
+  }
+
+  for (const id of oldNeighbors) {
+    if (newNeighbors.has(id)) continue;
+    const other = players.get(id);
+    safeSend(player.ws, { type: 'playerLeave', playerId: id });
+    if (other) {
+      safeSend(other.ws, { type: 'playerLeave', playerId: player.id });
+      other.aoiNeighbors.delete(player.id);
+    }
+  }
+
+  player.aoiNeighbors = newNeighbors;
+}
+
+// Used on disconnect / duplicate-session kick: notifies exactly the players
+// who currently have this player's entity (rather than re-deriving via
+// isInAOI, which needs a live position/location that a closing connection
+// may not reliably have) and cleans up the mutual bookkeeping.
+function notifyAOILeave(player) {
+  for (const id of player.aoiNeighbors) {
+    const other = players.get(id);
+    if (!other) continue;
+    other.aoiNeighbors.delete(player.id);
+    safeSend(other.ws, { type: 'playerLeave', playerId: player.id });
+  }
+  player.aoiNeighbors = new Set();
+}
+
 function spawnInSafeZone(player) {
   const angle = Math.random() * Math.PI * 2;
   const r = 10 + Math.random() * 15;
@@ -1068,6 +1145,7 @@ wss.on('connection', (ws) => {
     justSpawned: false,
     justTeleported: false,
     lastLocationChangeAt: 0,
+    aoiNeighbors: new Set(),
     weaponAmmo: WEAPON_CONFIG.maxAmmo,
     lastShotAt: 0,
     ammoEmptyAt: 0,
@@ -1272,7 +1350,7 @@ wss.on('connection', (ws) => {
     console.log(`[-] Player left: ${playerId} (${player.userId || 'unauth'}). Total: ${players.size}`);
 
     if (player.authenticated) {
-      broadcast({ type: 'playerLeave', playerId }, playerId, true, player);
+      notifyAOILeave(player);
       broadcastCount();
     }
   });
@@ -1307,7 +1385,7 @@ wss.on('connection', (ws) => {
       try { existingOwner.ws.close(4009, 'duplicate_session'); } catch (e) { }
       if (players.get(existingOwner.id) === existingOwner) {
         players.delete(existingOwner.id);
-        broadcast({ type: 'playerLeave', playerId: existingOwner.id }, existingOwner.id, true, existingOwner);
+        notifyAOILeave(existingOwner);
       }
     }
     userIdToPlayer.set(verifyResult.userId, player);
@@ -1438,6 +1516,10 @@ wss.on('connection', (ws) => {
             alive: p.alive,
             locationId: p.locationId,
           });
+          // Seed mutual AOI bookkeeping so recomputeAOI() has an accurate
+          // baseline the next time either player moves.
+          player.aoiNeighbors.add(id);
+          p.aoiNeighbors.add(playerId);
         }
       }
     });
@@ -1556,6 +1638,8 @@ wss.on('connection', (ws) => {
     player.weaponEquipped = data.weaponEquipped !== false;
     player.isShooting = !!data.isShooting;
     player.lastUpdate = now;
+
+    recomputeAOI(player);
 
     broadcast({
       type: 'playerUpdate',
@@ -2707,31 +2791,49 @@ wss.on('connection', (ws) => {
     player.positionHistory = [];
     player.recentShots = [];
 
-    broadcast({
-      type: 'playerLeaveLocation',
-      playerId: player.id,
-      fromLocation: oldLocation,
-      toLocation: data.locationId,
-    }, playerId, true, { ...player, locationId: oldLocation });
+    // Tell (and stop tracking) everyone who had this player's entity from
+    // the old location — using the maintained neighbor set here (rather than
+    // re-deriving via isInAOI against a synthetic old-location player) keeps
+    // this in sync with recomputeAOI()'s bookkeeping so no duplicate/missing
+    // join events happen later as this player moves in the new location.
+    const oldNeighbors = player.aoiNeighbors;
+    player.aoiNeighbors = new Set();
+    for (const id of oldNeighbors) {
+      const other = players.get(id);
+      if (!other) continue;
+      other.aoiNeighbors.delete(playerId);
+      safeSend(other.ws, {
+        type: 'playerLeaveLocation',
+        playerId: player.id,
+        fromLocation: oldLocation,
+        toLocation: data.locationId,
+      });
+    }
 
-    broadcast({
-      type: 'playerJoinLocation',
-      id: player.id,
-      nickname: player.nickname,
-      factionSymbol: player.displayedFactionSymbol,
-      factionImage: player.displayedFactionImage,
-      position: player.position,
-      rotation: player.rotation,
-      pitch: player.pitch,
-      state: player.state || 'idle',
-      jumping: player.jumping || false,
-      velocityY: player.velocityY || 0,
-      health: player.health,
-      alive: player.alive,
-      weaponEquipped: player.weaponEquipped,
-      isShooting: player.isShooting,
-      locationId: data.locationId,
-    }, playerId, true, player);
+    players.forEach((other, id) => {
+      if (id === playerId || !other.authenticated) return;
+      if (!isInAOI(player, other)) return;
+      player.aoiNeighbors.add(id);
+      other.aoiNeighbors.add(playerId);
+      safeSend(other.ws, {
+        type: 'playerJoinLocation',
+        id: player.id,
+        nickname: player.nickname,
+        factionSymbol: player.displayedFactionSymbol,
+        factionImage: player.displayedFactionImage,
+        position: player.position,
+        rotation: player.rotation,
+        pitch: player.pitch,
+        state: player.state || 'idle',
+        jumping: player.jumping || false,
+        velocityY: player.velocityY || 0,
+        health: player.health,
+        alive: player.alive,
+        weaponEquipped: player.weaponEquipped,
+        isShooting: player.isShooting,
+        locationId: data.locationId,
+      });
+    });
 
     if (data.locationId === 'main-world') {
       safeSend(ws, { type: 'lootState', loot: serializeLoot() });
