@@ -30,6 +30,7 @@ const CONFIG = {
     voiceRateLimit: 4,
     locationChangeRateLimit: 10,
     nicknameChangeRateLimit: 3,
+    skinUpdateRateLimit: 3,
     saveProgressRateLimit: 5,
     questRateLimit: 10,
     canyonRateLimit: 10,
@@ -40,6 +41,13 @@ const CONFIG = {
     friendSearchRateLimit: 15,
     mailSendRateLimit: 5,
     mailReadRateLimit: 15,
+    respawnRateLimit: 3,
+    tokenLookupRateLimit: 1,
+    supportRateLimit: 1,
+    blockRateLimit: 5,
+    privateMessageRateLimit: 5,
+    factionChatRateLimit: 3,
+    factionInviteRateLimit: 5,
   },
   combat: {
     maxShotRange: 200,
@@ -171,6 +179,7 @@ const wss = new WebSocket.Server({
 
 const players = new Map();
 const userIdToPlayer = new Map();
+const walletToPlayer = new Map();
 const rateLimits = new Map();
 const factionTaskState = new Map();
 // In-flight hydrateFactionTaskState() promises, keyed by factionId — makes
@@ -178,6 +187,17 @@ const factionTaskState = new Map();
 // call and mutate the SAME resulting state object, instead of each racing its
 // own hydrate and one silently overwriting (dropping) the other's contribution.
 const factionTaskHydrating = new Map();
+// Bumped every time something is about to overwrite factionTaskState for a
+// faction after an await (hydrate or accept-task). Whichever async write
+// resolves against a stale generation number is discarded instead of
+// clobbering a newer write that landed while it was in flight.
+const factionTaskGeneration = new Map();
+
+function nextFactionTaskGeneration(factionId) {
+  const gen = (factionTaskGeneration.get(factionId) || 0) + 1;
+  factionTaskGeneration.set(factionId, gen);
+  return gen;
+}
 
 const VALID_STATES = new Set(['idle', 'walk', 'sprint', 'jump']);
 const VALID_LOCATIONS = new Set([
@@ -222,6 +242,12 @@ function getCachedMessage(data) {
 function sanitizeMessage(msg) {
   return msg
     .replace(/[\u0000-\u001F\u007F-\u009F]/g, '');
+}
+
+const CHAT_LINK_PATTERN = /(https?:\/\/|www\.)\S+|\b[a-z0-9-]+\.(com|net|org|io|gg|xyz|app|dev|me|link|to|club|shop|site|online|info|biz|co|ru|tk|top|click|icu|cc|vip|live|fun|pw|ws)\b/i;
+
+function containsLink(msg) {
+  return CHAT_LINK_PATTERN.test(msg);
 }
 
 function checkRateLimit(playerId, type, limit) {
@@ -388,6 +414,16 @@ function generateUniqueNickname(base = 'Player') {
   return `${base}${suffix}`;
 }
 
+async function assignUniqueNickname(player, base) {
+  const result = await callInternalApi('/api/internal/game/nickname/set', {
+    userId: player.userId, gameId: player.gameId, nickname: base, allowSuffix: true,
+  }).catch((err) => {
+    console.error('[Nickname] auto-assign error:', err.message);
+    return null;
+  });
+  return result?.nickname || generateUniqueNickname(base);
+}
+
 function generateId() {
   return crypto.randomBytes(16).toString('hex');
 }
@@ -441,6 +477,9 @@ function buildPlayerJoinPayload(p) {
     weaponEquipped: p.weaponEquipped,
     isShooting: p.isShooting,
     locationId: p.locationId,
+    isAdmin: !!p.isAdmin,
+    isFactionCreator: !!p.isFactionCreator,
+    skinTextureUrl: p.skinTextureUrl || null,
   };
 }
 
@@ -665,7 +704,7 @@ function updateCanyonPatrol(enemy, cfg, now) {
   enemy.position[2] += (dz / len) * step;
 }
 
-function killPlayerAndRespawn(target, killerId, position, respawnDelayMs = 3000) {
+function markPlayerDead(target, killerId, position) {
   target.alive = false;
   target.stats.deaths++;
 
@@ -678,38 +717,39 @@ function killPlayerAndRespawn(target, killerId, position, respawnDelayMs = 3000)
 
   safeSend(target.ws, deathMessage);
   broadcast(deathMessage, target.id, true, target);
+}
 
-  const respawnToken = Date.now() + Math.random();
-  target.respawnToken = respawnToken;
+function respawnPlayer(target) {
+  if (target.alive) return;
+  if (target.ws.readyState !== WebSocket.OPEN) return;
 
-  setTimeout(() => {
-    if (target.respawnToken !== respawnToken) return;
-    if (target.ws.readyState !== WebSocket.OPEN) return;
-    if (!target.alive) {
-      target.health = target.maxHealth;
-      target.alive = true;
-      if (target.locationId === 'tower-first-floor' && target.canyon) {
-        enterCanyonHub(target);
-      } else {
-        spawnInSafeZone(target);
-      }
-      target.justTeleported = true;
-      target.respawnToken = null;
+  target.health = target.maxHealth;
+  target.alive = true;
+  if (target.locationId === 'tower-first-floor' && target.canyon) {
+    enterCanyonHub(target);
+  } else {
+    spawnInSafeZone(target);
+  }
+  target.justTeleported = true;
 
-      safeSend(target.ws, {
-        type: 'respawn',
-        position: target.position,
-        health: target.health,
-      });
+  safeSend(target.ws, {
+    type: 'respawn',
+    position: target.position,
+    health: target.health,
+  });
 
-      broadcast({
-        type: 'playerRespawn',
-        id: target.id,
-        position: target.position,
-        health: target.health,
-      }, target.id, true, target);
-    }
-  }, respawnDelayMs);
+  broadcast({
+    type: 'playerRespawn',
+    id: target.id,
+    position: target.position,
+    health: target.health,
+  }, target.id, true, target);
+}
+
+function handleRespawnRequest(player) {
+  if (!player.alive) {
+    respawnPlayer(player);
+  }
 }
 
 function damagePlayerByCanyonEnemy(player, enemy) {
@@ -730,7 +770,7 @@ function damagePlayerByCanyonEnemy(player, enemy) {
   });
 
   if (player.health <= 0) {
-    killPlayerAndRespawn(player, enemy.id, player.position);
+    markPlayerDead(player, enemy.id, player.position);
   }
 }
 
@@ -1029,6 +1069,7 @@ function buildSavePayload(player) {
           maxSegmentReached: player.canyon.maxSegmentReached,
           clearedSegments: Array.from(player.canyon.clearedSegments),
         },
+        skinTextureUrl: player.skinTextureUrl || null,
       },
     },
     nickname: player.nickname,
@@ -1051,6 +1092,11 @@ function buildSavePayload(player) {
 function queuePlayerSave(player, payload) {
   player.saveQueue = player.saveQueue.then(() =>
     savePlayerProgress(player.userId, player.gameId, payload)
+      .then((result) => {
+        if (result?.unlockedAchievements?.length && player.ws.readyState === WebSocket.OPEN) {
+          safeSend(player.ws, { type: 'achievementsUnlocked', achievements: result.unlockedAchievements });
+        }
+      })
       .catch((err) => console.error(`[Save] Error for ${player.id}:`, err.message))
   );
   return player.saveQueue;
@@ -1111,6 +1157,70 @@ safeInterval(() => {
   });
 }, 20000);
 
+// Refreshes mute/ban status for already-connected players so admin actions
+// take effect without requiring a reconnect.
+safeInterval(async () => {
+  if (!CONFIG.internalSecret) return;
+
+  const authedPlayers = Array.from(players.values()).filter((p) => p.authenticated && p.userId);
+  if (authedPlayers.length === 0) return;
+
+  const result = await callInternalApi('/api/internal/game/mute-status', {
+    userIds: authedPlayers.map((p) => p.userId),
+  }).catch((err) => {
+    console.error('[Moderation] status refresh error:', err.message);
+    return null;
+  });
+
+  if (!result?.statuses) return;
+
+  const statusByUserId = new Map(result.statuses.map((s) => [s.id, s]));
+  authedPlayers.forEach((p) => {
+    const status = statusByUserId.get(p.userId);
+    if (!status) return;
+
+    p.mutedUntil = status.mutedUntil || null;
+
+    if (status.isBanned) {
+      safeSend(p.ws, { type: 'auth_error', error: 'banned' });
+      try { p.ws.close(4008, 'banned'); } catch (e) { }
+    }
+  });
+}, 8000);
+
+// Refreshes skin status for already-connected players so an admin "Reset Skin"
+// action takes effect live, without requiring a reconnect.
+safeInterval(async () => {
+  if (!CONFIG.internalSecret) return;
+
+  const authedPlayers = Array.from(players.values()).filter((p) => p.authenticated && p.userId);
+  if (authedPlayers.length === 0) return;
+
+  const result = await callInternalApi('/api/internal/game/skin-status', {
+    userIds: authedPlayers.map((p) => p.userId),
+  }).catch((err) => {
+    console.error('[Moderation] skin status refresh error:', err.message);
+    return null;
+  });
+
+  if (!result?.statuses) return;
+
+  const statusByUserId = new Map(result.statuses.map((s) => [s.id, s]));
+  authedPlayers.forEach((p) => {
+    if (Date.now() - (p.skinTextureUrlChangedAt || 0) < 5000) return;
+
+    const status = statusByUserId.get(p.userId);
+    if (!status) return;
+
+    const nextUrl = status.skinTextureUrl || null;
+    if (nextUrl === p.skinTextureUrl) return;
+
+    p.skinTextureUrl = nextUrl;
+    broadcast({ type: 'skinUpdate', playerId: p.id, url: p.skinTextureUrl }, null, true, p);
+    safeSend(p.ws, { type: 'skinUpdate', playerId: p.id, url: p.skinTextureUrl });
+  });
+}, 8000);
+
 wss.on('connection', (ws) => {
   if (players.size >= MAX_PLAYERS) {
     ws.close(1013, 'Server full');
@@ -1158,7 +1268,12 @@ wss.on('connection', (ws) => {
     recentShots: [],
     weaponEquipped: true,
     isShooting: false,
-    respawnToken: null,
+    mutedUntil: null,
+    isAdmin: false,
+    isFactionCreator: false,
+    skinTextureUrl: null,
+    skinTextureUrlChangedAt: 0,
+    blockedUserIds: new Set(),
     inventory: [],
     ash: 0,
     quests: {},
@@ -1261,6 +1376,8 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'locationChange', CONFIG.network.locationChangeRateLimit)) return;
       } else if (data.type === 'nicknameChange') {
         if (!checkRateLimit(playerId, 'nicknameChange', CONFIG.network.nicknameChangeRateLimit)) return;
+      } else if (data.type === 'skinUpdate') {
+        if (!checkRateLimit(playerId, 'skinUpdate', CONFIG.network.skinUpdateRateLimit)) return;
       } else if (data.type === 'saveProgress') {
         if (!checkRateLimit(playerId, 'saveProgress', CONFIG.network.saveProgressRateLimit)) return;
       } else if (data.type === 'questInteract' || data.type === 'questAccept' || data.type === 'questTurnIn') {
@@ -1284,12 +1401,39 @@ wss.on('connection', (ws) => {
         }
       } else if (data.type === 'mailInboxRequest' || data.type === 'mailMarkRead') {
         if (!checkRateLimit(playerId, 'mailRead', CONFIG.network.mailReadRateLimit)) return;
+      } else if (data.type === 'respawnRequest') {
+        if (!checkRateLimit(playerId, 'respawn', CONFIG.network.respawnRateLimit)) return;
+      } else if (data.type === 'tokenInfoRequest') {
+        if (!checkRateLimit(playerId, 'tokenLookup', CONFIG.network.tokenLookupRateLimit)) {
+          safeSend(ws, { type: 'error', message: 'Token lookup rate limit exceeded' });
+          return;
+        }
+      } else if (data.type === 'supportTicketSend') {
+        if (!checkRateLimit(playerId, 'support', CONFIG.network.supportRateLimit)) {
+          safeSend(ws, { type: 'error', message: 'Please wait before sending another support message' });
+          return;
+        }
+      } else if (data.type === 'blockUser' || data.type === 'unblockUser' || data.type === 'blockedListRequest') {
+        if (!checkRateLimit(playerId, 'block', CONFIG.network.blockRateLimit)) return;
+      } else if (data.type === 'privateMessage') {
+        if (!checkRateLimit(playerId, 'privateMessage', CONFIG.network.privateMessageRateLimit)) {
+          safeSend(ws, { type: 'error', message: 'Private message rate limit exceeded' });
+          return;
+        }
+      } else if (data.type === 'factionChat') {
+        if (!checkRateLimit(playerId, 'factionChat', CONFIG.network.factionChatRateLimit)) {
+          safeSend(ws, { type: 'error', message: 'Chat rate limit exceeded' });
+          return;
+        }
+      } else if (data.type === 'factionInvite') {
+        if (!checkRateLimit(playerId, 'factionInvite', CONFIG.network.factionInviteRateLimit)) return;
       }
 
       switch (data.type) {
         case 'playerUpdate': handlePlayerUpdate(player, data); break;
         case 'shoot': handleShoot(player, data); break;
         case 'nicknameChange': handleNicknameChange(player, data); break;
+        case 'skinUpdate': handleSkinUpdate(player, data); break;
         case 'chat': handleChat(player, data); break;
         case 'hit': handleHit(player, data); break;
         case 'enemyHit': handleEnemyHit(player, data); break;
@@ -1329,6 +1473,15 @@ wss.on('connection', (ws) => {
         case 'mailSend': handleMailSend(player, data); break;
         case 'mailInboxRequest': handleMailInboxRequest(player); break;
         case 'mailMarkRead': handleMailMarkRead(player, data); break;
+        case 'respawnRequest': handleRespawnRequest(player); break;
+        case 'tokenInfoRequest': handleTokenInfoRequest(player, data); break;
+        case 'supportTicketSend': handleSupportTicketSend(player, data); break;
+        case 'blockUser': handleBlockUser(player, data); break;
+        case 'unblockUser': handleUnblockUser(player, data); break;
+        case 'blockedListRequest': handleBlockedListRequest(player); break;
+        case 'privateMessage': handlePrivateMessage(player, data); break;
+        case 'factionChat': handleFactionChat(player, data); break;
+        case 'factionInvite': handleFactionInvite(player, data); break;
       }
     } catch (error) {
       console.error('[!] Message parse error:', error.message);
@@ -1340,10 +1493,16 @@ wss.on('connection', (ws) => {
 
     if (player.authenticated) {
       persistPlayer(player);
+      callInternalApi('/api/internal/game/presence', { userId: player.userId, online: false }).catch((err) => {
+        console.error('[Presence] offline update error:', err.message);
+      });
     }
 
     if (player.userId && userIdToPlayer.get(player.userId) === player) {
       userIdToPlayer.delete(player.userId);
+    }
+    if (player.wallet && walletToPlayer.get(player.wallet) === player) {
+      walletToPlayer.delete(player.wallet);
     }
 
     players.delete(playerId);
@@ -1380,6 +1539,12 @@ wss.on('connection', (ws) => {
     const existingOwner = userIdToPlayer.get(verifyResult.userId);
     if (existingOwner && existingOwner !== player) {
       console.log(`[~] Duplicate session for user ${verifyResult.userId}, closing old connection ${existingOwner.id}`);
+      if (existingOwner.authenticated) {
+        persistPlayer(existingOwner);
+        callInternalApi('/api/internal/game/presence', { userId: existingOwner.userId, online: false }).catch((err) => {
+          console.error('[Presence] offline update error:', err.message);
+        });
+      }
       existingOwner.authenticated = false;
       safeSend(existingOwner.ws, { type: 'auth_error', error: 'duplicate_session' });
       try { existingOwner.ws.close(4009, 'duplicate_session'); } catch (e) { }
@@ -1387,14 +1552,24 @@ wss.on('connection', (ws) => {
         players.delete(existingOwner.id);
         notifyAOILeave(existingOwner);
       }
+      if (existingOwner.wallet && walletToPlayer.get(existingOwner.wallet) === existingOwner) {
+        walletToPlayer.delete(existingOwner.wallet);
+      }
     }
     userIdToPlayer.set(verifyResult.userId, player);
+    walletToPlayer.set(verifyResult.wallet, player);
 
     player.userId = verifyResult.userId;
     player.wallet = verifyResult.wallet;
     player.gameId = verifyResult.gameId;
     player.gameSlug = verifyResult.gameSlug;
+    player.mutedUntil = verifyResult.mutedUntil || null;
+    player.isAdmin = !!verifyResult.isAdmin;
     player.authenticated = true;
+
+    callInternalApi('/api/internal/game/presence', { userId: player.userId, online: true }).catch((err) => {
+      console.error('[Presence] online update error:', err.message);
+    });
 
     clearTimeout(player.authTimeout);
 
@@ -1404,7 +1579,7 @@ wss.on('connection', (ws) => {
       if (savedProgress.nickname) {
         player.nickname = savedProgress.nickname;
       } else {
-        player.nickname = generateUniqueNickname(`Player_${player.wallet.slice(0, 4)}`);
+        player.nickname = await assignUniqueNickname(player, `Player_${player.wallet.slice(0, 4)}`);
       }
 
       if (savedProgress.progress) {
@@ -1427,6 +1602,10 @@ wss.on('connection', (ws) => {
       }
 
       player.ash = Math.max(0, Math.floor(Number(savedProgress.progress?.data?.ash) || 0));
+
+      player.skinTextureUrl = typeof savedProgress.progress?.data?.skinTextureUrl === 'string'
+        ? savedProgress.progress.data.skinTextureUrl.slice(0, 500)
+        : null;
 
       const savedQuests = savedProgress.progress?.data?.quests;
       if (savedQuests && typeof savedQuests === 'object') {
@@ -1468,7 +1647,7 @@ wss.on('connection', (ws) => {
           }));
       }
     } else {
-      player.nickname = generateUniqueNickname(`Player_${player.wallet.slice(0, 4)}`);
+      player.nickname = await assignUniqueNickname(player, `Player_${player.wallet.slice(0, 4)}`);
       spawnInSafeZone(player);
     }
 
@@ -1491,6 +1670,14 @@ wss.on('connection', (ws) => {
       await refreshPlayerFactions(player);
     }
 
+    const blocksResult = await callInternalApi('/api/internal/game/blocks/list', {
+      userId: player.userId, gameId: player.gameId,
+    }).catch((err) => {
+      console.error('[Blocks] list error:', err.message);
+      return null;
+    });
+    player.blockedUserIds = new Set((blocksResult?.blocked || []).map((b) => b.userId));
+
     player.justSpawned = true;
     players.set(playerId, player);
 
@@ -1500,22 +1687,7 @@ wss.on('connection', (ws) => {
     players.forEach((p, id) => {
       if (id !== playerId && p.authenticated) {
         if (isInAOI(player, p)) {
-          existingPlayers.push({
-            type: 'playerJoin',
-            id: p.id,
-            nickname: p.nickname,
-            factionSymbol: p.displayedFactionSymbol,
-            factionImage: p.displayedFactionImage,
-            position: p.position,
-            rotation: p.rotation,
-            pitch: p.pitch,
-            state: p.state || 'idle',
-            jumping: p.jumping || false,
-            velocityY: p.velocityY || 0,
-            health: p.health,
-            alive: p.alive,
-            locationId: p.locationId,
-          });
+          existingPlayers.push(buildPlayerJoinPayload(p));
           // Seed mutual AOI bookkeeping so recomputeAOI() has an accurate
           // baseline the next time either player moves.
           player.aoiNeighbors.add(id);
@@ -1534,6 +1706,7 @@ wss.on('connection', (ws) => {
       daySyncEpoch: dayNightEpoch,
       dayDurationMs: DAY_NIGHT_CONFIG.dayDurationMs,
       nightDurationMs: DAY_NIGHT_CONFIG.nightDurationMs,
+      skinTextureUrl: player.skinTextureUrl || null,
     });
 
     safeSend(ws, {
@@ -1578,22 +1751,7 @@ wss.on('connection', (ws) => {
       }
     }
 
-    broadcast({
-      type: 'playerJoin',
-      id: playerId,
-      nickname: player.nickname,
-      factionSymbol: player.displayedFactionSymbol,
-      factionImage: player.displayedFactionImage,
-      position: player.position,
-      rotation: player.rotation,
-      pitch: 0,
-      state: 'idle',
-      jumping: false,
-      velocityY: 0,
-      health: player.health,
-      alive: player.alive,
-      locationId: player.locationId,
-    }, playerId, true, player);
+    broadcast(buildPlayerJoinPayload(player), playerId, true, player);
 
     broadcastCount();
   }
@@ -1635,7 +1793,8 @@ wss.on('connection', (ws) => {
 
     player.jumping = !!data.jumping;
     player.velocityY = typeof data.velocityY === 'number' ? data.velocityY : 0;
-    player.weaponEquipped = data.weaponEquipped !== false;
+    const requestedWeaponEquipped = data.weaponEquipped !== false;
+    player.weaponEquipped = player.locationId === 'tower-main-hall' ? false : requestedWeaponEquipped;
     player.isShooting = !!data.isShooting;
     player.lastUpdate = now;
 
@@ -1722,16 +1881,32 @@ wss.on('connection', (ws) => {
     }, playerId, true, player);
   }
 
-  function handleNicknameChange(player, data) {
+  async function handleNicknameChange(player, data) {
     if (typeof data.nickname !== 'string') return;
     const newNick = data.nickname.trim().slice(0, 30);
     if (newNick.length === 0) return;
 
-    const existing = Array.from(players.values())
-      .filter(p => p.id !== playerId && p.authenticated)
-      .map(p => p.nickname);
+    if (newNick === player.nickname) {
+      safeSend(ws, { type: 'nicknameChanged', nickname: player.nickname });
+      return;
+    }
 
-    player.nickname = existing.includes(newNick) ? generateUniqueNickname(newNick) : newNick;
+    const result = await callInternalApi('/api/internal/game/nickname/set', {
+      userId: player.userId, gameId: player.gameId, nickname: newNick, allowSuffix: false,
+    }).catch((err) => {
+      console.error('[Nickname] change error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      safeSend(ws, {
+        type: 'error',
+        message: result?.error === 'nickname_taken' ? 'That nickname is already taken' : 'Could not change nickname',
+      });
+      return;
+    }
+
+    player.nickname = result.nickname;
 
     broadcast({
       type: 'nicknameChange',
@@ -1742,11 +1917,53 @@ wss.on('connection', (ws) => {
     safeSend(ws, { type: 'nicknameChanged', nickname: player.nickname });
   }
 
+  async function handleSkinUpdate(player, data) {
+    if (typeof data.url !== 'string' || data.url.length === 0 || data.url.length > 500) return;
+
+    let parsed;
+    try {
+      parsed = new URL(data.url);
+    } catch (e) {
+      return;
+    }
+
+    if (parsed.protocol !== 'https:' || !parsed.hostname.endsWith('.public.blob.vercel-storage.com')) {
+      safeSend(ws, { type: 'error', message: 'Invalid skin URL' });
+      return;
+    }
+
+    player.skinTextureUrl = data.url;
+    player.skinTextureUrlChangedAt = Date.now();
+    persistPlayer(player);
+
+    broadcast({
+      type: 'skinUpdate',
+      playerId: player.id,
+      url: player.skinTextureUrl,
+    }, playerId, true, player);
+
+    safeSend(ws, { type: 'skinUpdate', playerId: player.id, url: player.skinTextureUrl });
+  }
+
+  function isMuted(player) {
+    return !!player.mutedUntil && new Date(player.mutedUntil).getTime() > Date.now();
+  }
+
   function handleChat(player, data) {
     if (typeof data.message !== 'string') return;
 
+    if (isMuted(player)) {
+      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
+      return;
+    }
+
     const msg = sanitizeMessage(data.message.trim().slice(0, 200));
     if (msg.length === 0) return;
+
+    if (containsLink(msg)) {
+      safeSend(player.ws, { type: 'error', message: 'Links are not allowed in chat' });
+      return;
+    }
 
     broadcast({
       type: 'chat',
@@ -1755,12 +1972,52 @@ wss.on('connection', (ws) => {
       senderWallet: player.wallet,
       senderFactionSymbol: player.displayedFactionSymbol,
       senderFactionImage: player.displayedFactionImage,
+      senderIsAdmin: !!player.isAdmin,
+      senderIsFactionCreator: !!player.isFactionCreator,
       message: msg,
       timestamp: Date.now(),
-    }, null, false);
+    }, null, false, player, true);
+  }
+
+  function handleFactionChat(player, data) {
+    if (typeof data.message !== 'string') return;
+    if (typeof data.factionId !== 'string' || !data.factionId) return;
+
+    if (isMuted(player)) {
+      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
+      return;
+    }
+
+    if (!player.factions?.some((f) => f.id === data.factionId)) {
+      safeSend(player.ws, { type: 'error', message: 'You are not a member of that faction' });
+      return;
+    }
+
+    const msg = sanitizeMessage(data.message.trim().slice(0, 200));
+    if (msg.length === 0) return;
+
+    if (containsLink(msg)) {
+      safeSend(player.ws, { type: 'error', message: 'Links are not allowed in chat' });
+      return;
+    }
+
+    broadcastToFaction(data.factionId, {
+      type: 'factionChat',
+      id: generateId(),
+      factionId: data.factionId,
+      sender: player.nickname,
+      senderWallet: player.wallet,
+      senderFactionSymbol: player.displayedFactionSymbol,
+      senderFactionImage: player.displayedFactionImage,
+      senderIsAdmin: !!player.isAdmin,
+      senderIsFactionCreator: !!player.isFactionCreator,
+      message: msg,
+      timestamp: Date.now(),
+    }, null, player.userId);
   }
 
   function handleVoiceClip(player, data) {
+    if (isMuted(player)) return;
     if (typeof data.chunk !== 'string' || typeof data.mimeType !== 'string') return;
     if (data.chunk.length === 0 || data.chunk.length > 20000) return;
     if (!/^audio\//.test(data.mimeType)) return;
@@ -1834,7 +2091,7 @@ wss.on('connection', (ws) => {
     if (target.health <= 0) {
       player.stats.kills++;
       bumpFactionTaskProgress(player, 'kills', 1).catch((err) => console.error('[FactionTask] bump error:', err.message));
-      killPlayerAndRespawn(target, playerId, historicalPos);
+      markPlayerDead(target, playerId, historicalPos);
     }
   }
 
@@ -2059,6 +2316,33 @@ wss.on('connection', (ws) => {
     safeSend(player.ws, { type: 'factionJoined', faction: result.faction });
   }
 
+  async function handleFactionInvite(player, data) {
+    if (typeof data.factionId !== 'string' || !data.factionId) return;
+    if (typeof data.toWallet !== 'string' || !data.toWallet.trim()) return;
+
+    if (!player.factions?.some((f) => f.id === data.factionId)) {
+      safeSend(player.ws, { type: 'error', message: 'You are not a member of that faction' });
+      return;
+    }
+
+    const result = await callInternalApi('/api/internal/game/faction/invite-mail', {
+      inviterUserId: player.userId,
+      gameId: player.gameId,
+      factionId: data.factionId,
+      toWallet: data.toWallet.trim(),
+    }).catch((err) => {
+      console.error('[Faction] invite error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not send faction invite' });
+      return;
+    }
+
+    safeSend(player.ws, { type: 'factionInviteSent', toWallet: data.toWallet.trim() });
+  }
+
   async function handleFactionLeave(player, data) {
     if (typeof data.factionId !== 'string' || !data.factionId) return;
 
@@ -2192,6 +2476,7 @@ wss.on('connection', (ws) => {
     player.displayedFactionName = displayed?.name || null;
     player.displayedFactionSymbol = displayed?.symbol || null;
     player.displayedFactionImage = displayed?.image || null;
+    player.isFactionCreator = player.factions.some((f) => f.verifiedCreatorWallet === player.wallet);
   }
 
   async function refreshPlayerFactions(player) {
@@ -2204,21 +2489,28 @@ wss.on('connection', (ws) => {
     applyPlayerFactions(player, result?.factions);
   }
 
-  function broadcastToFaction(factionId, message, excludePlayerId) {
+  function broadcastToFaction(factionId, message, excludePlayerId, senderUserId = null) {
     players.forEach((p) => {
       if (p.authenticated && p.id !== excludePlayerId && p.factions?.some((f) => f.id === factionId)) {
+        if (senderUserId && p.blockedUserIds?.has(senderUserId)) return;
         safeSend(p.ws, message);
       }
     });
   }
 
   async function hydrateFactionTaskState(factionId, gameId) {
+    const myGen = nextFactionTaskGeneration(factionId);
+
     const result = await callInternalApi('/api/internal/game/faction/get-by-id', {
       gameId, factionId,
     }).catch((err) => {
       console.error('[FactionTask] hydrate error:', err.message);
       return null;
     });
+
+    if (factionTaskGeneration.get(factionId) !== myGen) {
+      return factionTaskState.get(factionId) || null;
+    }
 
     const faction = result?.faction;
     if (!faction || !faction.activeTask) {
@@ -2233,16 +2525,21 @@ wss.on('connection', (ws) => {
       target: faction.activeTask.target,
       progress: faction.activeTask.progress,
       dirty: false,
+      contributions: new Map(),
     };
     factionTaskState.set(factionId, state);
     return state;
   }
 
-  async function completeFactionTask(factionId, taskKey, gameId) {
+  async function completeFactionTask(factionId, taskKey, gameId, contributions) {
     factionTaskState.delete(factionId);
 
+    const contributionsPayload = contributions
+      ? Array.from(contributions.entries()).map(([userId, amount]) => ({ userId, amount }))
+      : [];
+
     const result = await callInternalApi('/api/internal/game/faction/complete-task', {
-      factionId, taskKey,
+      factionId, taskKey, contributions: contributionsPayload,
     }).catch((err) => {
       console.error('[FactionTask] complete error:', err.message);
       return null;
@@ -2290,21 +2587,27 @@ wss.on('connection', (ws) => {
     return inflight;
   }
 
-  async function bumpSingleFactionTask(factionId, gameId, metric, amount) {
+  async function bumpSingleFactionTask(factionId, gameId, metric, amount, userId) {
     const state = await getOrHydrateFactionTaskState(factionId, gameId);
     if (!state || !state.taskKey || state.metric !== metric) return;
+    if (factionTaskState.get(factionId) !== state) return;
 
     state.progress += amount;
     state.dirty = true;
 
+    if (userId) {
+      if (!state.contributions) state.contributions = new Map();
+      state.contributions.set(userId, (state.contributions.get(userId) || 0) + amount);
+    }
+
     if (state.progress >= state.target) {
-      await completeFactionTask(factionId, state.taskKey, gameId);
+      await completeFactionTask(factionId, state.taskKey, gameId, state.contributions);
     }
   }
 
   async function bumpFactionTaskProgress(player, metric, amount) {
     if (!player.factions?.length || amount <= 0) return;
-    await Promise.all(player.factions.map((f) => bumpSingleFactionTask(f.id, player.gameId, metric, amount)));
+    await Promise.all(player.factions.map((f) => bumpSingleFactionTask(f.id, player.gameId, metric, amount, player.userId)));
   }
 
   function handleFactionTaskListRequest(player) {
@@ -2319,6 +2622,8 @@ wss.on('connection', (ws) => {
       safeSend(player.ws, { type: 'error', message: 'Unknown task' });
       return;
     }
+
+    const myGen = nextFactionTaskGeneration(data.factionId);
 
     const result = await callInternalApi('/api/internal/game/faction/accept-task', {
       userId: player.userId, gameId: player.gameId, factionId: data.factionId,
@@ -2338,9 +2643,11 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    factionTaskState.set(data.factionId, {
-      taskKey: def.key, metric: def.metric, target: def.target, progress: 0, dirty: false,
-    });
+    if (factionTaskGeneration.get(data.factionId) === myGen) {
+      factionTaskState.set(data.factionId, {
+        taskKey: def.key, metric: def.metric, target: def.target, progress: 0, dirty: false, contributions: new Map(),
+      });
+    }
 
     broadcastToFaction(data.factionId, { type: 'factionTaskAccepted', faction: result.faction }, null);
   }
@@ -2383,6 +2690,14 @@ wss.on('connection', (ws) => {
     const targetNickname = typeof data.nickname === 'string' && data.nickname.trim() ? data.nickname.trim() : null;
     if (!targetWallet && !targetNickname) return;
 
+    if (targetWallet) {
+      const targetPlayer = walletToPlayer.get(targetWallet);
+      if (targetPlayer && targetPlayer.authenticated && targetPlayer.blockedUserIds?.has(player.userId)) {
+        safeSend(player.ws, { type: 'error', message: 'This player is not accepting friend requests' });
+        return;
+      }
+    }
+
     const result = await callInternalApi('/api/internal/game/friends/request', {
       userId: player.userId, gameId: player.gameId, targetWallet, targetNickname,
     }).catch((err) => {
@@ -2406,6 +2721,56 @@ wss.on('connection', (ws) => {
         });
       }
     }
+  }
+
+  async function handleBlockUser(player, data) {
+    const targetWallet = typeof data.wallet === 'string' && data.wallet.trim() ? data.wallet.trim() : null;
+    const targetNickname = typeof data.nickname === 'string' && data.nickname.trim() ? data.nickname.trim() : null;
+    if (!targetWallet && !targetNickname) return;
+
+    const result = await callInternalApi('/api/internal/game/blocks/add', {
+      blockerUserId: player.userId, gameId: player.gameId, targetWallet, targetNickname,
+    }).catch((err) => {
+      console.error('[Blocks] add error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not block player' });
+      return;
+    }
+
+    player.blockedUserIds.add(result.blockedUserId);
+
+    safeSend(player.ws, {
+      type: 'userBlocked',
+      userId: result.blockedUserId,
+      wallet: result.blockedWallet,
+      nickname: result.blockedNickname,
+    });
+  }
+
+  async function handleUnblockUser(player, data) {
+    if (typeof data.blockedUserId !== 'string' || !data.blockedUserId) return;
+
+    await callInternalApi('/api/internal/game/blocks/remove', {
+      blockerUserId: player.userId, blockedUserId: data.blockedUserId,
+    }).catch((err) => console.error('[Blocks] remove error:', err.message));
+
+    player.blockedUserIds.delete(data.blockedUserId);
+
+    safeSend(player.ws, { type: 'userUnblocked', blockedUserId: data.blockedUserId });
+  }
+
+  async function handleBlockedListRequest(player) {
+    const result = await callInternalApi('/api/internal/game/blocks/list', {
+      userId: player.userId, gameId: player.gameId,
+    }).catch((err) => {
+      console.error('[Blocks] list error:', err.message);
+      return null;
+    });
+
+    safeSend(player.ws, { type: 'blockedListResult', blocked: result?.blocked || [] });
   }
 
   async function handleFriendRequestAccept(player, data) {
@@ -2498,7 +2863,7 @@ wss.on('connection', (ws) => {
 
     const result = await callInternalApi('/api/internal/game/mail/send', {
       userId: player.userId, gameId: player.gameId, wallet: player.wallet,
-      recipientWallet, recipientNickname, subject: data.subject, body: data.body,
+      recipientWallet, recipientNickname, subject: data.subject.slice(0, 100), body: data.body.slice(0, 2000),
     }).catch((err) => {
       console.error('[Mail] send error:', err.message);
       return null;
@@ -2520,6 +2885,92 @@ wss.on('connection', (ws) => {
         subject: data.subject,
       });
     }
+  }
+
+  async function handlePrivateMessage(player, data) {
+    if (isMuted(player)) {
+      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
+      return;
+    }
+
+    const toWallet = typeof data.toWallet === 'string' && data.toWallet.trim() ? data.toWallet.trim() : null;
+    if (!toWallet) return;
+
+    const text = typeof data.text === 'string' ? sanitizeMessage(data.text.trim().slice(0, 500)) : '';
+    if (text.length === 0) return;
+
+    if (containsLink(text)) {
+      safeSend(player.ws, { type: 'error', message: 'Links are not allowed in chat' });
+      return;
+    }
+
+    const targetPlayer = walletToPlayer.get(toWallet);
+    if (!targetPlayer || !targetPlayer.authenticated) {
+      safeSend(player.ws, { type: 'privateMessageError', code: 'offline', toWallet });
+      return;
+    }
+
+    if (targetPlayer.blockedUserIds?.has(player.userId)) {
+      safeSend(player.ws, { type: 'privateMessageError', code: 'blocked', toWallet });
+      return;
+    }
+
+    const timestamp = Date.now();
+
+    safeSend(targetPlayer.ws, {
+      type: 'privateMessage',
+      fromWallet: player.wallet,
+      fromNickname: player.nickname,
+      text,
+      timestamp,
+    });
+
+    safeSend(player.ws, {
+      type: 'privateMessageSent',
+      toWallet,
+      toNickname: targetPlayer.nickname,
+      text,
+      timestamp,
+    });
+  }
+
+  async function handleTokenInfoRequest(player, data) {
+    const ca = typeof data.ca === 'string' && data.ca.trim() ? data.ca.trim() : null;
+    if (!ca) return;
+
+    const result = await callInternalApi('/api/internal/game/token-lookup-mail', {
+      userId: player.userId, ca,
+    }).catch((err) => {
+      console.error('[TokenLookup] error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not look up token' });
+      return;
+    }
+
+    safeSend(player.ws, { type: 'tokenInfoSent', mailId: result.mailId });
+  }
+
+  async function handleSupportTicketSend(player, data) {
+    const subject = typeof data.subject === 'string' ? data.subject.trim().slice(0, 100) : '';
+    const message = typeof data.message === 'string' ? data.message.trim().slice(0, 2000) : '';
+    if (subject.length === 0 || message.length === 0) return;
+
+    const result = await callInternalApi('/api/internal/game/support/send', {
+      userId: player.userId, gameId: player.gameId, wallet: player.wallet, subject, message,
+    }).catch((err) => {
+      console.error('[Support] send error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not send message to support' });
+      return;
+    }
+
+    safeSend(player.ws, { type: 'supportTicketSent', ticketId: result.ticketId });
   }
 
   async function handleMailInboxRequest(player) {
@@ -2786,6 +3237,12 @@ wss.on('connection', (ws) => {
     }
 
     player.locationId = data.locationId;
+
+    if (player.locationId === 'tower-main-hall' && player.weaponEquipped) {
+      player.weaponEquipped = false;
+      safeSend(ws, { type: 'weaponForceUnequip' });
+    }
+
     spawnInSafeZone(player);
     player.justTeleported = true;
     player.positionHistory = [];
@@ -2832,6 +3289,9 @@ wss.on('connection', (ws) => {
         weaponEquipped: player.weaponEquipped,
         isShooting: player.isShooting,
         locationId: data.locationId,
+        isAdmin: !!player.isAdmin,
+        isFactionCreator: !!player.isFactionCreator,
+        skinTextureUrl: player.skinTextureUrl || null,
       });
     });
 
@@ -2845,7 +3305,7 @@ wss.on('connection', (ws) => {
   }
 });
 
-function broadcast(data, excludeId = null, useAOI = false, senderPlayer = null) {
+function broadcast(data, excludeId = null, useAOI = false, senderPlayer = null, applyBlockFilter = false) {
   const message = getCachedMessage(data);
   players.forEach((p, id) => {
     if (id === excludeId) return;
@@ -2854,6 +3314,8 @@ function broadcast(data, excludeId = null, useAOI = false, senderPlayer = null) 
     if (useAOI && senderPlayer) {
       if (!isInAOI(senderPlayer, p)) return;
     }
+
+    if (applyBlockFilter && senderPlayer && senderPlayer.userId && p.blockedUserIds?.has(senderPlayer.userId)) return;
 
     try {
       p.ws.send(message);
