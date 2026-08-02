@@ -21,7 +21,7 @@ const CONFIG = {
     heartbeatInterval: 5000,
     heartbeatTimeout: 15000,
     staleTimeout: 60000,
-    maxMessageSize: 16 * 1024,
+    maxMessageSize: 32 * 1024,
     chatRateLimit: 3,
     updateRateLimit: 25,
     shootRateLimit: 10,
@@ -2142,7 +2142,7 @@ wss.on('connection', (ws) => {
   function handleVoiceClip(player, data) {
     if (isMuted(player)) return;
     if (typeof data.chunk !== 'string' || typeof data.mimeType !== 'string') return;
-    if (data.chunk.length === 0 || data.chunk.length > 20000) return;
+    if (data.chunk.length === 0 || data.chunk.length > 24000) return;
     if (!/^audio\//.test(data.mimeType)) return;
 
     // Proximity chat: only players sharing the same location hear it.
