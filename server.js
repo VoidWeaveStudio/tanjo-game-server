@@ -1158,7 +1158,6 @@ function queuePlayerSave(player, payload) {
 
 function persistPlayer(player) {
   if (!CONFIG.internalSecret) return;
-  player.economyChangedAt = Date.now();
   queuePlayerSave(player, buildSavePayload(player));
 }
 
@@ -1361,6 +1360,7 @@ wss.on('connection', (ws) => {
     blockedUserIds: new Set(),
     inventory: [],
     ash: 0,
+    economyChangedAt: 0,
     placeables: {},
     quests: {},
     factions: [],
@@ -3203,6 +3203,7 @@ wss.on('connection', (ws) => {
 
     player.quests[quest.id] = { status: 'completed', progress: quest.targetCount };
     player.ash += quest.rewardAsh;
+    player.economyChangedAt = Date.now();
     bumpFactionTaskProgress(player, 'ash', quest.rewardAsh).catch((err) => console.error('[FactionTask] bump error:', err.message));
     persistPlayer(player);
 
@@ -3317,6 +3318,7 @@ wss.on('connection', (ws) => {
     finalEntry.quantity -= finalQty;
     player.inventory = player.inventory.filter((e) => e.quantity > 0);
     player.ash += ashEarned;
+    player.economyChangedAt = Date.now();
     bumpFactionTaskProgress(player, 'ash', ashEarned).catch((err) => console.error('[FactionTask] bump error:', err.message));
 
     persistPlayer(player);
@@ -3356,6 +3358,7 @@ wss.on('connection', (ws) => {
 
     player.ash -= item.price * qty;
     player.placeables[item.id] = owned + qty;
+    player.economyChangedAt = Date.now();
     persistPlayer(player);
 
     safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
@@ -3401,6 +3404,7 @@ wss.on('connection', (ws) => {
     }
 
     player.stats.buildingsPlaced += 1;
+    player.economyChangedAt = Date.now();
     persistPlayer(player);
 
     const sign = {
@@ -3584,6 +3588,33 @@ wss.on('connection', (ws) => {
         isAdmin: !!player.isAdmin,
         isFactionCreator: !!player.isFactionCreator,
         skinTextureUrl: player.skinTextureUrl || null,
+      });
+      // Without this, only the players already in the destination get told
+      // about the arriving player (above) — the arriving player was never
+      // told about players already there, so their client keeps them as an
+      // invisible, non-interactable placeholder (created hidden back when
+      // the arriving player was still on the bootstrap location) until a
+      // full reconnect happens to re-sync it.
+      safeSend(player.ws, {
+        type: 'playerJoinLocation',
+        id: other.id,
+        nickname: other.nickname,
+        factionSymbol: other.displayedFactionSymbol,
+        factionImage: other.displayedFactionImage,
+        position: other.position,
+        rotation: other.rotation,
+        pitch: other.pitch,
+        state: other.state || 'idle',
+        jumping: other.jumping || false,
+        velocityY: other.velocityY || 0,
+        health: other.health,
+        alive: other.alive,
+        weaponEquipped: other.weaponEquipped,
+        isShooting: other.isShooting,
+        locationId: other.locationId,
+        isAdmin: !!other.isAdmin,
+        isFactionCreator: !!other.isFactionCreator,
+        skinTextureUrl: other.skinTextureUrl || null,
       });
     });
 
