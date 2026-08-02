@@ -540,6 +540,78 @@ function notifyAOILeave(player) {
   player.aoiNeighbors = new Set();
 }
 
+// Shared by handleLocationChange (client-initiated) and respawnPlayer
+// (server-initiated, on death respawn): tells everyone who had this player's
+// entity from the old location that they left, and discovers/announces
+// mutual neighbors in the new location — both to the neighbors (so they
+// build the arriving player) and back to the player (so their own client
+// isn't left with an invisible, non-interactable placeholder for anyone
+// already there).
+function notifyLocationTransition(player, oldLocationId, newLocationId) {
+  const oldNeighbors = player.aoiNeighbors;
+  player.aoiNeighbors = new Set();
+  for (const id of oldNeighbors) {
+    const other = players.get(id);
+    if (!other) continue;
+    other.aoiNeighbors.delete(player.id);
+    safeSend(other.ws, {
+      type: 'playerLeaveLocation',
+      playerId: player.id,
+      fromLocation: oldLocationId,
+      toLocation: newLocationId,
+    });
+  }
+
+  players.forEach((other, id) => {
+    if (id === player.id || !other.authenticated) return;
+    if (!isInAOI(player, other)) return;
+    player.aoiNeighbors.add(id);
+    other.aoiNeighbors.add(player.id);
+    safeSend(other.ws, {
+      type: 'playerJoinLocation',
+      id: player.id,
+      nickname: player.nickname,
+      factionSymbol: player.displayedFactionSymbol,
+      factionImage: player.displayedFactionImage,
+      position: player.position,
+      rotation: player.rotation,
+      pitch: player.pitch,
+      state: player.state || 'idle',
+      jumping: player.jumping || false,
+      velocityY: player.velocityY || 0,
+      health: player.health,
+      alive: player.alive,
+      weaponEquipped: player.weaponEquipped,
+      isShooting: player.isShooting,
+      locationId: newLocationId,
+      isAdmin: !!player.isAdmin,
+      isFactionCreator: !!player.isFactionCreator,
+      skinTextureUrl: player.skinTextureUrl || null,
+    });
+    safeSend(player.ws, {
+      type: 'playerJoinLocation',
+      id: other.id,
+      nickname: other.nickname,
+      factionSymbol: other.displayedFactionSymbol,
+      factionImage: other.displayedFactionImage,
+      position: other.position,
+      rotation: other.rotation,
+      pitch: other.pitch,
+      state: other.state || 'idle',
+      jumping: other.jumping || false,
+      velocityY: other.velocityY || 0,
+      health: other.health,
+      alive: other.alive,
+      weaponEquipped: other.weaponEquipped,
+      isShooting: other.isShooting,
+      locationId: other.locationId,
+      isAdmin: !!other.isAdmin,
+      isFactionCreator: !!other.isFactionCreator,
+      skinTextureUrl: other.skinTextureUrl || null,
+    });
+  });
+}
+
 function spawnInSafeZone(player) {
   const angle = Math.random() * Math.PI * 2;
   const r = 10 + Math.random() * 15;
@@ -729,12 +801,22 @@ function respawnPlayer(target) {
   if (target.locationId === 'tower-first-floor' && target.canyon) {
     enterCanyonHub(target);
   } else {
+    const oldLocation = target.locationId;
+    target.locationId = 'tower-main-hall';
+    target.weaponEquipped = false;
     spawnInSafeZone(target);
+    target.positionHistory = [];
+    target.recentShots = [];
+    safeSend(target.ws, { type: 'weaponForceUnequip' });
+    if (oldLocation !== target.locationId) {
+      notifyLocationTransition(target, oldLocation, target.locationId);
+    }
   }
   target.justTeleported = true;
 
   safeSend(target.ws, {
     type: 'respawn',
+    locationId: target.locationId,
     position: target.position,
     health: target.health,
   });
@@ -1305,6 +1387,41 @@ safeInterval(async () => {
   });
 }, 8000);
 
+// Revokes game access granted via a faction promo code the moment the player
+// leaves the granting faction or loses its token — live kick, mid-session,
+// same shape as the mute-status/skin-status/economy-status polls above.
+// Normal (non-promo) licenses are never touched by this.
+safeInterval(async () => {
+  if (!CONFIG.internalSecret) return;
+
+  const authedPlayers = Array.from(players.values()).filter((p) => p.authenticated && p.userId && p.gameId);
+  if (authedPlayers.length === 0) return;
+
+  const byGameId = new Map();
+  authedPlayers.forEach((p) => {
+    if (!byGameId.has(p.gameId)) byGameId.set(p.gameId, []);
+    byGameId.get(p.gameId).push(p);
+  });
+
+  for (const [gameId, playersForGame] of byGameId) {
+    const result = await callInternalApi('/api/internal/game/license-status', {
+      gameId, userIds: playersForGame.map((p) => p.userId),
+    }).catch((err) => {
+      console.error('[License] status refresh error:', err.message);
+      return null;
+    });
+
+    if (!result?.revoked?.length) continue;
+
+    const revokedSet = new Set(result.revoked);
+    playersForGame.forEach((p) => {
+      if (!revokedSet.has(p.userId)) return;
+      safeSend(p.ws, { type: 'auth_error', error: 'license_revoked' });
+      try { p.ws.close(4010, 'license_revoked'); } catch (e) { }
+    });
+  }
+}, 8000);
+
 wss.on('connection', (ws) => {
   if (players.size >= MAX_PLAYERS) {
     ws.close(1013, 'Server full');
@@ -1663,7 +1780,6 @@ wss.on('connection', (ws) => {
     player.gameSlug = verifyResult.gameSlug;
     player.mutedUntil = verifyResult.mutedUntil || null;
     player.isAdmin = !!verifyResult.isAdmin;
-    player.authenticated = true;
 
     callInternalApi('/api/internal/game/presence', { userId: player.userId, online: true }).catch((err) => {
       console.error('[Presence] online update error:', err.message);
@@ -1785,6 +1901,14 @@ wss.on('connection', (ws) => {
     player.blockedUserIds = new Set((blocksResult?.blocked || []).map((b) => b.userId));
 
     player.justSpawned = true;
+    // Only now — once nickname, location, faction display info etc. are all
+    // populated — is this player object safe for other connections to read.
+    // Setting this any earlier let a concurrently-connecting/moving player's
+    // AOI scan pick this player up mid-init (nickname still null, faction
+    // still unset) and bake that permanently into their client's rendering,
+    // since a joined player's nickname/faction snapshot is only captured
+    // once and never refreshed after.
+    player.authenticated = true;
     players.set(playerId, player);
 
     console.log(`[+] Authenticated: ${playerId} (${player.userId}, ${player.nickname}, loc:${player.locationId}). Total: ${players.size}`);
@@ -2561,7 +2685,7 @@ wss.on('connection', (ws) => {
     if (typeof data.factionId !== 'string' || !data.factionId) return;
 
     const result = await callInternalApi('/api/internal/game/faction/get-by-id', {
-      gameId: player.gameId, factionId: data.factionId,
+      gameId: player.gameId, factionId: data.factionId, viewerUserId: player.userId,
     }).catch((err) => {
       console.error('[Faction] info error:', err.message);
       return null;
@@ -3560,79 +3684,7 @@ wss.on('connection', (ws) => {
     player.positionHistory = [];
     player.recentShots = [];
 
-    // Tell (and stop tracking) everyone who had this player's entity from
-    // the old location — using the maintained neighbor set here (rather than
-    // re-deriving via isInAOI against a synthetic old-location player) keeps
-    // this in sync with recomputeAOI()'s bookkeeping so no duplicate/missing
-    // join events happen later as this player moves in the new location.
-    const oldNeighbors = player.aoiNeighbors;
-    player.aoiNeighbors = new Set();
-    for (const id of oldNeighbors) {
-      const other = players.get(id);
-      if (!other) continue;
-      other.aoiNeighbors.delete(playerId);
-      safeSend(other.ws, {
-        type: 'playerLeaveLocation',
-        playerId: player.id,
-        fromLocation: oldLocation,
-        toLocation: data.locationId,
-      });
-    }
-
-    players.forEach((other, id) => {
-      if (id === playerId || !other.authenticated) return;
-      if (!isInAOI(player, other)) return;
-      player.aoiNeighbors.add(id);
-      other.aoiNeighbors.add(playerId);
-      safeSend(other.ws, {
-        type: 'playerJoinLocation',
-        id: player.id,
-        nickname: player.nickname,
-        factionSymbol: player.displayedFactionSymbol,
-        factionImage: player.displayedFactionImage,
-        position: player.position,
-        rotation: player.rotation,
-        pitch: player.pitch,
-        state: player.state || 'idle',
-        jumping: player.jumping || false,
-        velocityY: player.velocityY || 0,
-        health: player.health,
-        alive: player.alive,
-        weaponEquipped: player.weaponEquipped,
-        isShooting: player.isShooting,
-        locationId: data.locationId,
-        isAdmin: !!player.isAdmin,
-        isFactionCreator: !!player.isFactionCreator,
-        skinTextureUrl: player.skinTextureUrl || null,
-      });
-      // Without this, only the players already in the destination get told
-      // about the arriving player (above) — the arriving player was never
-      // told about players already there, so their client keeps them as an
-      // invisible, non-interactable placeholder (created hidden back when
-      // the arriving player was still on the bootstrap location) until a
-      // full reconnect happens to re-sync it.
-      safeSend(player.ws, {
-        type: 'playerJoinLocation',
-        id: other.id,
-        nickname: other.nickname,
-        factionSymbol: other.displayedFactionSymbol,
-        factionImage: other.displayedFactionImage,
-        position: other.position,
-        rotation: other.rotation,
-        pitch: other.pitch,
-        state: other.state || 'idle',
-        jumping: other.jumping || false,
-        velocityY: other.velocityY || 0,
-        health: other.health,
-        alive: other.alive,
-        weaponEquipped: other.weaponEquipped,
-        isShooting: other.isShooting,
-        locationId: other.locationId,
-        isAdmin: !!other.isAdmin,
-        isFactionCreator: !!other.isFactionCreator,
-        skinTextureUrl: other.skinTextureUrl || null,
-      });
-    });
+    notifyLocationTransition(player, oldLocation, data.locationId);
 
     if (data.locationId === 'main-world') {
       safeSend(ws, { type: 'lootState', loot: serializeLoot() });
