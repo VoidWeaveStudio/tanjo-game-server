@@ -27,6 +27,7 @@ const CONFIG = {
     shootRateLimit: 10,
     hitRateLimit: 15,
     sellRateLimit: 20,
+    buildRateLimit: 10,
     voiceRateLimit: 4,
     locationChangeRateLimit: 10,
     nicknameChangeRateLimit: 3,
@@ -835,6 +836,12 @@ function canyonTick() {
 
 safeInterval(canyonTick, CANYON_CONFIG.tickRate);
 
+const SHOP_ITEMS = {
+  'sign-on-a-stick': { id: 'sign-on-a-stick', name: 'Sign on a Stick', price: 100, maxOwned: 10 },
+};
+
+const SIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
+
 const LOOT_CONFIG = {
   pollIntervalMs: 10000,
   minDrop: 1,
@@ -874,6 +881,52 @@ function serializeLoot() {
       tokens: l.tokens,
     }));
 }
+
+const worldSigns = new Map();
+let signsLoadPromise = null;
+
+function serializeSigns() {
+  return Array.from(worldSigns.values());
+}
+
+async function ensureSignsLoaded(gameId) {
+  if (signsLoadPromise) return signsLoadPromise;
+
+  signsLoadPromise = (async () => {
+    const result = await callInternalApi('/api/internal/game/signs/list', { gameId }).catch((err) => {
+      console.error('[Signs] load error:', err.message);
+      return null;
+    });
+    for (const sign of result?.signs || []) {
+      sign.createdAtMs = new Date(sign.createdAt).getTime();
+      worldSigns.set(sign.id, sign);
+    }
+  })();
+
+  return signsLoadPromise;
+}
+
+async function deleteSign(sign) {
+  const result = await callInternalApi('/api/internal/game/signs/delete', {
+    signId: sign.id, userId: sign.ownerId,
+  }).catch((err) => {
+    console.error('[Signs] delete error:', err.message);
+    return null;
+  });
+  if (!result || !result.success) return false;
+  worldSigns.delete(sign.id);
+  broadcastToLocation('main-world', { type: 'signDespawn', id: sign.id });
+  return true;
+}
+
+safeInterval(() => {
+  const now = Date.now();
+  for (const sign of Array.from(worldSigns.values())) {
+    if (now - sign.createdAtMs > SIGN_LIFETIME_MS) {
+      deleteSign(sign);
+    }
+  }
+}, 60000);
 
 function addTokensToInventory(player, tokens) {
   for (const t of tokens) {
@@ -1064,6 +1117,7 @@ function buildSavePayload(player) {
       health: player.health,
       data: {
         ash: player.ash,
+        placeables: player.placeables,
         quests: player.quests,
         canyonProgress: {
           maxSegmentReached: player.canyon.maxSegmentReached,
@@ -1104,6 +1158,7 @@ function queuePlayerSave(player, payload) {
 
 function persistPlayer(player) {
   if (!CONFIG.internalSecret) return;
+  player.economyChangedAt = Date.now();
   queuePlayerSave(player, buildSavePayload(player));
 }
 
@@ -1221,6 +1276,36 @@ safeInterval(async () => {
   });
 }, 8000);
 
+safeInterval(async () => {
+  if (!CONFIG.internalSecret) return;
+
+  const authedPlayers = Array.from(players.values()).filter((p) => p.authenticated && p.userId);
+  if (authedPlayers.length === 0) return;
+
+  const result = await callInternalApi('/api/internal/game/economy-status', {
+    userIds: authedPlayers.map((p) => p.userId),
+  }).catch((err) => {
+    console.error('[Moderation] economy status refresh error:', err.message);
+    return null;
+  });
+
+  if (!result?.statuses) return;
+
+  const statusByUserId = new Map(result.statuses.map((s) => [s.id, s]));
+  authedPlayers.forEach((p) => {
+    if (Date.now() - (p.economyChangedAt || 0) < 5000) return;
+
+    const status = statusByUserId.get(p.userId);
+    if (!status) return;
+
+    if (status.ash === p.ash && JSON.stringify(status.placeables) === JSON.stringify(p.placeables)) return;
+
+    p.ash = status.ash;
+    p.placeables = status.placeables;
+    safeSend(p.ws, { type: 'inventoryUpdate', inventory: p.inventory, ash: p.ash, placeables: p.placeables });
+  });
+}, 8000);
+
 wss.on('connection', (ws) => {
   if (players.size >= MAX_PLAYERS) {
     ws.close(1013, 'Server full');
@@ -1276,6 +1361,7 @@ wss.on('connection', (ws) => {
     blockedUserIds: new Set(),
     inventory: [],
     ash: 0,
+    placeables: {},
     quests: {},
     factions: [],
     displayedFactionId: null,
@@ -1370,6 +1456,11 @@ wss.on('connection', (ws) => {
           safeSend(ws, { type: 'error', message: 'Sell rate limit exceeded' });
           return;
         }
+      } else if (data.type === 'shopBuyItem' || data.type === 'signPlace' || data.type === 'signRemove' || data.type === 'signSetText' || data.type === 'signSetDrawingUrl') {
+        if (!checkRateLimit(playerId, 'build', CONFIG.network.buildRateLimit)) {
+          safeSend(ws, { type: 'error', message: 'Build rate limit exceeded' });
+          return;
+        }
       } else if (data.type === 'voiceClip') {
         if (!checkRateLimit(playerId, 'voice', CONFIG.network.voiceRateLimit)) return;
       } else if (data.type === 'locationChange') {
@@ -1439,6 +1530,11 @@ wss.on('connection', (ws) => {
         case 'enemyHit': handleEnemyHit(player, data); break;
         case 'lootPickup': handleLootPickup(player, data); break;
         case 'sellToken': handleSellToken(player, data); break;
+        case 'shopBuyItem': handleShopBuyItem(player, data); break;
+        case 'signPlace': handleSignPlace(player, data); break;
+        case 'signRemove': handleSignRemove(player, data); break;
+        case 'signSetText': handleSignSetText(player, data); break;
+        case 'signSetDrawingUrl': handleSignSetDrawingUrl(player, data); break;
         case 'voiceClip': handleVoiceClip(player, data); break;
         case 'saveProgress': handleSaveProgress(player); break;
         case 'locationChange': handleLocationChange(player, data); break;
@@ -1603,6 +1699,14 @@ wss.on('connection', (ws) => {
 
       player.ash = Math.max(0, Math.floor(Number(savedProgress.progress?.data?.ash) || 0));
 
+      const savedPlaceables = savedProgress.progress?.data?.placeables;
+      if (savedPlaceables && typeof savedPlaceables === 'object') {
+        for (const itemId of Object.keys(SHOP_ITEMS)) {
+          const qty = Math.max(0, Math.floor(Number(savedPlaceables[itemId]) || 0));
+          if (qty > 0) player.placeables[itemId] = qty;
+        }
+      }
+
       player.skinTextureUrl = typeof savedProgress.progress?.data?.skinTextureUrl === 'string'
         ? savedProgress.progress.data.skinTextureUrl.slice(0, 500)
         : null;
@@ -1719,13 +1823,15 @@ wss.on('connection', (ws) => {
 
     if (player.locationId === 'main-world') {
       safeSend(ws, { type: 'lootState', loot: serializeLoot() });
+      await ensureSignsLoaded(player.gameId);
+      safeSend(ws, { type: 'signState', signs: serializeSigns() });
     }
 
     if (player.locationId === 'tower-first-floor') {
       enterCanyonHub(player);
     }
 
-    safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
+    safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
 
     if (savedProgress) {
       safeSend(ws, {
@@ -1977,6 +2083,8 @@ wss.on('connection', (ws) => {
       message: msg,
       timestamp: Date.now(),
     }, null, false, player, true);
+
+    logChatMessage(player, msg, null);
   }
 
   function handleFactionChat(player, data) {
@@ -2014,6 +2122,21 @@ wss.on('connection', (ws) => {
       message: msg,
       timestamp: Date.now(),
     }, null, player.userId);
+
+    logChatMessage(player, msg, data.factionId);
+  }
+
+  function logChatMessage(player, message, factionId) {
+    callInternalApi('/api/internal/game/chat/log', {
+      gameId: player.gameId,
+      senderUserId: player.userId,
+      senderWallet: player.wallet,
+      senderNickname: player.nickname,
+      factionId,
+      message,
+    }).catch((err) => {
+      console.error('[Chat] log error:', err.message);
+    });
   }
 
   function handleVoiceClip(player, data) {
@@ -3091,7 +3214,7 @@ wss.on('connection', (ws) => {
       targetCount: quest.targetCount,
       rewardAsh: quest.rewardAsh,
     });
-    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
   }
 
   function handleLootPickup(player, data) {
@@ -3113,7 +3236,7 @@ wss.on('connection', (ws) => {
     addTokensToInventory(player, loot.tokens);
     persistPlayer(player);
 
-    safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
+    safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
 
     if (loot.ownerId) {
       safeSend(ws, { type: 'lootDespawn', id: data.id });
@@ -3198,7 +3321,7 @@ wss.on('connection', (ws) => {
 
     persistPlayer(player);
 
-    safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash });
+    safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
     safeSend(ws, {
       type: 'sellResult',
       address: job.address,
@@ -3208,11 +3331,180 @@ wss.on('connection', (ws) => {
     });
   }
 
+  function handleShopBuyItem(player, data) {
+    if (!player.alive) return;
+    const item = SHOP_ITEMS[data.itemId];
+    if (!item) {
+      safeSend(player.ws, { type: 'error', message: 'Unknown item' });
+      return;
+    }
+
+    const owned = player.placeables[item.id] || 0;
+    const capRemaining = item.maxOwned - owned;
+    if (capRemaining <= 0) {
+      safeSend(player.ws, { type: 'error', message: `You already own the maximum of ${item.maxOwned}` });
+      return;
+    }
+
+    const requestedQty = Number.isInteger(data.quantity) && data.quantity > 0 ? data.quantity : 1;
+    const affordableQty = Math.floor(player.ash / item.price);
+    const qty = Math.max(0, Math.min(requestedQty, capRemaining, affordableQty));
+    if (qty <= 0) {
+      safeSend(player.ws, { type: 'error', message: 'Not enough ash' });
+      return;
+    }
+
+    player.ash -= item.price * qty;
+    player.placeables[item.id] = owned + qty;
+    persistPlayer(player);
+
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+  }
+
+  async function handleSignPlace(player, data) {
+    if (!player.alive) return;
+    if (player.locationId !== 'main-world') {
+      safeSend(player.ws, { type: 'error', message: 'Signs can only be placed in the open world' });
+      return;
+    }
+    if (isMuted(player)) {
+      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
+      return;
+    }
+    if (!(player.placeables['sign-on-a-stick'] > 0)) {
+      safeSend(player.ws, { type: 'error', message: "You don't own any signs — buy one from the Shop" });
+      return;
+    }
+    if (Array.from(worldSigns.values()).some((s) => s.ownerId === player.userId)) {
+      safeSend(player.ws, { type: 'error', message: 'You can only have one sign placed at a time' });
+      return;
+    }
+    if (!isValidPositionForLocation(player.locationId, data.position)) {
+      safeSend(player.ws, { type: 'error', message: 'Invalid placement position' });
+      return;
+    }
+    const rotation = typeof data.rotation === 'number' && isFinite(data.rotation) ? data.rotation : 0;
+
+    player.placeables['sign-on-a-stick'] -= 1;
+
+    const result = await callInternalApi('/api/internal/game/signs/create', {
+      userId: player.userId, gameId: player.gameId, position: data.position, rotation,
+    }).catch((err) => {
+      console.error('[Signs] create error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      player.placeables['sign-on-a-stick'] += 1;
+      safeSend(player.ws, { type: 'error', message: 'Could not place sign right now' });
+      return;
+    }
+
+    player.stats.buildingsPlaced += 1;
+    persistPlayer(player);
+
+    const sign = {
+      id: result.id,
+      ownerId: player.userId,
+      ownerNickname: player.nickname,
+      position: data.position,
+      rotation,
+      contentType: null,
+      textContent: null,
+      drawingUrl: null,
+      createdAt: result.createdAt,
+      createdAtMs: Date.now(),
+    };
+    worldSigns.set(sign.id, sign);
+
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+    broadcastToLocation('main-world', { type: 'signSpawn', sign });
+  }
+
+  async function handleSignSetText(player, data) {
+    const sign = worldSigns.get(data.id);
+    if (!sign) return;
+    if (sign.ownerId !== player.userId || sign.contentType !== null) {
+      safeSend(player.ws, { type: 'error', message: 'You cannot edit this sign' });
+      return;
+    }
+    if (isMuted(player)) {
+      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
+      return;
+    }
+    if (typeof data.text !== 'string') return;
+
+    const text = sanitizeMessage(data.text.trim().slice(0, 150));
+    if (text.length === 0) return;
+    if (containsLink(text)) {
+      safeSend(player.ws, { type: 'error', message: 'Links are not allowed on signs' });
+      return;
+    }
+
+    const result = await callInternalApi('/api/internal/game/signs/set-content', {
+      signId: sign.id, userId: player.userId, contentType: 'text', textContent: text,
+    }).catch((err) => {
+      console.error('[Signs] set-content error:', err.message);
+      return null;
+    });
+    if (!result || !result.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not save sign right now' });
+      return;
+    }
+
+    sign.contentType = 'text';
+    sign.textContent = text;
+    broadcastToLocation('main-world', { type: 'signContentSet', id: sign.id, contentType: 'text', textContent: text });
+  }
+
+  async function handleSignSetDrawingUrl(player, data) {
+    const sign = worldSigns.get(data.id);
+    if (!sign) return;
+    if (sign.ownerId !== player.userId || sign.contentType !== null) {
+      safeSend(player.ws, { type: 'error', message: 'You cannot edit this sign' });
+      return;
+    }
+    if (typeof data.url !== 'string' || !data.url.startsWith('https://') || data.url.length > 512) {
+      safeSend(player.ws, { type: 'error', message: 'Invalid drawing' });
+      return;
+    }
+
+    const result = await callInternalApi('/api/internal/game/signs/set-content', {
+      signId: sign.id, userId: player.userId, contentType: 'draw', drawingUrl: data.url,
+    }).catch((err) => {
+      console.error('[Signs] set-content error:', err.message);
+      return null;
+    });
+    if (!result || !result.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not save sign right now' });
+      return;
+    }
+
+    sign.contentType = 'draw';
+    sign.drawingUrl = data.url;
+    broadcastToLocation('main-world', { type: 'signContentSet', id: sign.id, contentType: 'draw', drawingUrl: data.url });
+  }
+
+  async function handleSignRemove(player, data) {
+    const sign = worldSigns.get(data.id);
+    if (!sign) return;
+    if (sign.ownerId !== player.userId) {
+      safeSend(player.ws, { type: 'error', message: 'You can only remove your own sign' });
+      return;
+    }
+
+    const removed = await deleteSign(sign);
+    if (!removed) {
+      safeSend(player.ws, { type: 'error', message: 'Could not remove sign right now' });
+      return;
+    }
+  }
+
   function handleSaveProgress(player) {
     persistPlayer(player);
   }
 
-  function handleLocationChange(player, data) {
+  async function handleLocationChange(player, data) {
     if (!player.alive) return;
     if (typeof data.locationId !== 'string') return;
 
@@ -3297,6 +3589,8 @@ wss.on('connection', (ws) => {
 
     if (data.locationId === 'main-world') {
       safeSend(ws, { type: 'lootState', loot: serializeLoot() });
+      await ensureSignsLoaded(player.gameId);
+      safeSend(ws, { type: 'signState', signs: serializeSigns() });
     }
 
     if (data.locationId === 'tower-first-floor' && player.canyon) {
