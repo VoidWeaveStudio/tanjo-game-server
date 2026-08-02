@@ -28,7 +28,7 @@ const CONFIG = {
     hitRateLimit: 15,
     sellRateLimit: 20,
     buildRateLimit: 10,
-    voiceRateLimit: 4,
+    voiceRateLimit: 40,
     locationChangeRateLimit: 10,
     nicknameChangeRateLimit: 3,
     skinUpdateRateLimit: 3,
@@ -1461,7 +1461,7 @@ wss.on('connection', (ws) => {
           safeSend(ws, { type: 'error', message: 'Build rate limit exceeded' });
           return;
         }
-      } else if (data.type === 'voiceClip') {
+      } else if (data.type === 'voiceOffer' || data.type === 'voiceAnswer' || data.type === 'voiceIceCandidate') {
         if (!checkRateLimit(playerId, 'voice', CONFIG.network.voiceRateLimit)) return;
       } else if (data.type === 'locationChange') {
         if (!checkRateLimit(playerId, 'locationChange', CONFIG.network.locationChangeRateLimit)) return;
@@ -1535,7 +1535,9 @@ wss.on('connection', (ws) => {
         case 'signRemove': handleSignRemove(player, data); break;
         case 'signSetText': handleSignSetText(player, data); break;
         case 'signSetDrawingUrl': handleSignSetDrawingUrl(player, data); break;
-        case 'voiceClip': handleVoiceClip(player, data); break;
+        case 'voiceOffer': handleVoiceOffer(player, data); break;
+        case 'voiceAnswer': handleVoiceAnswer(player, data); break;
+        case 'voiceIceCandidate': handleVoiceIceCandidate(player, data); break;
         case 'saveProgress': handleSaveProgress(player); break;
         case 'locationChange': handleLocationChange(player, data); break;
         case 'questInteract': handleQuestInteract(player, data); break;
@@ -2139,20 +2141,34 @@ wss.on('connection', (ws) => {
     });
   }
 
-  function handleVoiceClip(player, data) {
+  // WebRTC signaling relay for proximity voice chat: the game server never
+  // touches audio, it just forwards SDP offers/answers and ICE candidates
+  // between two players' browsers so they can set up a direct peer
+  // connection. Only relayed between players currently sharing a location —
+  // mirrors the old voice-clip proximity rule and stops this being usable as
+  // a generic message channel to an arbitrary player id.
+  function relayVoiceSignal(player, targetId, payload) {
     if (isMuted(player)) return;
-    if (typeof data.chunk !== 'string' || typeof data.mimeType !== 'string') return;
-    if (data.chunk.length === 0 || data.chunk.length > 24000) return;
-    if (!/^audio\//.test(data.mimeType)) return;
+    if (typeof targetId !== 'string') return;
+    const target = players.get(targetId);
+    if (!target || !target.authenticated || target.ws.readyState !== WebSocket.OPEN) return;
+    if (target.locationId !== player.locationId) return;
+    safeSend(target.ws, payload);
+  }
 
-    // Proximity chat: only players sharing the same location hear it.
-    broadcastToLocation(player.locationId, {
-      type: 'voiceClip',
-      senderId: player.id,
-      senderNickname: player.nickname,
-      chunk: data.chunk,
-      mimeType: data.mimeType,
-    }, player.id);
+  function handleVoiceOffer(player, data) {
+    if (typeof data.sdp !== 'string') return;
+    relayVoiceSignal(player, data.targetId, { type: 'voiceOffer', fromId: player.id, sdp: data.sdp });
+  }
+
+  function handleVoiceAnswer(player, data) {
+    if (typeof data.sdp !== 'string') return;
+    relayVoiceSignal(player, data.targetId, { type: 'voiceAnswer', fromId: player.id, sdp: data.sdp });
+  }
+
+  function handleVoiceIceCandidate(player, data) {
+    if (!data.candidate || typeof data.candidate !== 'object') return;
+    relayVoiceSignal(player, data.targetId, { type: 'voiceIceCandidate', fromId: player.id, candidate: data.candidate });
   }
 
   function handleHit(player, data) {
