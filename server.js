@@ -85,10 +85,7 @@ const CANYON_COMBAT_DEPTH = 360;
 const CANYON_BOSS_ZONE_DEPTH = 40;
 const CANYON_SEGMENT_LENGTH = CANYON_SAFE_ENTRANCE_DEPTH + CANYON_COMBAT_DEPTH + CANYON_BOSS_ZONE_DEPTH;
 const CANYON_MAX_SEGMENT_CAP = 200;
-// Must stay clear of the hub crystal/dispatcher, which sit at (0, _, 40) —
-// matches the client's FirstFloor.getSpawnPoint() hub position (0, 2, 20) so a
-// player whose position is persisted while in the hub doesn't get restored
-// standing inside the crystal mesh on their next login.
+
 const CANYON_HUB_POSITION = [0, 0, 20];
 
 function canyonSegmentStartZ(segment) {
@@ -183,15 +180,9 @@ const userIdToPlayer = new Map();
 const walletToPlayer = new Map();
 const rateLimits = new Map();
 const factionTaskState = new Map();
-// In-flight hydrateFactionTaskState() promises, keyed by factionId — makes
-// concurrent bumpSingleFactionTask() calls on a cache miss share ONE hydrate
-// call and mutate the SAME resulting state object, instead of each racing its
-// own hydrate and one silently overwriting (dropping) the other's contribution.
+
 const factionTaskHydrating = new Map();
-// Bumped every time something is about to overwrite factionTaskState for a
-// faction after an await (hydrate or accept-task). Whichever async write
-// resolves against a stale generation number is discarded instead of
-// clobbering a newer write that landed while it was in flight.
+
 const factionTaskGeneration = new Map();
 
 function nextFactionTaskGeneration(factionId) {
@@ -208,14 +199,21 @@ const VALID_LOCATIONS = new Set([
   'tower-first-floor',
   'tower-token-gates',
   'tower-basement',
+  'tower-events',
   'open-world-canyon',
-  ...Array.from({ length: 39 }, (_, i) => `canyon-token-${String(i + 1).padStart(2, '0')}`),
 ]);
+
+const FACTION_GATE_LOCATION_PATTERN = /^faction-gate-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isKnownLocationId(locationId) {
+  return VALID_LOCATIONS.has(locationId) || FACTION_GATE_LOCATION_PATTERN.test(locationId);
+}
 
 const LOCATION_MAX_RADIUS = {
   'tower-main-hall': 140,
   'tower-token-gates': 70,
   'tower-basement': 70,
+  'tower-events': 40,
   cave: 180,
   'open-world-canyon': 150,
 };
@@ -224,8 +222,8 @@ const TELEPORT_SETTLE_TOLERANCE = 20;
 
 function getLocationMaxRadius(locationId) {
   if (LOCATION_MAX_RADIUS[locationId] != null) return LOCATION_MAX_RADIUS[locationId];
-  if (locationId.startsWith('canyon-token-')) return 150;
-  return null; 
+  if (locationId.startsWith('faction-gate-')) return 25;
+  return null;
 }
 
 function isValidPositionForLocation(locationId, pos) {
@@ -484,15 +482,7 @@ function buildPlayerJoinPayload(p) {
   };
 }
 
-// Re-evaluates which currently-connected players are within `player`'s AOI
-// and diffs that against player.aoiNeighbors (the set established the last
-// time this ran). isInAOI is re-checked from scratch on every playerUpdate
-// broadcast, but without this diff+notify step a player who simply walks
-// into/out of someone's zone (no reconnect, no location change) never gets
-// a playerJoin/playerLeave for them — the client then silently drops their
-// playerUpdate packets (no local entity to apply them to), which is why
-// two players could see each other only in one direction until one of them
-// reloaded and got a fresh AOI snapshot from the init message.
+
 function recomputeAOI(player) {
   const newNeighbors = new Set();
 
@@ -526,10 +516,7 @@ function recomputeAOI(player) {
   player.aoiNeighbors = newNeighbors;
 }
 
-// Used on disconnect / duplicate-session kick: notifies exactly the players
-// who currently have this player's entity (rather than re-deriving via
-// isInAOI, which needs a live position/location that a closing connection
-// may not reliably have) and cleans up the mutual bookkeeping.
+
 function notifyAOILeave(player) {
   for (const id of player.aoiNeighbors) {
     const other = players.get(id);
@@ -540,13 +527,7 @@ function notifyAOILeave(player) {
   player.aoiNeighbors = new Set();
 }
 
-// Shared by handleLocationChange (client-initiated) and respawnPlayer
-// (server-initiated, on death respawn): tells everyone who had this player's
-// entity from the old location that they left, and discovers/announces
-// mutual neighbors in the new location — both to the neighbors (so they
-// build the arriving player) and back to the player (so their own client
-// isn't left with an invisible, non-interactable placeholder for anyone
-// already there).
+
 function notifyLocationTransition(player, oldLocationId, newLocationId) {
   const oldNeighbors = player.aoiNeighbors;
   player.aoiNeighbors = new Set();
@@ -937,6 +918,21 @@ let tokenPool = [];
 const lootDrops = new Map();
 let nextLootId = 0;
 
+let factionGatesList = [];
+
+async function refreshFactionGates() {
+  const result = await callInternalApi('/api/internal/game/faction/gates-list', {}).catch((err) => {
+    console.error('[FactionGates] refresh error:', err.message);
+    return null;
+  });
+  if (result?.success && Array.isArray(result.gates)) {
+    factionGatesList = result.gates;
+  }
+}
+
+refreshFactionGates();
+safeInterval(refreshFactionGates, 15000);
+
 async function refreshTokenPool() {
   try {
     const url = new URL('/api/new-tokens', CONFIG.siteUrl).toString();
@@ -1278,11 +1274,7 @@ safeInterval(() => {
   });
 }, CONFIG.autoSaveInterval);
 
-// Flushes dirty faction-task progress to the DB. factionTaskState is shared
-// module-level state (not per-connection), so this must run once for the
-// whole process — it was previously (incorrectly) declared inside
-// wss.on('connection', ...), creating one leaked, never-cleared interval per
-// WebSocket connection ever made (including connections that never authenticate).
+
 safeInterval(() => {
   factionTaskState.forEach((state, factionId) => {
     if (!state.dirty || !state.taskKey) return;
@@ -1293,8 +1285,7 @@ safeInterval(() => {
   });
 }, 20000);
 
-// Refreshes mute/ban status for already-connected players so admin actions
-// take effect without requiring a reconnect.
+
 safeInterval(async () => {
   if (!CONFIG.internalSecret) return;
 
@@ -1324,8 +1315,7 @@ safeInterval(async () => {
   });
 }, 8000);
 
-// Refreshes skin status for already-connected players so an admin "Reset Skin"
-// action takes effect live, without requiring a reconnect.
+
 safeInterval(async () => {
   if (!CONFIG.internalSecret) return;
 
@@ -1387,10 +1377,7 @@ safeInterval(async () => {
   });
 }, 8000);
 
-// Revokes game access granted via a faction promo code the moment the player
-// leaves the granting faction or loses its token — live kick, mid-session,
-// same shape as the mute-status/skin-status/economy-status polls above.
-// Normal (non-promo) licenses are never touched by this.
+
 safeInterval(async () => {
   if (!CONFIG.internalSecret) return;
 
@@ -1800,7 +1787,7 @@ wss.on('connection', (ws) => {
         player.position = savedProgress.progress.position || [0, 0, 0];
         player.rotation = savedProgress.progress.rotation || 0;
         player.health = savedProgress.progress.health || 100;
-        player.locationId = VALID_LOCATIONS.has(savedProgress.progress.locationId)
+        player.locationId = isKnownLocationId(savedProgress.progress.locationId)
           ? savedProgress.progress.locationId
           : 'tower-main-hall';
       } else {
@@ -1886,9 +1873,7 @@ wss.on('connection', (ws) => {
         console.log(`[Faction] auto-kicked ${player.userId} from: ${verifyResult2.kicked.map((k) => k.factionName).join(', ')}`);
       }
     } else {
-      // The internal-API call itself failed (not an RPC/balance failure — that's
-      // already fail-open inside the route) — fall back to a plain unverified
-      // list so the player isn't stranded with no faction data this session.
+ 
       await refreshPlayerFactions(player);
     }
 
@@ -1901,13 +1886,7 @@ wss.on('connection', (ws) => {
     player.blockedUserIds = new Set((blocksResult?.blocked || []).map((b) => b.userId));
 
     player.justSpawned = true;
-    // Only now — once nickname, location, faction display info etc. are all
-    // populated — is this player object safe for other connections to read.
-    // Setting this any earlier let a concurrently-connecting/moving player's
-    // AOI scan pick this player up mid-init (nickname still null, faction
-    // still unset) and bake that permanently into their client's rendering,
-    // since a joined player's nickname/faction snapshot is only captured
-    // once and never refreshed after.
+ 
     player.authenticated = true;
     players.set(playerId, player);
 
@@ -1918,8 +1897,7 @@ wss.on('connection', (ws) => {
       if (id !== playerId && p.authenticated) {
         if (isInAOI(player, p)) {
           existingPlayers.push(buildPlayerJoinPayload(p));
-          // Seed mutual AOI bookkeeping so recomputeAOI() has an accurate
-          // baseline the next time either player moves.
+       
           player.aoiNeighbors.add(id);
           p.aoiNeighbors.add(playerId);
         }
@@ -1955,6 +1933,10 @@ wss.on('connection', (ws) => {
 
     if (player.locationId === 'tower-first-floor') {
       enterCanyonHub(player);
+    }
+
+    if (player.locationId === 'tower-token-gates') {
+      safeSend(ws, { type: 'factionGatesState', gates: factionGatesList });
     }
 
     safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
@@ -2265,12 +2247,7 @@ wss.on('connection', (ws) => {
     });
   }
 
-  // WebRTC signaling relay for proximity voice chat: the game server never
-  // touches audio, it just forwards SDP offers/answers and ICE candidates
-  // between two players' browsers so they can set up a direct peer
-  // connection. Only relayed between players currently sharing a location —
-  // mirrors the old voice-clip proximity rule and stops this being usable as
-  // a generic message channel to an arbitrary player id.
+
   function relayVoiceSignal(player, targetId, payload) {
     if (isMuted(player)) return;
     if (typeof targetId !== 'string') return;
@@ -2499,62 +2476,11 @@ wss.on('connection', (ws) => {
     }
   }
 
-  async function fetchTokenInfo(ca) {
-    const url = new URL('/api/token-by-ca', CONFIG.siteUrl);
-    url.searchParams.set('ca', ca);
-    const res = await fetch(url.toString());
-    if (!res.ok) return null;
-    const json = await res.json();
-    if (!json || !json.name) return null;
-    return {
-      name: String(json.name).slice(0, 50),
-      symbol: json.symbol ? String(json.symbol).slice(0, 20) : null,
-      image: json.image ? String(json.image).slice(0, 512) : null,
-    };
-  }
-
-  function buildFactionDescription(name, symbol) {
-    return symbol ? `Community faction for ${name} ($${symbol}).` : `Community faction for ${name}.`;
-  }
-
   async function handleFactionCreate(player, data) {
-    if (typeof data.ca !== 'string' || data.ca.trim().length === 0) {
-      safeSend(player.ws, { type: 'error', message: factionErrorMessage('token_not_found') });
-      return;
-    }
-    const ca = data.ca.trim().slice(0, 64);
-
-    const tokenInfo = await fetchTokenInfo(ca).catch((err) => {
-      console.error('[Faction] token lookup error:', err.message);
-      return null;
+    safeSend(player.ws, {
+      type: 'error',
+      message: 'Faction creation now happens through Alaric in-game and costs 1,000,000 TNJ. Please update your client.',
     });
-
-    if (!tokenInfo) {
-      safeSend(player.ws, { type: 'error', message: factionErrorMessage('token_not_found') });
-      return;
-    }
-
-    const result = await callInternalApi('/api/internal/game/faction/create', {
-      userId: player.userId,
-      gameId: player.gameId,
-      wallet: player.wallet,
-      name: tokenInfo.name,
-      symbol: tokenInfo.symbol,
-      image: tokenInfo.image,
-      description: buildFactionDescription(tokenInfo.name, tokenInfo.symbol),
-      tokenCa: ca,
-    }).catch((err) => {
-      console.error('[Faction] create error:', err.message);
-      return null;
-    });
-
-    if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: factionErrorMessage(result?.error) });
-      return;
-    }
-
-    await refreshPlayerFactions(player);
-    safeSend(player.ws, { type: 'factionCreated', faction: result.faction });
   }
 
   async function handleFactionJoin(player, data) {
@@ -3404,9 +3330,7 @@ wss.on('connection', (ws) => {
     const sellQty = Math.min(requestedQty, entry.quantity);
     if (sellQty <= 0) return;
 
-    // Selling multiple stacks confirms them all in one burst from the client
-    // (no per-item round trip), so queue and drain sequentially per player
-    // instead of rejecting whichever requests land while one is in flight.
+
     if (!player.sellQueue) player.sellQueue = [];
     if (player.sellQueue.length >= 32) {
       safeSend(ws, { type: 'error', message: 'Too many pending sells, slow down' });
@@ -3652,7 +3576,7 @@ wss.on('connection', (ws) => {
     if (!player.alive) return;
     if (typeof data.locationId !== 'string') return;
 
-    if (!VALID_LOCATIONS.has(data.locationId)) {
+    if (!isKnownLocationId(data.locationId)) {
       console.log(`[!] Invalid location: ${data.locationId} from ${player.id}`);
       return;
     }
@@ -3694,6 +3618,10 @@ wss.on('connection', (ws) => {
 
     if (data.locationId === 'tower-first-floor' && player.canyon) {
       enterCanyonHub(player);
+    }
+
+    if (data.locationId === 'tower-token-gates') {
+      safeSend(ws, { type: 'factionGatesState', gates: factionGatesList });
     }
   }
 });
