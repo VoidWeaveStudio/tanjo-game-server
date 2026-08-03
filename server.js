@@ -49,6 +49,7 @@ const CONFIG = {
     privateMessageRateLimit: 5,
     factionChatRateLimit: 3,
     factionInviteRateLimit: 5,
+    tradeRateLimit: 8,
   },
   combat: {
     maxShotRange: 200,
@@ -901,6 +902,7 @@ safeInterval(canyonTick, CANYON_CONFIG.tickRate);
 
 const SHOP_ITEMS = {
   'sign-on-a-stick': { id: 'sign-on-a-stick', name: 'Sign on a Stick', price: 100, maxOwned: 10 },
+  'sphere': { id: 'sphere', name: 'Sphere', price: 100, maxOwned: 50, tradeable: true },
 };
 
 const SIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
@@ -917,6 +919,57 @@ const LOOT_CONFIG = {
 let tokenPool = [];
 const lootDrops = new Map();
 let nextLootId = 0;
+
+
+const activeTrades = new Map();
+
+function buildTradeSnapshot(session) {
+  return {
+    tradeId: session.id,
+    phase: session.phase,
+    sellerId: session.sellerId,
+    itemId: session.itemId,
+    itemName: session.itemName,
+    priceTnj: session.priceTnj,
+    participants: Object.values(session.participants).map((p) => ({
+      userId: p.userId, wallet: p.wallet, nickname: p.nickname, ready: p.ready,
+    })),
+  };
+}
+
+function sendToTradeParticipants(session, message) {
+  for (const uid of Object.keys(session.participants)) {
+    const p = userIdToPlayer.get(uid);
+    if (p) safeSend(p.ws, message);
+  }
+}
+
+function broadcastTradeState(session) {
+  sendToTradeParticipants(session, { type: 'tradeSession', ...buildTradeSnapshot(session) });
+}
+
+function endTrade(session, phase, extra) {
+  session.phase = phase;
+  for (const uid of Object.keys(session.participants)) {
+    const p = userIdToPlayer.get(uid);
+    if (p && p.activeTradeId === session.id) p.activeTradeId = null;
+  }
+  activeTrades.delete(session.id);
+  sendToTradeParticipants(session, { type: 'tradeSession', ...buildTradeSnapshot(session), ...(extra || {}) });
+}
+
+safeInterval(() => {
+  const now = Date.now();
+  for (const session of Array.from(activeTrades.values())) {
+    if (session.phase === 'settling') continue;
+    const awaitingAge = session.awaitingPaymentSince ? now - session.awaitingPaymentSince : 0;
+    if (session.phase === 'awaiting_payment' && awaitingAge > 5 * 60 * 1000) {
+      endTrade(session, 'expired');
+    } else if (now - session.createdAt > 15 * 60 * 1000) {
+      endTrade(session, 'expired');
+    }
+  }
+}, 30000);
 
 let factionGatesList = [];
 
@@ -1466,6 +1519,7 @@ wss.on('connection', (ws) => {
     ash: 0,
     economyChangedAt: 0,
     placeables: {},
+    activeTradeId: null,
     quests: {},
     factions: [],
     displayedFactionId: null,
@@ -1622,6 +1676,11 @@ wss.on('connection', (ws) => {
         }
       } else if (data.type === 'factionInvite') {
         if (!checkRateLimit(playerId, 'factionInvite', CONFIG.network.factionInviteRateLimit)) return;
+      } else if (data.type === 'tradeInvite' || data.type === 'tradeInviteRespond' || data.type === 'tradeSetOffer' || data.type === 'tradeSetReady' || data.type === 'tradeSubmitPayment' || data.type === 'tradeCancel') {
+        if (!checkRateLimit(playerId, 'trade', CONFIG.network.tradeRateLimit)) {
+          safeSend(ws, { type: 'error', message: 'Trade action rate limit exceeded' });
+          return;
+        }
       }
 
       switch (data.type) {
@@ -1684,6 +1743,12 @@ wss.on('connection', (ws) => {
         case 'privateMessage': handlePrivateMessage(player, data); break;
         case 'factionChat': handleFactionChat(player, data); break;
         case 'factionInvite': handleFactionInvite(player, data); break;
+        case 'tradeInvite': handleTradeInvite(player, data); break;
+        case 'tradeInviteRespond': handleTradeInviteRespond(player, data); break;
+        case 'tradeSetOffer': handleTradeSetOffer(player, data); break;
+        case 'tradeSetReady': handleTradeSetReady(player, data); break;
+        case 'tradeSubmitPayment': handleTradeSubmitPayment(player, data); break;
+        case 'tradeCancel': handleTradeCancel(player, data); break;
       }
     } catch (error) {
       console.error('[!] Message parse error:', error.message);
@@ -1705,6 +1770,13 @@ wss.on('connection', (ws) => {
     }
     if (player.wallet && walletToPlayer.get(player.wallet) === player) {
       walletToPlayer.delete(player.wallet);
+    }
+
+    if (player.activeTradeId) {
+      const tradeSession = activeTrades.get(player.activeTradeId);
+     if (tradeSession && tradeSession.phase !== 'settling') {
+        endTrade(tradeSession, 'cancelled');
+      }
     }
 
     players.delete(playerId);
@@ -3121,6 +3193,237 @@ wss.on('connection', (ws) => {
       text,
       timestamp,
     });
+  }
+
+  function tradePaymentErrorMessage(code) {
+    switch (code) {
+      case 'transaction_not_found': return 'Payment not found on-chain yet — wait a few seconds and try again';
+      case 'transaction_failed': return 'The transaction failed on-chain';
+      case 'transfer_verification_failed': return 'Could not verify the payment amount or recipient';
+      case 'wrong_signer': return 'Payment must be sent from your registered wallet';
+      case 'signature_already_used': return 'This transaction was already used elsewhere';
+      default: return 'Payment verification failed — please try again';
+    }
+  }
+
+  function handleTradeInvite(player, data) {
+    const toWallet = typeof data.toWallet === 'string' && data.toWallet.trim() ? data.toWallet.trim() : null;
+    if (!toWallet) return;
+
+    if (toWallet === player.wallet) {
+      safeSend(player.ws, { type: 'tradeInviteError', code: 'self', toWallet });
+      return;
+    }
+    if (player.activeTradeId) {
+      safeSend(player.ws, { type: 'tradeInviteError', code: 'already_active', toWallet });
+      return;
+    }
+
+    const target = walletToPlayer.get(toWallet);
+    if (!target || !target.authenticated) {
+      safeSend(player.ws, { type: 'tradeInviteError', code: 'offline', toWallet });
+      return;
+    }
+    if (target.activeTradeId) {
+      safeSend(player.ws, { type: 'tradeInviteError', code: 'target_busy', toWallet });
+      return;
+    }
+    if (target.blockedUserIds?.has(player.userId) || player.blockedUserIds?.has(target.userId)) {
+      safeSend(player.ws, { type: 'tradeInviteError', code: 'blocked', toWallet });
+      return;
+    }
+
+    const tradeId = generateId();
+    const session = {
+      id: tradeId,
+      gameId: player.gameId,
+      phase: 'pending_accept',
+      inviterUserId: player.userId,
+      participants: {
+        [player.userId]: { userId: player.userId, wallet: player.wallet, nickname: player.nickname, ready: false },
+        [target.userId]: { userId: target.userId, wallet: target.wallet, nickname: target.nickname, ready: false },
+      },
+      sellerId: null,
+      itemId: null,
+      itemName: null,
+      priceTnj: null,
+      createdAt: Date.now(),
+      awaitingPaymentSince: null,
+    };
+    activeTrades.set(tradeId, session);
+    player.activeTradeId = tradeId;
+
+    safeSend(player.ws, { type: 'tradeSession', ...buildTradeSnapshot(session) });
+    safeSend(target.ws, { type: 'tradeInviteReceived', tradeId, fromWallet: player.wallet, fromNickname: player.nickname });
+  }
+
+  function handleTradeInviteRespond(player, data) {
+    const tradeId = typeof data.tradeId === 'string' ? data.tradeId : null;
+    const session = tradeId ? activeTrades.get(tradeId) : null;
+    if (!session || session.phase !== 'pending_accept') return;
+    if (!session.participants[player.userId] || player.userId === session.inviterUserId) return;
+
+    if (!data.accept) {
+      endTrade(session, 'declined');
+      return;
+    }
+
+    if (player.activeTradeId) {
+      endTrade(session, 'cancelled');
+      return;
+    }
+    const inviter = userIdToPlayer.get(session.inviterUserId);
+    if (!inviter || !inviter.authenticated || inviter.activeTradeId !== tradeId) {
+      endTrade(session, 'cancelled');
+      return;
+    }
+
+    session.phase = 'negotiating';
+    player.activeTradeId = tradeId;
+    broadcastTradeState(session);
+  }
+
+  function handleTradeSetOffer(player, data) {
+    const tradeId = typeof data.tradeId === 'string' ? data.tradeId : null;
+    const session = tradeId ? activeTrades.get(tradeId) : null;
+    if (!session || session.phase !== 'negotiating' || !session.participants[player.userId]) return;
+
+    const itemId = typeof data.itemId === 'string' && data.itemId ? data.itemId : null;
+
+    if (!itemId) {
+      if (session.sellerId && session.sellerId !== player.userId) return;
+      session.sellerId = null;
+      session.itemId = null;
+      session.itemName = null;
+      session.priceTnj = null;
+    } else {
+      if (session.sellerId && session.sellerId !== player.userId) {
+        safeSend(player.ws, { type: 'error', message: 'A seller is already set for this trade' });
+        return;
+      }
+      const item = SHOP_ITEMS[itemId];
+      if (!item || !item.tradeable) {
+        safeSend(player.ws, { type: 'error', message: 'This item cannot be traded' });
+        return;
+      }
+      if (!(player.placeables[itemId] > 0)) {
+        safeSend(player.ws, { type: 'error', message: "You don't own that item" });
+        return;
+      }
+      const priceTnj = Number.isInteger(data.priceTnj) ? data.priceTnj : null;
+      if (!priceTnj || priceTnj <= 0 || priceTnj > 1_000_000_000) {
+        safeSend(player.ws, { type: 'error', message: 'Invalid price' });
+        return;
+      }
+      session.sellerId = player.userId;
+      session.itemId = itemId;
+      session.itemName = item.name;
+      session.priceTnj = priceTnj;
+    }
+
+    for (const p of Object.values(session.participants)) p.ready = false;
+    broadcastTradeState(session);
+  }
+
+  function handleTradeSetReady(player, data) {
+    const tradeId = typeof data.tradeId === 'string' ? data.tradeId : null;
+    const session = tradeId ? activeTrades.get(tradeId) : null;
+    if (!session || session.phase !== 'negotiating' || !session.participants[player.userId]) return;
+
+    const ready = !!data.ready;
+    if (ready && (!session.sellerId || !session.itemId || !session.priceTnj)) {
+      safeSend(player.ws, { type: 'error', message: 'Set an item and price before readying up' });
+      return;
+    }
+
+    session.participants[player.userId].ready = ready;
+
+    const allReady = Object.values(session.participants).every((p) => p.ready);
+    if (allReady && session.sellerId) {
+      const seller = userIdToPlayer.get(session.sellerId);
+      if (!seller || !(seller.placeables[session.itemId] > 0)) {
+        for (const p of Object.values(session.participants)) p.ready = false;
+        sendToTradeParticipants(session, { type: 'error', message: 'Seller no longer has this item' });
+        broadcastTradeState(session);
+        return;
+      }
+      session.phase = 'awaiting_payment';
+      session.awaitingPaymentSince = Date.now();
+    }
+
+    broadcastTradeState(session);
+  }
+
+  function handleTradeCancel(player, data) {
+    const tradeId = typeof data.tradeId === 'string' ? data.tradeId : null;
+    const session = tradeId ? activeTrades.get(tradeId) : null;
+    if (!session || !session.participants[player.userId]) return;
+    if (session.phase === 'settling') return;
+    endTrade(session, 'cancelled');
+  }
+
+  async function handleTradeSubmitPayment(player, data) {
+    const tradeId = typeof data.tradeId === 'string' ? data.tradeId : null;
+    const signature = typeof data.signature === 'string' && data.signature.trim() ? data.signature.trim() : null;
+    const session = tradeId ? activeTrades.get(tradeId) : null;
+    if (!session || !signature) return;
+    if (session.phase !== 'awaiting_payment') return;
+    if (!session.participants[player.userId] || player.userId === session.sellerId) return;
+
+    const sellerEntry = session.participants[session.sellerId];
+    session.phase = 'settling';
+    broadcastTradeState(session);
+
+    const result = await callInternalApi('/api/internal/game/trade/settle', {
+      tradeId: session.id,
+      gameId: session.gameId,
+      signature,
+      sellerId: session.sellerId,
+      sellerWallet: sellerEntry.wallet,
+      buyerId: player.userId,
+      buyerWallet: player.wallet,
+      itemId: session.itemId,
+      itemName: session.itemName,
+      quantity: 1,
+      priceTnj: session.priceTnj,
+    }).catch((err) => {
+      console.error('[Trade] settle call error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      const errorCode = result?.error || 'internal_error';
+      if (errorCode === 'settlement_record_failed') {
+        console.error('[Trade] CRITICAL: payment verified on-chain but not recorded:', {
+          tradeId: session.id, signature, sellerWallet: sellerEntry.wallet, buyerWallet: player.wallet,
+        });
+        endTrade(session, 'failed', { reason: errorCode, critical: true });
+        return;
+      }
+      session.phase = 'awaiting_payment';
+      sendToTradeParticipants(session, { type: 'error', message: tradePaymentErrorMessage(errorCode) });
+      broadcastTradeState(session);
+      return;
+    }
+
+    const seller = userIdToPlayer.get(session.sellerId);
+    if (seller) {
+      seller.placeables[session.itemId] = Math.max(0, (seller.placeables[session.itemId] || 0) - 1);
+      seller.economyChangedAt = Date.now();
+      persistPlayer(seller);
+      safeSend(seller.ws, { type: 'inventoryUpdate', inventory: seller.inventory, ash: seller.ash, placeables: seller.placeables });
+    } else {
+      console.error('[Trade] Seller offline at settlement — item not deducted in-memory, needs manual reconciliation:', {
+        tradeId: session.id, sellerId: session.sellerId, itemId: session.itemId, dbTradeId: result.tradeId,
+      });
+    }
+
+    player.placeables[session.itemId] = (player.placeables[session.itemId] || 0) + 1;
+    player.economyChangedAt = Date.now();
+    persistPlayer(player);
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+
+    endTrade(session, 'completed');
   }
 
   async function handleTokenInfoRequest(player, data) {
