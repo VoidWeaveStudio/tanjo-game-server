@@ -212,7 +212,7 @@ function isKnownLocationId(locationId) {
 
 const LOCATION_MAX_RADIUS = {
   'tower-main-hall': 140,
-  'tower-token-gates': 70,
+  'tower-token-gates': 80, // square hall, half-size 50 -> corner distance 50*sqrt(2) ~= 70.7
   'tower-basement': 70,
   'tower-events': 40,
   cave: 180,
@@ -903,6 +903,20 @@ safeInterval(canyonTick, CANYON_CONFIG.tickRate);
 const SHOP_ITEMS = {
   'sign-on-a-stick': { id: 'sign-on-a-stick', name: 'Sign on a Stick', price: 100, maxOwned: 10 },
   'sphere': { id: 'sphere', name: 'Sphere', price: 100, maxOwned: 50, tradeable: true },
+  'wall-poster': { id: 'wall-poster', name: 'Wall Poster', price: 100, maxOwned: 4 },
+};
+
+// Room-scoped furniture catalog, kept separate from SHOP_ITEMS: chair/table/wardrobe
+// are free (price 0) and must never flow through handleShopBuyItem, whose
+// affordableQty = Math.floor(player.ash / item.price) is Infinity/NaN at price 0
+// (NaN specifically when a fresh player's ash is also 0), which would corrupt
+// player.ash. Free items are capped purely by how many this owner already has
+// placed in this room (see handlePlaceItem), not by a player.placeables count.
+const FURNITURE_ITEMS = {
+  'chair': { id: 'chair', price: 0, maxOwned: 6 },
+  'table': { id: 'table', price: 0, maxOwned: 2 },
+  'wardrobe': { id: 'wardrobe', price: 0, maxOwned: 1 },
+  'wall-poster': { id: 'wall-poster', price: 100, maxOwned: 4 },
 };
 
 const SIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
@@ -971,7 +985,36 @@ safeInterval(() => {
   }
 }, 30000);
 
+// Must match GateLayoutSystem.TOTAL_GATE_SLOTS on the client — the hall has a
+// fixed number of gate archways regardless of how many factions own a room.
+const TOTAL_GATE_SLOTS = 22;
+const GATE_SUBSET_REFRESH_MS = 8 * 60 * 1000;
+
+function hashString(input) {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+// Deterministic, stateless selection: every server process agrees on the same
+// subset without coordination (just a shared clock), and it fully reshuffles
+// at each GATE_SUBSET_REFRESH_MS window boundary rather than on every refresh
+// tick, so gates don't visibly swap under players standing in the hall.
+function selectDisplayedGates(allGates, slotCount) {
+  if (allGates.length <= slotCount) return allGates;
+  const windowIndex = Math.floor(Date.now() / GATE_SUBSET_REFRESH_MS);
+  return allGates
+    .map((g) => ({ gate: g, rank: hashString(g.factionId + ':' + windowIndex) }))
+    .sort((a, b) => a.rank - b.rank)
+    .slice(0, slotCount)
+    .map((entry) => entry.gate);
+}
+
 let factionGatesList = [];
+let displayedFactionGatesList = [];
 
 async function refreshFactionGates() {
   const result = await callInternalApi('/api/internal/game/faction/gates-list', {}).catch((err) => {
@@ -980,6 +1023,19 @@ async function refreshFactionGates() {
   });
   if (result?.success && Array.isArray(result.gates)) {
     factionGatesList = result.gates;
+  }
+
+  const nextDisplayed = selectDisplayedGates(factionGatesList, TOTAL_GATE_SLOTS);
+  const prevIds = new Set(displayedFactionGatesList.map((g) => g.factionId));
+  const nextIds = new Set(nextDisplayed.map((g) => g.factionId));
+  const changed = prevIds.size !== nextIds.size || Array.from(prevIds).some((id) => !nextIds.has(id));
+
+  displayedFactionGatesList = nextDisplayed;
+
+  // Join-time state is sent via safeSend elsewhere; players already standing
+  // in the hall only ever see a rotation if we push it to them here.
+  if (changed) {
+    broadcastToLocation('tower-token-gates', { type: 'factionGatesState', gates: displayedFactionGatesList });
   }
 }
 
@@ -1058,6 +1114,45 @@ safeInterval(() => {
     }
   }
 }, 60000);
+
+const FACTION_ROOM_PREFIX = 'faction-gate-';
+
+function roomFactionIdFor(player) {
+  return typeof player.locationId === 'string' && player.locationId.startsWith(FACTION_ROOM_PREFIX)
+    ? player.locationId.slice(FACTION_ROOM_PREFIX.length)
+    : null;
+}
+
+// Per-room maps, loaded lazily (unlike worldSigns' single eager-loaded map) since
+// there can be hundreds of faction rooms and most are never visited in a given
+// server lifetime. No lifetime sweep here — placed furniture persists until a
+// player explicitly removes it, unlike signs' SIGN_LIFETIME_MS auto-expiry.
+const worldFurniture = new Map();
+const furnitureLoadPromises = new Map();
+
+function serializeFurnitureForRoom(factionId) {
+  const room = worldFurniture.get(factionId);
+  return room ? Array.from(room.values()) : [];
+}
+
+async function ensureFurnitureLoaded(factionId) {
+  if (worldFurniture.has(factionId)) return;
+  if (furnitureLoadPromises.has(factionId)) return furnitureLoadPromises.get(factionId);
+
+  const promise = (async () => {
+    const result = await callInternalApi('/api/internal/game/furniture/list', { factionId }).catch((err) => {
+      console.error('[Furniture] load error:', err.message);
+      return null;
+    });
+    const room = new Map();
+    for (const item of result?.items || []) {
+      room.set(item.id, item);
+    }
+    worldFurniture.set(factionId, room);
+  })();
+  furnitureLoadPromises.set(factionId, promise);
+  return promise;
+}
 
 function addTokensToInventory(player, tokens) {
   for (const t of tokens) {
@@ -1614,7 +1709,7 @@ wss.on('connection', (ws) => {
           safeSend(ws, { type: 'error', message: 'Sell rate limit exceeded' });
           return;
         }
-      } else if (data.type === 'shopBuyItem' || data.type === 'signPlace' || data.type === 'signRemove' || data.type === 'signSetText' || data.type === 'signSetDrawingUrl') {
+      } else if (data.type === 'shopBuyItem' || data.type === 'signPlace' || data.type === 'signRemove' || data.type === 'signSetText' || data.type === 'signSetDrawingUrl' || data.type === 'itemPlace' || data.type === 'itemRemove' || data.type === 'itemSetText' || data.type === 'itemSetDrawingUrl') {
         if (!checkRateLimit(playerId, 'build', CONFIG.network.buildRateLimit)) {
           safeSend(ws, { type: 'error', message: 'Build rate limit exceeded' });
           return;
@@ -1698,6 +1793,10 @@ wss.on('connection', (ws) => {
         case 'signRemove': handleSignRemove(player, data); break;
         case 'signSetText': handleSignSetText(player, data); break;
         case 'signSetDrawingUrl': handleSignSetDrawingUrl(player, data); break;
+        case 'itemPlace': handlePlaceItem(player, data); break;
+        case 'itemRemove': handleItemRemove(player, data); break;
+        case 'itemSetText': handleItemSetText(player, data); break;
+        case 'itemSetDrawingUrl': handleItemSetDrawingUrl(player, data); break;
         case 'voiceOffer': handleVoiceOffer(player, data); break;
         case 'voiceAnswer': handleVoiceAnswer(player, data); break;
         case 'voiceIceCandidate': handleVoiceIceCandidate(player, data); break;
@@ -2008,7 +2107,13 @@ wss.on('connection', (ws) => {
     }
 
     if (player.locationId === 'tower-token-gates') {
-      safeSend(ws, { type: 'factionGatesState', gates: factionGatesList });
+      safeSend(ws, { type: 'factionGatesState', gates: displayedFactionGatesList });
+    }
+
+    if (typeof player.locationId === 'string' && player.locationId.startsWith(FACTION_ROOM_PREFIX)) {
+      const joinRoomFactionId = player.locationId.slice(FACTION_ROOM_PREFIX.length);
+      await ensureFurnitureLoaded(joinRoomFactionId);
+      safeSend(ws, { type: 'furnitureState', items: serializeFurnitureForRoom(joinRoomFactionId) });
     }
 
     safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
@@ -3871,6 +3976,183 @@ wss.on('connection', (ws) => {
     }
   }
 
+  async function handlePlaceItem(player, data) {
+    if (!player.alive) return;
+    const item = FURNITURE_ITEMS[data.itemId];
+    if (!item) return;
+
+    const roomFactionId = roomFactionIdFor(player);
+    if (!roomFactionId) {
+      safeSend(player.ws, { type: 'error', message: 'This can only be placed in a faction room' });
+      return;
+    }
+    // Independent of how the player got into this room (walked through their
+    // own gate, or teleported here as a guest via the steward's search tab) —
+    // this check always re-verifies membership in THIS room's faction.
+    if (!player.factions?.some((f) => f.id === roomFactionId)) {
+      safeSend(player.ws, { type: 'error', message: "You can only place furniture in your own faction's room" });
+      return;
+    }
+    if (isMuted(player)) {
+      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
+      return;
+    }
+    if (!Array.isArray(data.position) || data.position.length !== 3) return;
+    if (!isValidPositionForLocation(player.locationId, data.position)) {
+      safeSend(player.ws, { type: 'error', message: 'Invalid placement position' });
+      return;
+    }
+    const rotation = typeof data.rotation === 'number' && isFinite(data.rotation) ? data.rotation : 0;
+
+    await ensureFurnitureLoaded(roomFactionId);
+    const roomItems = worldFurniture.get(roomFactionId) || new Map();
+    const ownedOfType = Array.from(roomItems.values()).filter((f) => f.ownerId === player.userId && f.itemId === data.itemId).length;
+    if (ownedOfType >= item.maxOwned) {
+      safeSend(player.ws, { type: 'error', message: `You can only place ${item.maxOwned} of this here` });
+      return;
+    }
+
+    if (item.price > 0) {
+      if (!(player.placeables[data.itemId] > 0)) {
+        safeSend(player.ws, { type: 'error', message: "You don't own any of that — buy one from the Shop" });
+        return;
+      }
+      player.placeables[data.itemId] -= 1;
+    }
+
+    const result = await callInternalApi('/api/internal/game/furniture/create', {
+      userId: player.userId, gameId: player.gameId, factionId: roomFactionId, itemId: data.itemId, position: data.position, rotation,
+    }).catch((err) => {
+      console.error('[Furniture] create error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      if (item.price > 0) player.placeables[data.itemId] += 1;
+      safeSend(player.ws, { type: 'error', message: 'Could not place item right now' });
+      return;
+    }
+
+    player.stats.buildingsPlaced += 1;
+    player.economyChangedAt = Date.now();
+    persistPlayer(player);
+
+    const furnitureItem = {
+      id: result.id,
+      itemId: data.itemId,
+      ownerId: player.userId,
+      ownerNickname: player.nickname,
+      factionId: roomFactionId,
+      position: data.position,
+      rotation,
+      contentType: null,
+      textContent: null,
+      drawingUrl: null,
+      createdAt: result.createdAt,
+    };
+    if (!worldFurniture.has(roomFactionId)) worldFurniture.set(roomFactionId, new Map());
+    worldFurniture.get(roomFactionId).set(furnitureItem.id, furnitureItem);
+
+    if (item.price > 0) {
+      safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+    }
+    broadcastToLocation(player.locationId, { type: 'furnitureSpawn', item: furnitureItem });
+  }
+
+  async function handleItemSetText(player, data) {
+    const roomFactionId = roomFactionIdFor(player);
+    if (!roomFactionId) return;
+    const item = worldFurniture.get(roomFactionId)?.get(data.id);
+    if (!item) return;
+    if (item.ownerId !== player.userId) {
+      safeSend(player.ws, { type: 'error', message: 'You cannot edit this item' });
+      return;
+    }
+    if (isMuted(player)) {
+      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
+      return;
+    }
+    if (typeof data.text !== 'string') return;
+
+    const text = sanitizeMessage(data.text.trim().slice(0, 150));
+    if (text.length === 0) return;
+    if (containsLink(text)) {
+      safeSend(player.ws, { type: 'error', message: 'Links are not allowed' });
+      return;
+    }
+
+    const result = await callInternalApi('/api/internal/game/furniture/set-content', {
+      itemId: item.id, userId: player.userId, contentType: 'text', textContent: text,
+    }).catch((err) => {
+      console.error('[Furniture] set-content error:', err.message);
+      return null;
+    });
+    if (!result || !result.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not save item right now' });
+      return;
+    }
+
+    item.contentType = 'text';
+    item.textContent = text;
+    broadcastToLocation(player.locationId, { type: 'furnitureContentSet', id: item.id, contentType: 'text', textContent: text });
+  }
+
+  async function handleItemSetDrawingUrl(player, data) {
+    const roomFactionId = roomFactionIdFor(player);
+    if (!roomFactionId) return;
+    const item = worldFurniture.get(roomFactionId)?.get(data.id);
+    if (!item) return;
+    if (item.ownerId !== player.userId) {
+      safeSend(player.ws, { type: 'error', message: 'You cannot edit this item' });
+      return;
+    }
+    if (typeof data.url !== 'string' || !data.url.startsWith('https://') || data.url.length > 512) {
+      safeSend(player.ws, { type: 'error', message: 'Invalid drawing' });
+      return;
+    }
+
+    const result = await callInternalApi('/api/internal/game/furniture/set-content', {
+      itemId: item.id, userId: player.userId, contentType: 'draw', drawingUrl: data.url,
+    }).catch((err) => {
+      console.error('[Furniture] set-content error:', err.message);
+      return null;
+    });
+    if (!result || !result.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not save item right now' });
+      return;
+    }
+
+    item.contentType = 'draw';
+    item.drawingUrl = data.url;
+    broadcastToLocation(player.locationId, { type: 'furnitureContentSet', id: item.id, contentType: 'draw', drawingUrl: data.url });
+  }
+
+  async function handleItemRemove(player, data) {
+    const roomFactionId = roomFactionIdFor(player);
+    if (!roomFactionId) return;
+    const roomItems = worldFurniture.get(roomFactionId);
+    const item = roomItems?.get(data.id);
+    if (!item) return;
+    if (item.ownerId !== player.userId) {
+      safeSend(player.ws, { type: 'error', message: 'You can only remove your own item' });
+      return;
+    }
+
+    const result = await callInternalApi('/api/internal/game/furniture/delete', {
+      itemId: item.id, userId: item.ownerId,
+    }).catch((err) => {
+      console.error('[Furniture] delete error:', err.message);
+      return null;
+    });
+    if (!result || !result.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not remove item right now' });
+      return;
+    }
+
+    roomItems.delete(item.id);
+    broadcastToLocation(player.locationId, { type: 'furnitureDespawn', id: item.id });
+  }
+
   function handleSaveProgress(player) {
     persistPlayer(player);
   }
@@ -3924,7 +4206,13 @@ wss.on('connection', (ws) => {
     }
 
     if (data.locationId === 'tower-token-gates') {
-      safeSend(ws, { type: 'factionGatesState', gates: factionGatesList });
+      safeSend(ws, { type: 'factionGatesState', gates: displayedFactionGatesList });
+    }
+
+    if (data.locationId.startsWith(FACTION_ROOM_PREFIX)) {
+      const newRoomFactionId = data.locationId.slice(FACTION_ROOM_PREFIX.length);
+      await ensureFurnitureLoaded(newRoomFactionId);
+      safeSend(ws, { type: 'furnitureState', items: serializeFurnitureForRoom(newRoomFactionId) });
     }
   }
 });
