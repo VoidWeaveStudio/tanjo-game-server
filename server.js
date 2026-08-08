@@ -5,9 +5,30 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const { FACTION_TASKS, FACTION_TASKS_BY_KEY } = require('./factionTasks');
+const {
+  QUEST_LISTING_FEE_ASH,
+  QUEST_MIN_SLOTS,
+  QUEST_MAX_SLOTS,
+  QUEST_MIN_REWARD_ASH,
+  QUEST_MAX_REWARD_ASH,
+  FACTION_QUEST_TYPES,
+  isValidXPostUrl,
+  questTotalCostAsh,
+} = require('./factionQuests');
 
 const PORT = process.env.PORT || 3001;
 const MAX_PLAYERS = 100;
+
+const EMOTE_KEYS = ['laugh', 'fuck_you', 'angry', 'to_the_moon', 'green_candle'];
+
+const COSMETIC_SLOTS = {
+  scream_mask: 'accessory',
+  trump_hair: 'accessory',
+  scream_robe: 'skin',
+  trump_suit: 'skin',
+  pepe_frog: 'skin',
+};
+const COSMETIC_PRICE_ASH = 1;
 
 const CONFIG = {
   world: {
@@ -49,6 +70,10 @@ const CONFIG = {
     privateMessageRateLimit: 5,
     factionChatRateLimit: 3,
     factionInviteRateLimit: 5,
+    factionQuestRateLimit: 10,
+    factionQuestCreateRateLimit: 3,
+    emoteRateLimit: 2,
+    cosmeticRateLimit: 5,
     tradeRateLimit: 8,
   },
   combat: {
@@ -94,45 +119,75 @@ function canyonSegmentStartZ(segment) {
 }
 
 function canyonSegmentName(segment) {
-  return segment === 1 ? 'Slime Valley' : `Slime Valley — Segment ${segment}`;
+  const biome = canyonBiomeFor(segment);
+  return segment <= CANYON_BIOMES.length ? biome.name : `${biome.name} — Segment ${segment}`;
 }
 
 const ENEMY_TYPES = {
   slime: {
-    name: 'Slime',
-    maxHealth: 100,
-    attackDamage: 10,
-    attackRange: 1.5,
-    aggroRadius: 20,
-    aggroLeash: 150,
-    attackCooldown: 1000,
-    chaseSpeedNear: 5,
-    chaseSpeedFar: 17.5,
-    chaseNearThreshold: 10,
-    patrolSpeed: 1.8,
-    patrolRadius: 18,
-    scale: 1,
-    lootMin: 1,
-    lootMax: 3,
+    name: 'Slime', maxHealth: 100, attackDamage: 10, attackRange: 1.5, aggroRadius: 20, aggroLeash: 150,
+    attackCooldown: 1000, chaseSpeedNear: 5, chaseSpeedFar: 17.5, chaseNearThreshold: 10,
+    patrolSpeed: 1.8, patrolRadius: 18, scale: 1, lootMin: 1, lootMax: 3,
   },
   slime_boss: {
-    name: 'Slime Boss',
-    maxHealth: 600,
-    attackDamage: 25,
-    attackRange: 2.5,
-    aggroRadius: 30,
-    aggroLeash: 180,
-    attackCooldown: 1200,
-    chaseSpeedNear: 4,
-    chaseSpeedFar: 10,
-    chaseNearThreshold: 12,
-    patrolSpeed: 1.2,
-    patrolRadius: 10,
-    scale: 3,
-    lootMin: 10,
-    lootMax: 20,
+    name: 'Slime Boss', maxHealth: 600, attackDamage: 25, attackRange: 2.5, aggroRadius: 30, aggroLeash: 180,
+    attackCooldown: 1200, chaseSpeedNear: 4, chaseSpeedFar: 10, chaseNearThreshold: 12,
+    patrolSpeed: 1.2, patrolRadius: 10, scale: 3, lootMin: 10, lootMax: 20,
+  },
+  husk: {
+    name: 'Ash Husk', maxHealth: 140, attackDamage: 14, attackRange: 1.8, aggroRadius: 24, aggroLeash: 160,
+    attackCooldown: 900, chaseSpeedNear: 6, chaseSpeedFar: 15, chaseNearThreshold: 10,
+    patrolSpeed: 2.2, patrolRadius: 20, scale: 1.15, lootMin: 2, lootMax: 4,
+  },
+  husk_boss: {
+    name: 'Cinder Colossus', maxHealth: 900, attackDamage: 32, attackRange: 3, aggroRadius: 34, aggroLeash: 190,
+    attackCooldown: 1300, chaseSpeedNear: 4.5, chaseSpeedFar: 11, chaseNearThreshold: 12,
+    patrolSpeed: 1.3, patrolRadius: 12, scale: 3.4, lootMin: 14, lootMax: 26,
+  },
+  frostling: {
+    name: 'Frostling', maxHealth: 120, attackDamage: 12, attackRange: 1.6, aggroRadius: 26, aggroLeash: 170,
+    attackCooldown: 800, chaseSpeedNear: 7, chaseSpeedFar: 19, chaseNearThreshold: 9,
+    patrolSpeed: 2.6, patrolRadius: 22, scale: 0.9, lootMin: 2, lootMax: 5,
+  },
+  frost_boss: {
+    name: 'Glacier Warden', maxHealth: 1100, attackDamage: 36, attackRange: 3.2, aggroRadius: 36, aggroLeash: 200,
+    attackCooldown: 1400, chaseSpeedNear: 4.2, chaseSpeedFar: 12, chaseNearThreshold: 13,
+    patrolSpeed: 1.4, patrolRadius: 12, scale: 3.6, lootMin: 18, lootMax: 32,
+  },
+  sporeling: {
+    name: 'Sporeling', maxHealth: 165, attackDamage: 16, attackRange: 2, aggroRadius: 22, aggroLeash: 165,
+    attackCooldown: 950, chaseSpeedNear: 5.5, chaseSpeedFar: 16, chaseNearThreshold: 10,
+    patrolSpeed: 2, patrolRadius: 19, scale: 1.25, lootMin: 3, lootMax: 6,
+  },
+  spore_boss: {
+    name: 'Mycelial Heart', maxHealth: 1400, attackDamage: 40, attackRange: 3.4, aggroRadius: 34, aggroLeash: 200,
+    attackCooldown: 1500, chaseSpeedNear: 3.8, chaseSpeedFar: 10.5, chaseNearThreshold: 14,
+    patrolSpeed: 1.1, patrolRadius: 11, scale: 4, lootMin: 22, lootMax: 40,
+  },
+  voidling: {
+    name: 'Voidling', maxHealth: 200, attackDamage: 20, attackRange: 1.9, aggroRadius: 30, aggroLeash: 180,
+    attackCooldown: 750, chaseSpeedNear: 8, chaseSpeedFar: 21, chaseNearThreshold: 9,
+    patrolSpeed: 3, patrolRadius: 24, scale: 1.05, lootMin: 4, lootMax: 8,
+  },
+  void_boss: {
+    name: 'The Rug Puller', maxHealth: 1800, attackDamage: 46, attackRange: 3.6, aggroRadius: 40, aggroLeash: 220,
+    attackCooldown: 1200, chaseSpeedNear: 5, chaseSpeedFar: 14, chaseNearThreshold: 14,
+    patrolSpeed: 1.6, patrolRadius: 14, scale: 4.2, lootMin: 30, lootMax: 55,
   },
 };
+
+const CANYON_BIOMES = [
+  { key: 'slime_valley', name: 'Slime Valley', mob: 'slime', boss: 'slime_boss', mobCount: 10 },
+  { key: 'ember_wastes', name: 'Ember Wastes', mob: 'husk', boss: 'husk_boss', mobCount: 12 },
+  { key: 'frozen_shelf', name: 'Frozen Shelf', mob: 'frostling', boss: 'frost_boss', mobCount: 14 },
+  { key: 'spore_hollow', name: 'Spore Hollow', mob: 'sporeling', boss: 'spore_boss', mobCount: 15 },
+  { key: 'void_rift', name: 'Void Rift', mob: 'voidling', boss: 'void_boss', mobCount: 16 },
+];
+
+function canyonBiomeFor(segment) {
+  const index = Math.min(CANYON_BIOMES.length, Math.max(1, segment)) - 1;
+  return CANYON_BIOMES[index];
+}
 
 const QUESTS = {
   sola_kill_10: {
@@ -219,6 +274,7 @@ const LOCATION_MAX_RADIUS = {
   'open-world-canyon': 150,
 };
 const MIN_LOCATION_CHANGE_INTERVAL_MS = 1000;
+const SPAWN_PROTECTION_MS = 5000;
 const TELEPORT_SETTLE_TOLERANCE = 20;
 
 function getLocationMaxRadius(locationId) {
@@ -480,9 +536,10 @@ function buildPlayerJoinPayload(p) {
     isAdmin: !!p.isAdmin,
     isFactionCreator: !!p.isFactionCreator,
     skinTextureUrl: p.skinTextureUrl || null,
+    cosmeticSkinId: p.cosmeticSkinId || null,
+    cosmeticAccessoryId: p.cosmeticAccessoryId || null,
   };
 }
-
 
 function recomputeAOI(player) {
   const newNeighbors = new Set();
@@ -517,7 +574,6 @@ function recomputeAOI(player) {
   player.aoiNeighbors = newNeighbors;
 }
 
-
 function notifyAOILeave(player) {
   for (const id of player.aoiNeighbors) {
     const other = players.get(id);
@@ -527,7 +583,6 @@ function notifyAOILeave(player) {
   }
   player.aoiNeighbors = new Set();
 }
-
 
 function notifyLocationTransition(player, oldLocationId, newLocationId) {
   const oldNeighbors = player.aoiNeighbors;
@@ -569,6 +624,8 @@ function notifyLocationTransition(player, oldLocationId, newLocationId) {
       isAdmin: !!player.isAdmin,
       isFactionCreator: !!player.isFactionCreator,
       skinTextureUrl: player.skinTextureUrl || null,
+      cosmeticSkinId: player.cosmeticSkinId || null,
+      cosmeticAccessoryId: player.cosmeticAccessoryId || null,
     });
     safeSend(player.ws, {
       type: 'playerJoinLocation',
@@ -590,13 +647,37 @@ function notifyLocationTransition(player, oldLocationId, newLocationId) {
       isAdmin: !!other.isAdmin,
       isFactionCreator: !!other.isFactionCreator,
       skinTextureUrl: other.skinTextureUrl || null,
+      cosmeticSkinId: other.cosmeticSkinId || null,
+      cosmeticAccessoryId: other.cosmeticAccessoryId || null,
     });
   });
 }
 
-function spawnInSafeZone(player) {
+function isSpawnProtected(player) {
+  return !!player.invulnerableUntil && Date.now() < player.invulnerableUntil;
+}
+
+function grantSpawnProtection(player) {
+  player.invulnerableUntil = Date.now() + SPAWN_PROTECTION_MS;
+  safeSend(player.ws, { type: 'spawnProtection', untilMs: player.invulnerableUntil, durationMs: SPAWN_PROTECTION_MS });
+}
+
+function clearSpawnProtection(player) {
+  if (!player.invulnerableUntil) return;
+  player.invulnerableUntil = 0;
+  safeSend(player.ws, { type: 'spawnProtection', untilMs: 0, durationMs: 0 });
+}
+
+function spawnInSafeZone(player, locationId) {
+  const target = locationId || player.locationId;
+  if (typeof target === 'string' && target.startsWith('faction-gate-')) {
+    player.position = [0, 0, 4];
+    return;
+  }
   const angle = Math.random() * Math.PI * 2;
-  const r = 10 + Math.random() * 15;
+  const maxRadius = getLocationMaxRadius(target);
+  const spread = maxRadius == null ? 25 : Math.min(25, Math.max(0, maxRadius - 6));
+  const r = spread <= 0 ? 0 : spread * (0.4 + Math.random() * 0.6);
   player.position = [Math.cos(angle) * r, 0, Math.sin(angle) * r];
 }
 
@@ -615,10 +696,12 @@ function broadcastToLocation(locationId, data, excludeId = null) {
 }
 
 function getSegmentDifficulty(segment) {
-  const healthMult = 1 + (segment - 1) * 0.2;
-  const damageMult = 1 + (segment - 1) * 0.15;
-  const slimeCount = Math.min(10 + (segment - 1) * 2, 24);
-  return { healthMult, damageMult, slimeCount };
+  const beyond = Math.max(0, segment - CANYON_BIOMES.length);
+  const healthMult = 1 + beyond * 0.2;
+  const damageMult = 1 + beyond * 0.15;
+  const biome = canyonBiomeFor(segment);
+  const mobCount = Math.min(biome.mobCount + beyond * 2, 26);
+  return { healthMult, damageMult, mobCount };
 }
 
 function canyonPathOffsetX(z) {
@@ -681,11 +764,12 @@ function preparePlayerEnemiesForSegment(player, segment) {
   player.canyon.enemies.clear();
   clearCanyonLoot(player);
 
-  const { healthMult, damageMult, slimeCount } = getSegmentDifficulty(segment);
-  for (let i = 0; i < slimeCount; i++) {
-    spawnCanyonEnemy(player, 'slime', randomCanyonCombatPoint(segment), healthMult, damageMult);
+  const { healthMult, damageMult, mobCount } = getSegmentDifficulty(segment);
+  const biome = canyonBiomeFor(segment);
+  for (let i = 0; i < mobCount; i++) {
+    spawnCanyonEnemy(player, biome.mob, randomCanyonCombatPoint(segment), healthMult, damageMult);
   }
-  spawnCanyonEnemy(player, 'slime_boss', randomCanyonBossPoint(segment), healthMult, damageMult);
+  spawnCanyonEnemy(player, biome.boss, randomCanyonBossPoint(segment), healthMult, damageMult);
 }
 
 function populateCanyonSegment(player, segment) {
@@ -693,6 +777,7 @@ function populateCanyonSegment(player, segment) {
   preparePlayerEnemiesForSegment(player, segment);
   player.position = canyonSegmentEntrancePosition(segment);
   player.justTeleported = true;
+  grantSpawnProtection(player);
 
   safeSend(player.ws, {
     type: 'canyonSegment',
@@ -700,6 +785,7 @@ function populateCanyonSegment(player, segment) {
     maxSegmentReached: player.canyon.maxSegmentReached,
     cleared: player.canyon.clearedSegments.has(segment),
     name: canyonSegmentName(segment),
+    biome: canyonBiomeFor(segment).key,
   });
   safeSend(player.ws, { type: 'enemyState', enemies: serializeCanyonEnemies(player) });
 }
@@ -710,6 +796,7 @@ function enterCanyonHub(player) {
   clearCanyonLoot(player);
   player.position = [...CANYON_HUB_POSITION];
   player.justTeleported = true;
+  grantSpawnProtection(player);
 
   safeSend(player.ws, {
     type: 'canyonHub',
@@ -795,6 +882,7 @@ function respawnPlayer(target) {
     }
   }
   target.justTeleported = true;
+  grantSpawnProtection(target);
 
   safeSend(target.ws, {
     type: 'respawn',
@@ -819,6 +907,7 @@ function handleRespawnRequest(player) {
 
 function damagePlayerByCanyonEnemy(player, enemy) {
   if (!player.alive) return;
+  if (isSpawnProtected(player)) return;
 
   const damage = enemy.attackDamage;
   player.health = Math.max(0, player.health - damage);
@@ -906,18 +995,38 @@ const SHOP_ITEMS = {
   'wall-poster': { id: 'wall-poster', name: 'Wall Poster', price: 100, maxOwned: 4 },
 };
 
-// Room-scoped furniture catalog, kept separate from SHOP_ITEMS: chair/table/wardrobe
-// are free (price 0) and must never flow through handleShopBuyItem, whose
-// affordableQty = Math.floor(player.ash / item.price) is Infinity/NaN at price 0
-// (NaN specifically when a fresh player's ash is also 0), which would corrupt
-// player.ash. Free items are capped purely by how many this owner already has
-// placed in this room (see handlePlaceItem), not by a player.placeables count.
 const FURNITURE_ITEMS = {
   'chair': { id: 'chair', price: 0, maxOwned: 6 },
   'table': { id: 'table', price: 0, maxOwned: 2 },
   'wardrobe': { id: 'wardrobe', price: 0, maxOwned: 1 },
   'wall-poster': { id: 'wall-poster', price: 100, maxOwned: 4 },
 };
+
+const shopPriceOverrides = new Map();
+
+async function refreshShopPrices(gameId) {
+  if (!gameId || !CONFIG.internalSecret) return;
+  const result = await callInternalApi('/api/internal/game/shop-prices', { gameId }).catch((err) => {
+    console.error('[Shop] price refresh error:', err.message);
+    return null;
+  });
+  if (!result?.items) return;
+  shopPriceOverrides.clear();
+  for (const item of result.items) {
+    shopPriceOverrides.set(item.itemId, item);
+  }
+}
+
+function shopPriceFor(itemId, fallbackPrice) {
+  const override = shopPriceOverrides.get(itemId);
+  if (!override || override.currency !== 'ash') return fallbackPrice;
+  return Math.max(0, Math.floor(Number(override.priceAsh) || 0));
+}
+
+function shopItemEnabled(itemId) {
+  const override = shopPriceOverrides.get(itemId);
+  return !override || override.enabled !== false;
+}
 
 const SIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
 
@@ -933,7 +1042,6 @@ const LOOT_CONFIG = {
 let tokenPool = [];
 const lootDrops = new Map();
 let nextLootId = 0;
-
 
 const activeTrades = new Map();
 
@@ -985,8 +1093,6 @@ safeInterval(() => {
   }
 }, 30000);
 
-// Must match GateLayoutSystem.TOTAL_GATE_SLOTS on the client — the hall has a
-// fixed number of gate archways regardless of how many factions own a room.
 const TOTAL_GATE_SLOTS = 22;
 const GATE_SUBSET_REFRESH_MS = 8 * 60 * 1000;
 
@@ -999,10 +1105,6 @@ function hashString(input) {
   return hash >>> 0;
 }
 
-// Deterministic, stateless selection: every server process agrees on the same
-// subset without coordination (just a shared clock), and it fully reshuffles
-// at each GATE_SUBSET_REFRESH_MS window boundary rather than on every refresh
-// tick, so gates don't visibly swap under players standing in the hall.
 function selectDisplayedGates(allGates, slotCount) {
   if (allGates.length <= slotCount) return allGates;
   const windowIndex = Math.floor(Date.now() / GATE_SUBSET_REFRESH_MS);
@@ -1032,8 +1134,6 @@ async function refreshFactionGates() {
 
   displayedFactionGatesList = nextDisplayed;
 
-  // Join-time state is sent via safeSend elsewhere; players already standing
-  // in the hall only ever see a rotation if we push it to them here.
   if (changed) {
     broadcastToLocation('tower-token-gates', { type: 'factionGatesState', gates: displayedFactionGatesList });
   }
@@ -1123,10 +1223,6 @@ function roomFactionIdFor(player) {
     : null;
 }
 
-// Per-room maps, loaded lazily (unlike worldSigns' single eager-loaded map) since
-// there can be hundreds of faction rooms and most are never visited in a given
-// server lifetime. No lifetime sweep here — placed furniture persists until a
-// player explicitly removes it, unlike signs' SIGN_LIFETIME_MS auto-expiry.
 const worldFurniture = new Map();
 const furnitureLoadPromises = new Map();
 
@@ -1422,7 +1518,6 @@ safeInterval(() => {
   });
 }, CONFIG.autoSaveInterval);
 
-
 safeInterval(() => {
   factionTaskState.forEach((state, factionId) => {
     if (!state.dirty || !state.taskKey) return;
@@ -1432,7 +1527,6 @@ safeInterval(() => {
     }).catch((err) => console.error('[FactionTask] progress flush error:', err.message));
   });
 }, 20000);
-
 
 safeInterval(async () => {
   if (!CONFIG.internalSecret) return;
@@ -1462,7 +1556,6 @@ safeInterval(async () => {
     }
   });
 }, 8000);
-
 
 safeInterval(async () => {
   if (!CONFIG.internalSecret) return;
@@ -1496,6 +1589,11 @@ safeInterval(async () => {
 }, 8000);
 
 safeInterval(async () => {
+  const anyPlayer = Array.from(players.values()).find((p) => p.authenticated && p.gameId);
+  if (anyPlayer) await refreshShopPrices(anyPlayer.gameId);
+}, 60000);
+
+safeInterval(async () => {
   if (!CONFIG.internalSecret) return;
 
   const authedPlayers = Array.from(players.values()).filter((p) => p.authenticated && p.userId);
@@ -1524,7 +1622,6 @@ safeInterval(async () => {
     safeSend(p.ws, { type: 'inventoryUpdate', inventory: p.inventory, ash: p.ash, placeables: p.placeables });
   });
 }, 8000);
-
 
 safeInterval(async () => {
   if (!CONFIG.internalSecret) return;
@@ -1591,6 +1688,8 @@ wss.on('connection', (ws) => {
     justSpawned: false,
     justTeleported: false,
     lastLocationChangeAt: 0,
+    pendingLocationChange: null,
+    invulnerableUntil: 0,
     aoiNeighbors: new Set(),
     weaponAmmo: WEAPON_CONFIG.maxAmmo,
     lastShotAt: 0,
@@ -1617,6 +1716,9 @@ wss.on('connection', (ws) => {
     activeTradeId: null,
     quests: {},
     factions: [],
+    cosmeticsOwned: new Set(),
+    cosmeticSkinId: null,
+    cosmeticAccessoryId: null,
     displayedFactionId: null,
     displayedFactionName: null,
     displayedFactionSymbol: null,
@@ -1724,12 +1826,20 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'skinUpdate', CONFIG.network.skinUpdateRateLimit)) return;
       } else if (data.type === 'saveProgress') {
         if (!checkRateLimit(playerId, 'saveProgress', CONFIG.network.saveProgressRateLimit)) return;
+      } else if (data.type === 'cosmeticListRequest' || data.type === 'cosmeticBuy' || data.type === 'cosmeticEquip') {
+        if (!checkRateLimit(playerId, 'cosmetic', CONFIG.network.cosmeticRateLimit)) return;
+      } else if (data.type === 'emote') {
+        if (!checkRateLimit(playerId, 'emote', CONFIG.network.emoteRateLimit)) return;
       } else if (data.type === 'questInteract' || data.type === 'questAccept' || data.type === 'questTurnIn') {
         if (!checkRateLimit(playerId, 'quest', CONFIG.network.questRateLimit)) return;
       } else if (data.type === 'canyonWarp' || data.type === 'canyonMapRequest' || data.type === 'canyonEnterDungeon' || data.type === 'canyonReturnToHub' || data.type === 'canyonCrossThreshold') {
         if (!checkRateLimit(playerId, 'canyon', CONFIG.network.canyonRateLimit)) return;
       } else if (data.type === 'factionCreate' || data.type === 'factionJoin' || data.type === 'factionLeave' || data.type === 'factionList' || data.type === 'factionInfo' || data.type === 'factionTaskListRequest' || data.type === 'factionAcceptTask' || data.type === 'factionClaimCreator' || data.type === 'factionSetDisplayed' || data.type === 'factionMyListRequest') {
         if (!checkRateLimit(playerId, 'faction', CONFIG.network.factionRateLimit)) return;
+      } else if (data.type === 'factionQuestCreate') {
+        if (!checkRateLimit(playerId, 'factionQuestCreate', CONFIG.network.factionQuestCreateRateLimit)) return;
+      } else if (data.type === 'factionQuestListRequest' || data.type === 'factionQuestManageListRequest' || data.type === 'factionQuestClaim') {
+        if (!checkRateLimit(playerId, 'factionQuest', CONFIG.network.factionQuestRateLimit)) return;
       } else if (data.type === 'factionSearch') {
         if (!checkRateLimit(playerId, 'factionSearch', CONFIG.network.factionSearchRateLimit)) return;
       } else if (data.type === 'playerProfileRequest' || data.type === 'leaderboardRequest' || data.type === 'factionLeaderboardRequest') {
@@ -1802,6 +1912,10 @@ wss.on('connection', (ws) => {
         case 'voiceIceCandidate': handleVoiceIceCandidate(player, data); break;
         case 'saveProgress': handleSaveProgress(player); break;
         case 'locationChange': handleLocationChange(player, data); break;
+        case 'emote': handleEmote(player, data); break;
+        case 'cosmeticListRequest': handleCosmeticListRequest(player); break;
+        case 'cosmeticBuy': handleCosmeticBuy(player, data); break;
+        case 'cosmeticEquip': handleCosmeticEquip(player, data); break;
         case 'questInteract': handleQuestInteract(player, data); break;
         case 'questAccept': handleQuestAccept(player, data); break;
         case 'questTurnIn': handleQuestTurnIn(player, data); break;
@@ -1821,6 +1935,10 @@ wss.on('connection', (ws) => {
         case 'factionTaskListRequest': handleFactionTaskListRequest(player); break;
         case 'factionAcceptTask': handleFactionAcceptTask(player, data); break;
         case 'factionClaimCreator': handleFactionClaimCreator(player, data); break;
+        case 'factionQuestCreate': handleFactionQuestCreate(player, data); break;
+        case 'factionQuestListRequest': handleFactionQuestListRequest(player); break;
+        case 'factionQuestManageListRequest': handleFactionQuestManageListRequest(player, data); break;
+        case 'factionQuestClaim': handleFactionQuestClaim(player, data); break;
         case 'playerProfileRequest': handlePlayerProfileRequest(player, data); break;
         case 'leaderboardRequest': handleLeaderboardRequest(player, data); break;
         case 'factionLeaderboardRequest': handleFactionLeaderboardRequest(player, data); break;
@@ -1856,6 +1974,10 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     clearTimeout(player.authTimeout);
+    if (player.pendingLocationChange) {
+      clearTimeout(player.pendingLocationChange);
+      player.pendingLocationChange = null;
+    }
 
     if (player.authenticated) {
       persistPlayer(player);
@@ -2048,6 +2170,9 @@ wss.on('connection', (ws) => {
       await refreshPlayerFactions(player);
     }
 
+    await refreshPlayerCosmetics(player);
+    if (shopPriceOverrides.size === 0) await refreshShopPrices(player.gameId);
+
     const blocksResult = await callInternalApi('/api/internal/game/blocks/list', {
       userId: player.userId, gameId: player.gameId,
     }).catch((err) => {
@@ -2095,6 +2220,9 @@ wss.on('connection', (ws) => {
       count: Array.from(players.values()).filter((p) => p.authenticated).length,
       spawnPosition: player.position,
     });
+
+    safeSend(ws, { type: 'factionMyListResult', factions: player.factions });
+    sendCosmeticState(player);
 
     if (player.locationId === 'main-world') {
       safeSend(ws, { type: 'lootState', loot: serializeLoot() });
@@ -2209,6 +2337,7 @@ wss.on('connection', (ws) => {
 
   function handleShoot(player, data) {
     if (!player.alive) return;
+    clearSpawnProtection(player);
 
     if (!Array.isArray(data.origin) || !Array.isArray(data.direction)) return;
     if (data.origin.length !== 3 || data.direction.length !== 3) return;
@@ -2424,7 +2553,6 @@ wss.on('connection', (ws) => {
     });
   }
 
-
   function relayVoiceSignal(player, targetId, payload) {
     if (isMuted(player)) return;
     if (typeof targetId !== 'string') return;
@@ -2490,6 +2618,8 @@ wss.on('connection', (ws) => {
       console.log(`[!] Hit rejected: shot from ${playerId} to ${data.target} blocked by another entity`);
       return;
     }
+
+    if (isSpawnProtected(target)) return;
 
     const damage = 5;
     target.health = Math.max(0, target.health - damage);
@@ -2590,6 +2720,7 @@ wss.on('connection', (ws) => {
           segment: nextSegment,
           maxSegmentReached: player.canyon.maxSegmentReached,
           name: canyonSegmentName(nextSegment),
+          biome: canyonBiomeFor(nextSegment).key,
         });
       }
     } else {
@@ -3038,6 +3169,132 @@ wss.on('connection', (ws) => {
     if (result.isCreator) {
       broadcastToFaction(data.factionId, { type: 'factionCreatorVerified', faction: result.faction }, player.id);
     }
+  }
+
+  async function handleFactionQuestCreate(player, data) {
+    if (typeof data.factionId !== 'string' || !player.factions?.some((f) => f.id === data.factionId)) return;
+
+    const targetUrl = typeof data.targetUrl === 'string' ? data.targetUrl.trim() : '';
+    if (!isValidXPostUrl(targetUrl)) {
+      safeSend(player.ws, { type: 'error', message: 'The quest link must be a post on https://x.com/' });
+      return;
+    }
+
+    const slotsTotal = Number.isInteger(data.slotsTotal) ? data.slotsTotal : 0;
+    const rewardAsh = Number.isInteger(data.rewardAsh) ? data.rewardAsh : 0;
+    if (slotsTotal < QUEST_MIN_SLOTS || slotsTotal > QUEST_MAX_SLOTS) {
+      safeSend(player.ws, { type: 'error', message: `Participants must be between ${QUEST_MIN_SLOTS} and ${QUEST_MAX_SLOTS}` });
+      return;
+    }
+    if (rewardAsh < QUEST_MIN_REWARD_ASH || rewardAsh > QUEST_MAX_REWARD_ASH) {
+      safeSend(player.ws, { type: 'error', message: `Reward must be between ${QUEST_MIN_REWARD_ASH} and ${QUEST_MAX_REWARD_ASH} Ash` });
+      return;
+    }
+
+    const totalCost = questTotalCostAsh(slotsTotal, rewardAsh);
+    if (player.ash < totalCost) {
+      safeSend(player.ws, { type: 'error', message: `Not enough Ash — this quest costs ${totalCost} Ash` });
+      return;
+    }
+
+    player.ash -= totalCost;
+    player.economyChangedAt = Date.now();
+    persistPlayer(player);
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+
+    const result = await callInternalApi('/api/internal/game/faction/quest/create', {
+      userId: player.userId, gameId: player.gameId, wallet: player.wallet,
+      factionId: data.factionId, targetUrl, slotsTotal, rewardAsh,
+    }).catch((err) => {
+      console.error('[FactionQuest] create error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      player.ash += totalCost;
+      player.economyChangedAt = Date.now();
+      persistPlayer(player);
+      const message = result?.error === 'not_verified_creator'
+        ? 'Only the verified token creator can publish faction quests'
+        : result?.error === 'invalid_post_url'
+          ? 'The quest link must be a post on https://x.com/'
+          : 'Could not publish that quest right now';
+      safeSend(player.ws, { type: 'error', message });
+      safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+      return;
+    }
+
+    persistPlayer(player);
+    safeSend(player.ws, { type: 'factionQuestCreated', quest: result.quest, chargedAsh: totalCost });
+  }
+
+  async function handleFactionQuestListRequest(player) {
+    const result = await callInternalApi('/api/internal/game/faction/quest/list', {
+      gameId: player.gameId, viewerUserId: player.userId, limit: 50,
+    }).catch((err) => {
+      console.error('[FactionQuest] list error:', err.message);
+      return null;
+    });
+
+    safeSend(player.ws, { type: 'factionQuestListResult', quests: result?.quests || [] });
+  }
+
+  async function handleFactionQuestManageListRequest(player, data) {
+    if (typeof data.factionId !== 'string' || !player.factions?.some((f) => f.id === data.factionId)) return;
+
+    const result = await callInternalApi('/api/internal/game/faction/quest/faction-list', {
+      gameId: player.gameId, factionId: data.factionId, userId: player.userId,
+    }).catch((err) => {
+      console.error('[FactionQuest] faction-list error:', err.message);
+      return null;
+    });
+
+    safeSend(player.ws, {
+      type: 'factionQuestManageListResult',
+      factionId: data.factionId,
+      canManage: !!result?.canManage,
+      questTypes: FACTION_QUEST_TYPES,
+      listingFeeAsh: QUEST_LISTING_FEE_ASH,
+      quests: result?.quests || [],
+    });
+  }
+
+  async function handleFactionQuestClaim(player, data) {
+    if (typeof data.questId !== 'string' || !data.questId) return;
+
+    const result = await callInternalApi('/api/internal/game/faction/quest/claim', {
+      questId: data.questId, userId: player.userId, gameId: player.gameId, wallet: player.wallet,
+    }).catch((err) => {
+      console.error('[FactionQuest] claim error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      const message = result?.error === 'already_completed'
+        ? 'You already claimed this quest'
+        : result?.error === 'quest_full'
+          ? 'All reward slots for this quest are taken'
+          : result?.error === 'own_quest'
+            ? "You can't claim your own faction's quest"
+            : 'Could not claim that quest right now';
+      safeSend(player.ws, { type: 'error', message });
+      return;
+    }
+
+    player.ash += result.rewardAsh;
+    player.economyChangedAt = Date.now();
+    bumpFactionTaskProgress(player, 'ash', result.rewardAsh).catch((err) => console.error('[FactionTask] bump error:', err.message));
+    persistPlayer(player);
+
+    safeSend(player.ws, {
+      type: 'factionQuestClaimed',
+      questId: result.questId,
+      rewardAsh: result.rewardAsh,
+      slotsClaimed: result.slotsClaimed,
+      slotsTotal: result.slotsTotal,
+      status: result.status,
+    });
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
   }
 
   function friendErrorMessage(code) {
@@ -3628,6 +3885,131 @@ wss.on('connection', (ws) => {
     }
   }
 
+  function sendCosmeticState(player) {
+    safeSend(player.ws, {
+      type: 'cosmeticState',
+      owned: Array.from(player.cosmeticsOwned || []),
+      skinId: player.cosmeticSkinId || null,
+      accessoryId: player.cosmeticAccessoryId || null,
+    });
+  }
+
+  function broadcastCosmeticChange(player) {
+    broadcastToLocation(player.locationId, {
+      type: 'cosmeticUpdate',
+      playerId: player.id,
+      skinId: player.cosmeticSkinId || null,
+      accessoryId: player.cosmeticAccessoryId || null,
+    }, player.id);
+  }
+
+  async function refreshPlayerCosmetics(player) {
+    const result = await callInternalApi('/api/internal/game/cosmetics/state', {
+      userId: player.userId, gameId: player.gameId,
+    }).catch((err) => {
+      console.error('[Cosmetics] state error:', err.message);
+      return null;
+    });
+
+    player.cosmeticsOwned = new Set(result?.owned || []);
+    player.cosmeticSkinId = result?.skinId || null;
+    player.cosmeticAccessoryId = result?.accessoryId || null;
+  }
+
+  async function handleCosmeticListRequest(player) {
+    await refreshPlayerCosmetics(player);
+    sendCosmeticState(player);
+  }
+
+  async function handleCosmeticBuy(player, data) {
+    const slot = COSMETIC_SLOTS[data.itemId];
+    if (!slot) return;
+
+    if (!shopItemEnabled(data.itemId)) {
+      safeSend(player.ws, { type: 'error', message: 'That item is not for sale right now' });
+      return;
+    }
+
+    const cosmeticPrice = shopPriceFor(data.itemId, COSMETIC_PRICE_ASH);
+
+    if (player.cosmeticsOwned?.has(data.itemId)) {
+      safeSend(player.ws, { type: 'error', message: 'You already own that' });
+      return;
+    }
+    if (player.ash < cosmeticPrice) {
+      safeSend(player.ws, { type: 'error', message: `Not enough Ash — this costs ${cosmeticPrice} Ash` });
+      return;
+    }
+
+    player.ash -= cosmeticPrice;
+    player.economyChangedAt = Date.now();
+    persistPlayer(player);
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+
+    const result = await callInternalApi('/api/internal/game/cosmetics/buy', {
+      userId: player.userId, gameId: player.gameId, itemId: data.itemId,
+    }).catch((err) => {
+      console.error('[Cosmetics] buy error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      player.ash += cosmeticPrice;
+      player.economyChangedAt = Date.now();
+      persistPlayer(player);
+      safeSend(player.ws, {
+        type: 'error',
+        message: result?.error === 'already_owned' ? 'You already own that' : 'Could not buy that right now',
+      });
+      safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+      return;
+    }
+
+    if (!player.cosmeticsOwned) player.cosmeticsOwned = new Set();
+    player.cosmeticsOwned.add(data.itemId);
+    sendCosmeticState(player);
+  }
+
+  async function handleCosmeticEquip(player, data) {
+    const wantedSkin = COSMETIC_SLOTS[data.skinId] === 'skin' ? data.skinId : null;
+    const wantedAccessory = COSMETIC_SLOTS[data.accessoryId] === 'accessory' ? data.accessoryId : null;
+
+    if (wantedSkin && !player.cosmeticsOwned?.has(wantedSkin)) return;
+    if (wantedAccessory && !player.cosmeticsOwned?.has(wantedAccessory)) return;
+
+    const skinId = wantedSkin;
+    const accessoryId = skinId ? null : wantedAccessory;
+
+    const result = await callInternalApi('/api/internal/game/cosmetics/equip', {
+      userId: player.userId, gameId: player.gameId, skinId, accessoryId,
+    }).catch((err) => {
+      console.error('[Cosmetics] equip error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not change your outfit right now' });
+      return;
+    }
+
+    player.cosmeticSkinId = result.skinId || null;
+    player.cosmeticAccessoryId = result.accessoryId || null;
+
+    sendCosmeticState(player);
+    broadcastCosmeticChange(player);
+  }
+
+  function handleEmote(player, data) {
+    if (!player.alive) return;
+    if (!EMOTE_KEYS.includes(data.key)) return;
+
+    broadcastToLocation(player.locationId, {
+      type: 'emote',
+      playerId: player.id,
+      key: data.key,
+    }, player.id);
+  }
+
   function handleQuestInteract(player, data) {
     if (typeof data.questId !== 'string') return;
     const quest = getQuest(data.questId);
@@ -3738,7 +4120,6 @@ wss.on('connection', (ws) => {
     const sellQty = Math.min(requestedQty, entry.quantity);
     if (sellQty <= 0) return;
 
-
     if (!player.sellQueue) player.sellQueue = [];
     if (player.sellQueue.length >= 32) {
       safeSend(ws, { type: 'error', message: 'Too many pending sells, slow down' });
@@ -3820,15 +4201,21 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (!shopItemEnabled(item.id)) {
+      safeSend(player.ws, { type: 'error', message: 'That item is not for sale right now' });
+      return;
+    }
+
+    const unitPrice = shopPriceFor(item.id, item.price);
     const requestedQty = Number.isInteger(data.quantity) && data.quantity > 0 ? data.quantity : 1;
-    const affordableQty = Math.floor(player.ash / item.price);
+    const affordableQty = unitPrice > 0 ? Math.floor(player.ash / unitPrice) : requestedQty;
     const qty = Math.max(0, Math.min(requestedQty, capRemaining, affordableQty));
     if (qty <= 0) {
       safeSend(player.ws, { type: 'error', message: 'Not enough ash' });
       return;
     }
 
-    player.ash -= item.price * qty;
+    player.ash -= unitPrice * qty;
     player.placeables[item.id] = owned + qty;
     player.economyChangedAt = Date.now();
     persistPlayer(player);
@@ -3986,9 +4373,6 @@ wss.on('connection', (ws) => {
       safeSend(player.ws, { type: 'error', message: 'This can only be placed in a faction room' });
       return;
     }
-    // Independent of how the player got into this room (walked through their
-    // own gate, or teleported here as a guest via the steward's search tab) —
-    // this check always re-verifies membership in THIS room's faction.
     if (!player.factions?.some((f) => f.id === roomFactionId)) {
       safeSend(player.ws, { type: 'error', message: "You can only place furniture in your own faction's room" });
       return;
@@ -4170,8 +4554,18 @@ wss.on('connection', (ws) => {
     if (oldLocation === data.locationId) return;
 
     const now = Date.now();
-    if (now - player.lastLocationChangeAt < MIN_LOCATION_CHANGE_INTERVAL_MS) {
+    const sinceLast = now - player.lastLocationChangeAt;
+    if (sinceLast < MIN_LOCATION_CHANGE_INTERVAL_MS) {
+      if (player.pendingLocationChange) clearTimeout(player.pendingLocationChange);
+      player.pendingLocationChange = setTimeout(() => {
+        player.pendingLocationChange = null;
+        if (player.authenticated) handleLocationChange(player, data);
+      }, MIN_LOCATION_CHANGE_INTERVAL_MS - sinceLast);
       return;
+    }
+    if (player.pendingLocationChange) {
+      clearTimeout(player.pendingLocationChange);
+      player.pendingLocationChange = null;
     }
     player.lastLocationChangeAt = now;
 
@@ -4188,8 +4582,9 @@ wss.on('connection', (ws) => {
       safeSend(ws, { type: 'weaponForceUnequip' });
     }
 
-    spawnInSafeZone(player);
+    spawnInSafeZone(player, data.locationId);
     player.justTeleported = true;
+    grantSpawnProtection(player);
     player.positionHistory = [];
     player.recentShots = [];
 
