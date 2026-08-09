@@ -260,15 +260,31 @@ const VALID_LOCATIONS = new Set([
 ]);
 
 const FACTION_GATE_LOCATION_PATTERN = /^faction-gate-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const PLAYER_ROOM_LOCATION_PATTERN = /^player-room-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function isKnownLocationId(locationId) {
-  return VALID_LOCATIONS.has(locationId) || FACTION_GATE_LOCATION_PATTERN.test(locationId);
+  return VALID_LOCATIONS.has(locationId) ||
+    FACTION_GATE_LOCATION_PATTERN.test(locationId) ||
+    PLAYER_ROOM_LOCATION_PATTERN.test(locationId);
 }
+
+const GALAXY_LOCATION_ID = 'tower-basement';
+const SEALED_LOCATIONS = new Set(['tower-token-gates']);
+const SHARDED_LOCATIONS = new Set(['tower-basement']);
+const SHARD_CAPACITY = 40;
+const SHARD_FRIEND_GRACE = 5;
+const MAX_SHARDS = 64;
+const GALAXY_MAX_RADIUS = 2600;
+const GALAXY_MIN_Y = -1400;
+const GALAXY_MAX_Y = 500;
+const GALAXY_MAX_SPEED = 110;
+const GALAXY_SPAWN = [0, 0, 14];
+const PLAYER_ROOM_PREFIX = 'player-room-';
 
 const LOCATION_MAX_RADIUS = {
   'tower-main-hall': 140,
-  'tower-token-gates': 80, // square hall, half-size 50 -> corner distance 50*sqrt(2) ~= 70.7
-  'tower-basement': 70,
+  'tower-token-gates': 80,
+  'tower-basement': GALAXY_MAX_RADIUS,
   'tower-events': 40,
   cave: 180,
   'open-world-canyon': 150,
@@ -280,6 +296,7 @@ const TELEPORT_SETTLE_TOLERANCE = 20;
 function getLocationMaxRadius(locationId) {
   if (LOCATION_MAX_RADIUS[locationId] != null) return LOCATION_MAX_RADIUS[locationId];
   if (locationId.startsWith('faction-gate-')) return 25;
+  if (locationId.startsWith(PLAYER_ROOM_PREFIX)) return 25;
   return null;
 }
 
@@ -325,11 +342,17 @@ function isValidPosition(pos, locationId) {
   if (
     typeof x !== 'number' || typeof y !== 'number' || typeof z !== 'number' ||
     isNaN(x) || isNaN(y) || isNaN(z) ||
-    !isFinite(x) || !isFinite(y) || !isFinite(z) ||
-    y < -30 || y > 50
+    !isFinite(x) || !isFinite(y) || !isFinite(z)
   ) {
     return false;
   }
+
+  if (locationId === GALAXY_LOCATION_ID) {
+    return y >= GALAXY_MIN_Y && y <= GALAXY_MAX_Y &&
+      Math.abs(x) <= GALAXY_MAX_RADIUS && Math.abs(z) <= GALAXY_MAX_RADIUS;
+  }
+
+  if (y < -30 || y > 50) return false;
 
   if (locationId === 'tower-first-floor') {
     return Math.abs(x) <= CANYON_HALF_WIDTH + 70 && z >= -50 && z <= CANYON_START_Z + CANYON_SEGMENT_LENGTH * CANYON_MAX_SEGMENT_CAP;
@@ -349,12 +372,14 @@ function isValidMovement(player, newPosition, deltaTimeMs) {
   if (player.justSpawned || player.justTeleported) {
     player.justSpawned = false;
     player.justTeleported = false;
+    if (player.locationId === GALAXY_LOCATION_ID) return true;
     return distance <= TELEPORT_SETTLE_TOLERANCE;
   }
 
   const seconds = deltaTimeMs / 1000;
   const speed = distance / seconds;
-  return speed <= CONFIG.world.maxSpeed * 1.5;
+  const limit = player.locationId === GALAXY_LOCATION_ID ? GALAXY_MAX_SPEED : CONFIG.world.maxSpeed;
+  return speed <= limit * 1.5;
 }
 
 function getHistoricalPosition(player, targetTime) {
@@ -503,6 +528,7 @@ function getPlayerZone(player) {
 
 function isInAOI(player, other) {
   if (player.locationId !== other.locationId) return false;
+  if (SHARDED_LOCATIONS.has(player.locationId) && player.instance !== other.instance) return false;
 
   if (player.locationId === 'tower-first-floor') {
     return !!(player.canyon && other.canyon && player.canyon.inHub && other.canyon.inHub);
@@ -670,8 +696,12 @@ function clearSpawnProtection(player) {
 
 function spawnInSafeZone(player, locationId) {
   const target = locationId || player.locationId;
-  if (typeof target === 'string' && target.startsWith('faction-gate-')) {
+  if (typeof target === 'string' && (target.startsWith('faction-gate-') || target.startsWith(PLAYER_ROOM_PREFIX))) {
     player.position = [0, 0, 4];
+    return;
+  }
+  if (target === GALAXY_LOCATION_ID) {
+    player.position = [...GALAXY_SPAWN];
     return;
   }
   const angle = Math.random() * Math.PI * 2;
@@ -681,17 +711,86 @@ function spawnInSafeZone(player, locationId) {
   player.position = [Math.cos(angle) * r, 0, Math.sin(angle) * r];
 }
 
-function broadcastToLocation(locationId, data, excludeId = null) {
+function broadcastToLocation(locationId, data, excludeId = null, instance = null) {
   const message = getCachedMessage(data);
   players.forEach((p, id) => {
     if (id === excludeId) return;
     if (!p.authenticated || p.ws.readyState !== WebSocket.OPEN) return;
     if (p.locationId !== locationId) return;
+    if (instance !== null && SHARDED_LOCATIONS.has(locationId) && p.instance !== instance) return;
     try {
       p.ws.send(message);
     } catch (err) {
       console.error('[!] Broadcast error:', err.message);
     }
+  });
+}
+
+function isShardedLocation(locationId) {
+  return SHARDED_LOCATIONS.has(locationId);
+}
+
+function countShardPlayers(locationId, instance) {
+  let count = 0;
+  players.forEach((p) => {
+    if (!p.authenticated) return;
+    if (p.locationId !== locationId) return;
+    if (p.instance !== instance) return;
+    count++;
+  });
+  return count;
+}
+
+function listShards(locationId) {
+  const counts = new Map();
+  players.forEach((p) => {
+    if (!p.authenticated || p.locationId !== locationId) return;
+    counts.set(p.instance, (counts.get(p.instance) || 0) + 1);
+  });
+
+  const highest = counts.size > 0 ? Math.max(...counts.keys()) : 1;
+  const shards = [];
+  for (let i = 1; i <= Math.max(1, highest); i++) {
+    shards.push({ instance: i, count: counts.get(i) || 0 });
+  }
+  return shards;
+}
+
+function pickShard(locationId, requestedInstance) {
+  if (Number.isInteger(requestedInstance) && requestedInstance >= 1 && requestedInstance <= MAX_SHARDS) {
+    const occupancy = countShardPlayers(locationId, requestedInstance);
+    if (occupancy < SHARD_CAPACITY + SHARD_FRIEND_GRACE) return requestedInstance;
+  }
+
+  for (let i = 1; i <= MAX_SHARDS; i++) {
+    if (countShardPlayers(locationId, i) < SHARD_CAPACITY) return i;
+  }
+  return MAX_SHARDS;
+}
+
+function sendShardState(player) {
+  if (!isShardedLocation(player.locationId)) return;
+  safeSend(player.ws, {
+    type: 'shardState',
+    locationId: player.locationId,
+    instance: player.instance,
+    capacity: SHARD_CAPACITY,
+    shards: listShards(player.locationId),
+  });
+}
+
+function broadcastShardState(locationId) {
+  if (!isShardedLocation(locationId)) return;
+  const shards = listShards(locationId);
+  players.forEach((p) => {
+    if (!p.authenticated || p.locationId !== locationId) return;
+    safeSend(p.ws, {
+      type: 'shardState',
+      locationId,
+      instance: p.instance,
+      capacity: SHARD_CAPACITY,
+      shards,
+    });
   });
 }
 
@@ -1093,30 +1192,10 @@ safeInterval(() => {
   }
 }, 30000);
 
-const TOTAL_GATE_SLOTS = 22;
-const GATE_SUBSET_REFRESH_MS = 8 * 60 * 1000;
-
-function hashString(input) {
-  let hash = 2166136261;
-  for (let i = 0; i < input.length; i++) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0;
-}
-
-function selectDisplayedGates(allGates, slotCount) {
-  if (allGates.length <= slotCount) return allGates;
-  const windowIndex = Math.floor(Date.now() / GATE_SUBSET_REFRESH_MS);
-  return allGates
-    .map((g) => ({ gate: g, rank: hashString(g.factionId + ':' + windowIndex) }))
-    .sort((a, b) => a.rank - b.rank)
-    .slice(0, slotCount)
-    .map((entry) => entry.gate);
-}
-
 let factionGatesList = [];
 let displayedFactionGatesList = [];
+let accountCount = 0;
+let lastBroadcastAccountCount = -1;
 
 async function refreshFactionGates() {
   const result = await callInternalApi('/api/internal/game/faction/gates-list', {}).catch((err) => {
@@ -1126,16 +1205,26 @@ async function refreshFactionGates() {
   if (result?.success && Array.isArray(result.gates)) {
     factionGatesList = result.gates;
   }
+  if (typeof result?.accountCount === 'number') {
+    accountCount = result.accountCount;
+  }
 
-  const nextDisplayed = selectDisplayedGates(factionGatesList, TOTAL_GATE_SLOTS);
   const prevIds = new Set(displayedFactionGatesList.map((g) => g.factionId));
-  const nextIds = new Set(nextDisplayed.map((g) => g.factionId));
-  const changed = prevIds.size !== nextIds.size || Array.from(prevIds).some((id) => !nextIds.has(id));
+  const nextIds = new Set(factionGatesList.map((g) => g.factionId));
+  const changed =
+    prevIds.size !== nextIds.size ||
+    Array.from(prevIds).some((id) => !nextIds.has(id)) ||
+    accountCount !== lastBroadcastAccountCount;
 
-  displayedFactionGatesList = nextDisplayed;
+  displayedFactionGatesList = factionGatesList;
 
   if (changed) {
-    broadcastToLocation('tower-token-gates', { type: 'factionGatesState', gates: displayedFactionGatesList });
+    lastBroadcastAccountCount = accountCount;
+    broadcastToLocation(GALAXY_LOCATION_ID, {
+      type: 'factionGatesState',
+      gates: displayedFactionGatesList,
+      accountCount,
+    });
   }
 }
 
@@ -1678,6 +1767,7 @@ wss.on('connection', (ws) => {
     velocityY: 0,
     lastJump: 0,
     locationId: 'tower-main-hall',
+    instance: 1,
     ws,
     authenticated: false,
     lastSeen: Date.now(),
@@ -2006,6 +2096,9 @@ wss.on('connection', (ws) => {
     if (player.authenticated) {
       notifyAOILeave(player);
       broadcastCount();
+      if (isShardedLocation(player.locationId)) {
+        broadcastShardState(player.locationId);
+      }
     }
   });
 
@@ -2080,9 +2173,16 @@ wss.on('connection', (ws) => {
         player.position = savedProgress.progress.position || [0, 0, 0];
         player.rotation = savedProgress.progress.rotation || 0;
         player.health = savedProgress.progress.health || 100;
-        player.locationId = isKnownLocationId(savedProgress.progress.locationId)
-          ? savedProgress.progress.locationId
-          : 'tower-main-hall';
+        const savedLocation = savedProgress.progress.locationId;
+        if (isKnownLocationId(savedLocation) && !SEALED_LOCATIONS.has(savedLocation)) {
+          player.locationId = savedLocation;
+        } else {
+          player.locationId = 'tower-main-hall';
+          spawnInSafeZone(player, player.locationId);
+        }
+        if (isShardedLocation(player.locationId)) {
+          player.instance = pickShard(player.locationId, null);
+        }
       } else {
         spawnInSafeZone(player);
       }
@@ -2234,8 +2334,9 @@ wss.on('connection', (ws) => {
       enterCanyonHub(player);
     }
 
-    if (player.locationId === 'tower-token-gates') {
-      safeSend(ws, { type: 'factionGatesState', gates: displayedFactionGatesList });
+    if (player.locationId === GALAXY_LOCATION_ID) {
+      safeSend(ws, { type: 'factionGatesState', gates: displayedFactionGatesList, accountCount });
+      sendShardState(player);
     }
 
     if (typeof player.locationId === 'string' && player.locationId.startsWith(FACTION_ROOM_PREFIX)) {
@@ -4550,8 +4651,42 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (SEALED_LOCATIONS.has(data.locationId)) {
+      safeSend(player.ws, { type: 'error', message: 'That place is sealed for now.' });
+      return;
+    }
+
     const oldLocation = player.locationId;
-    if (oldLocation === data.locationId) return;
+    if (oldLocation === data.locationId) {
+      if (!isShardedLocation(oldLocation)) return;
+      const requested = Number.isInteger(data.instance) ? data.instance : null;
+      if (requested === null || requested === player.instance) return;
+
+      const target = pickShard(oldLocation, requested);
+      if (target === player.instance) return;
+
+      for (const id of player.aoiNeighbors) {
+        const other = players.get(id);
+        safeSend(player.ws, { type: 'playerLeave', playerId: id });
+        if (other) {
+          safeSend(other.ws, { type: 'playerLeave', playerId: player.id });
+          other.aoiNeighbors.delete(player.id);
+        }
+      }
+      player.aoiNeighbors.clear();
+
+      player.instance = target;
+      spawnInSafeZone(player, oldLocation);
+      player.justTeleported = true;
+      grantSpawnProtection(player);
+      player.positionHistory = [];
+      player.recentShots = [];
+
+      safeSend(player.ws, { type: 'shardTeleport', position: player.position, instance: target });
+      recomputeAOI(player);
+      broadcastShardState(oldLocation);
+      return;
+    }
 
     const now = Date.now();
     const sinceLast = now - player.lastLocationChangeAt;
@@ -4569,13 +4704,35 @@ wss.on('connection', (ws) => {
     }
     player.lastLocationChangeAt = now;
 
+    if (data.locationId.startsWith(PLAYER_ROOM_PREFIX) || data.locationId.startsWith(FACTION_ROOM_PREFIX)) {
+      const verdict = await callInternalApi('/api/internal/game/room/can-enter', {
+        userId: player.userId,
+        locationId: data.locationId,
+      }).catch((err) => {
+        console.error('[RoomAccess] check error:', err.message);
+        return null;
+      });
+
+      if (!verdict || verdict.allowed !== true) {
+        safeSend(player.ws, {
+          type: 'error',
+          message: verdict?.reason || 'You cannot enter that room.',
+        });
+        return;
+      }
+    }
+
     if (oldLocation === 'tower-first-floor' && player.canyon) {
       player.canyon.enemies.clear();
       player.canyon.pendingSegment = null;
       clearCanyonLoot(player);
     }
 
+    const previousInstance = player.instance;
     player.locationId = data.locationId;
+    player.instance = isShardedLocation(data.locationId)
+      ? pickShard(data.locationId, Number.isInteger(data.instance) ? data.instance : null)
+      : 1;
 
     if (player.locationId === 'tower-main-hall' && player.weaponEquipped) {
       player.weaponEquipped = false;
@@ -4590,6 +4747,15 @@ wss.on('connection', (ws) => {
 
     notifyLocationTransition(player, oldLocation, data.locationId);
 
+    if (isShardedLocation(oldLocation) && oldLocation !== data.locationId) {
+      broadcastShardState(oldLocation);
+    }
+    if (isShardedLocation(data.locationId)) {
+      broadcastShardState(data.locationId);
+    } else if (isShardedLocation(oldLocation) && oldLocation === data.locationId && previousInstance !== player.instance) {
+      broadcastShardState(oldLocation);
+    }
+
     if (data.locationId === 'main-world') {
       safeSend(ws, { type: 'lootState', loot: serializeLoot() });
       await ensureSignsLoaded(player.gameId);
@@ -4600,8 +4766,8 @@ wss.on('connection', (ws) => {
       enterCanyonHub(player);
     }
 
-    if (data.locationId === 'tower-token-gates') {
-      safeSend(ws, { type: 'factionGatesState', gates: displayedFactionGatesList });
+    if (data.locationId === GALAXY_LOCATION_ID) {
+      safeSend(ws, { type: 'factionGatesState', gates: displayedFactionGatesList, accountCount });
     }
 
     if (data.locationId.startsWith(FACTION_ROOM_PREFIX)) {
