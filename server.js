@@ -1475,6 +1475,41 @@ safeInterval(() => {
   }
 }, 30000);
 
+const INTERNAL_HTTP_AGENT = new http.Agent({ keepAlive: true, maxSockets: 24, keepAliveMsecs: 15000 });
+const INTERNAL_HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 24, keepAliveMsecs: 15000 });
+
+const internalCache = new Map();
+
+function cachedInternalCall(key, ttlMs, factory) {
+  const now = Date.now();
+  const entry = internalCache.get(key);
+
+  if (entry) {
+    if (entry.pending) return entry.pending;
+    if (now - entry.at < ttlMs) return Promise.resolve(entry.value);
+  }
+
+  const pending = factory()
+    .then((value) => {
+      internalCache.set(key, { value, at: Date.now(), pending: null });
+      return value;
+    })
+    .catch((err) => {
+      internalCache.delete(key);
+      throw err;
+    });
+
+  internalCache.set(key, { value: entry?.value ?? null, at: entry?.at ?? 0, pending });
+  return pending;
+}
+
+safeInterval(() => {
+  const now = Date.now();
+  internalCache.forEach((entry, key) => {
+    if (!entry.pending && now - entry.at > 60000) internalCache.delete(key);
+  });
+}, 60000);
+
 async function callInternalApi(endpoint, data) {
   if (!CONFIG.internalSecret) {
     console.warn('[Internal] INTERNAL_API_SECRET not set, skipping:', endpoint);
@@ -1498,6 +1533,7 @@ async function callInternalApi(endpoint, data) {
         'Content-Length': Buffer.byteLength(postData),
         'X-Internal-Secret': CONFIG.internalSecret,
       },
+      agent: isHttps ? INTERNAL_HTTPS_AGENT : INTERNAL_HTTP_AGENT,
     };
 
     const req = lib.request(options, (res) => {
@@ -3093,9 +3129,11 @@ wss.on('connection', (ws) => {
   async function handleLeaderboardRequest(player, data) {
     const limit = Number.isInteger(data.limit) && data.limit > 0 ? data.limit : 20;
 
-    const result = await callInternalApi('/api/internal/game/leaderboard', {
-      gameId: player.gameId, limit,
-    }).catch((err) => {
+    const result = await cachedInternalCall(
+      `leaderboard:${player.gameId}:${limit}`,
+      5000,
+      () => callInternalApi('/api/internal/game/leaderboard', { gameId: player.gameId, limit })
+    ).catch((err) => {
       console.error('[Leaderboard] request error:', err.message);
       return null;
     });
@@ -3106,9 +3144,11 @@ wss.on('connection', (ws) => {
   async function handleFactionLeaderboardRequest(player, data) {
     const limit = Number.isInteger(data.limit) && data.limit > 0 ? data.limit : 50;
 
-    const result = await callInternalApi('/api/internal/game/faction/leaderboard', {
-      gameId: player.gameId, limit,
-    }).catch((err) => {
+    const result = await cachedInternalCall(
+      `factionLeaderboard:${player.gameId}:${limit}`,
+      5000,
+      () => callInternalApi('/api/internal/game/faction/leaderboard', { gameId: player.gameId, limit })
+    ).catch((err) => {
       console.error('[Faction] leaderboard request error:', err.message);
       return null;
     });
@@ -3379,9 +3419,13 @@ wss.on('connection', (ws) => {
   }
 
   async function handleFactionQuestListRequest(player) {
-    const result = await callInternalApi('/api/internal/game/faction/quest/list', {
-      gameId: player.gameId, viewerUserId: player.userId, limit: 50,
-    }).catch((err) => {
+    const result = await cachedInternalCall(
+      `factionQuests:${player.gameId}:${player.userId}`,
+      5000,
+      () => callInternalApi('/api/internal/game/faction/quest/list', {
+        gameId: player.gameId, viewerUserId: player.userId, limit: 50,
+      })
+    ).catch((err) => {
       console.error('[FactionQuest] list error:', err.message);
       return null;
     });
