@@ -30,6 +30,11 @@ const COSMETIC_SLOTS = {
 };
 const COSMETIC_PRICE_ASH = 1;
 
+const INTERNAL_HTTP_AGENT = new http.Agent({ keepAlive: true, maxSockets: 24, keepAliveMsecs: 15000 });
+const INTERNAL_HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 24, keepAliveMsecs: 15000 });
+
+const internalCache = new Map();
+
 const CONFIG = {
   world: {
     size: 1000,
@@ -1474,11 +1479,6 @@ safeInterval(() => {
     }
   }
 }, 30000);
-
-const INTERNAL_HTTP_AGENT = new http.Agent({ keepAlive: true, maxSockets: 24, keepAliveMsecs: 15000 });
-const INTERNAL_HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 24, keepAliveMsecs: 15000 });
-
-const internalCache = new Map();
 
 function cachedInternalCall(key, ttlMs, factory) {
   const now = Date.now();
@@ -2997,6 +2997,8 @@ wss.on('connection', (ws) => {
 
     await refreshPlayerFactions(player);
     safeSend(player.ws, { type: 'factionJoined', faction: result.faction });
+    broadcastFactionIdentity(player);
+    notifyFactionRosterChanged(data.factionId);
   }
 
   async function handleFactionInvite(player, data) {
@@ -3037,6 +3039,8 @@ wss.on('connection', (ws) => {
 
     await refreshPlayerFactions(player);
     safeSend(player.ws, { type: 'factionLeft', factionId: data.factionId });
+    broadcastFactionIdentity(player);
+    notifyFactionRosterChanged(data.factionId);
   }
 
   async function handleFactionSetDisplayed(player, data) {
@@ -3058,6 +3062,7 @@ wss.on('connection', (ws) => {
 
     await refreshPlayerFactions(player);
     safeSend(player.ws, { type: 'factionDisplayedSet', faction: result.faction });
+    broadcastFactionIdentity(player);
   }
 
   async function handleFactionMyListRequest(player) {
@@ -3164,6 +3169,35 @@ wss.on('connection', (ws) => {
     player.displayedFactionSymbol = displayed?.symbol || null;
     player.displayedFactionImage = displayed?.image || null;
     player.isFactionCreator = player.factions.some((f) => f.verifiedCreatorWallet === player.wallet);
+  }
+
+  function broadcastFactionIdentity(player) {
+    broadcast({
+      type: 'playerFactionIdentity',
+      id: player.id,
+      factionSymbol: player.displayedFactionSymbol,
+      factionImage: player.displayedFactionImage,
+      isFactionCreator: player.isFactionCreator,
+    }, player.id, true, player);
+  }
+
+  function notifyFactionRosterChanged(factionId) {
+    if (!factionId) return;
+
+    internalCache.forEach((entry, key) => {
+      if (entry.pending) return;
+      if (key.startsWith('factionLeaderboard:') || key.startsWith('factionQuests:')) internalCache.delete(key);
+    });
+
+    players.forEach((p) => {
+      if (!p.authenticated || p.ws.readyState !== WebSocket.OPEN) return;
+
+      const isMember = !!p.factions?.some((f) => f.id === factionId);
+      const showsBoards = p.locationId === 'tower-main-hall';
+      if (!isMember && !showsBoards) return;
+
+      safeSend(p.ws, { type: 'factionRosterChanged', factionId, mine: isMember });
+    });
   }
 
   async function refreshPlayerFactions(player) {
