@@ -299,7 +299,7 @@ const MAIN_WORLD_SAFE_RADIUS = 34;
 const MIN_LOCATION_CHANGE_INTERVAL_MS = 1000;
 const SPAWN_PROTECTION_MS = 5000;
 const CLIENT_READY_TIMEOUT_MS = 25000;
-const TELEPORT_SETTLE_TOLERANCE = 20;
+const TELEPORT_SETTLE_MS = 4000;
 
 function getLocationMaxRadius(locationId) {
   if (LOCATION_MAX_RADIUS[locationId] != null) return LOCATION_MAX_RADIUS[locationId];
@@ -382,11 +382,10 @@ function isValidMovement(player, newPosition, deltaTimeMs) {
   const dz = nz - oz;
   const distance = Math.sqrt(dx * dx + dz * dz);
 
-  if (player.justSpawned || player.justTeleported) {
+  if (player.justSpawned || player.justTeleported || Date.now() < (player.teleportSettleUntil || 0)) {
     player.justSpawned = false;
     player.justTeleported = false;
-    if (player.locationId === GALAXY_LOCATION_ID) return true;
-    return distance <= TELEPORT_SETTLE_TOLERANCE;
+    return true;
   }
 
   const seconds = deltaTimeMs / 1000;
@@ -920,6 +919,7 @@ function populateCanyonSegment(player, segment) {
   preparePlayerEnemiesForSegment(player, segment);
   player.position = canyonSegmentEntrancePosition(segment);
   player.justTeleported = true;
+  player.teleportSettleUntil = Date.now() + TELEPORT_SETTLE_MS;
   grantSpawnProtection(player);
 
   safeSend(player.ws, {
@@ -939,6 +939,7 @@ function enterCanyonHub(player) {
   clearCanyonLoot(player);
   player.position = [...CANYON_HUB_POSITION];
   player.justTeleported = true;
+  player.teleportSettleUntil = Date.now() + TELEPORT_SETTLE_MS;
   grantSpawnProtection(player);
 
   safeSend(player.ws, {
@@ -1025,6 +1026,7 @@ function respawnPlayer(target) {
     }
   }
   target.justTeleported = true;
+  target.teleportSettleUntil = Date.now() + TELEPORT_SETTLE_MS;
   grantSpawnProtection(target);
 
   safeSend(target.ws, {
@@ -1852,6 +1854,7 @@ wss.on('connection', (ws) => {
     lastUpdate: 0,
     justSpawned: false,
     justTeleported: false,
+    teleportSettleUntil: 0,
     lastLocationChangeAt: 0,
     pendingLocationChange: null,
     invulnerableUntil: 0,
@@ -2365,6 +2368,7 @@ wss.on('connection', (ws) => {
     player.blockedUserIds = new Set((blocksResult?.blocked || []).map((b) => b.userId));
 
     player.justSpawned = true;
+    player.teleportSettleUntil = Date.now() + TELEPORT_SETTLE_MS;
 
     player.authenticated = true;
     setPlayerLoading(player);
@@ -4805,6 +4809,7 @@ wss.on('connection', (ws) => {
       player.instance = target;
       spawnInSafeZone(player, oldLocation);
       player.justTeleported = true;
+      player.teleportSettleUntil = Date.now() + TELEPORT_SETTLE_MS;
       grantSpawnProtection(player);
       player.positionHistory = [];
       player.recentShots = [];
@@ -4868,6 +4873,7 @@ wss.on('connection', (ws) => {
 
     spawnInSafeZone(player, data.locationId);
     player.justTeleported = true;
+    player.teleportSettleUntil = Date.now() + TELEPORT_SETTLE_MS;
     grantSpawnProtection(player);
     player.positionHistory = [];
     player.recentShots = [];
