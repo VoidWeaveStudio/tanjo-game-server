@@ -289,8 +289,11 @@ const LOCATION_MAX_RADIUS = {
   cave: 180,
   'open-world-canyon': 150,
 };
+const MAIN_WORLD_LIMIT = 480;
+const MAIN_WORLD_SAFE_RADIUS = 34;
 const MIN_LOCATION_CHANGE_INTERVAL_MS = 1000;
 const SPAWN_PROTECTION_MS = 5000;
+const CLIENT_READY_TIMEOUT_MS = 25000;
 const TELEPORT_SETTLE_TOLERANCE = 20;
 
 function getLocationMaxRadius(locationId) {
@@ -350,6 +353,11 @@ function isValidPosition(pos, locationId) {
   if (locationId === GALAXY_LOCATION_ID) {
     return y >= GALAXY_MIN_Y && y <= GALAXY_MAX_Y &&
       Math.abs(x) <= GALAXY_MAX_RADIUS && Math.abs(z) <= GALAXY_MAX_RADIUS;
+  }
+
+  if (locationId === 'main-world') {
+    if (y < -30 || y > 90) return false;
+    return Math.abs(x) <= MAIN_WORLD_LIMIT && Math.abs(z) <= MAIN_WORLD_LIMIT;
   }
 
   if (y < -30 || y > 50) return false;
@@ -582,8 +590,8 @@ function recomputeAOI(player) {
     if (oldNeighbors.has(id)) continue;
     const other = players.get(id);
     if (!other) continue;
-    safeSend(player.ws, buildPlayerJoinPayload(other));
-    safeSend(other.ws, buildPlayerJoinPayload(player));
+    if (other.ready) safeSend(player.ws, buildPlayerJoinPayload(other));
+    if (player.ready) safeSend(other.ws, buildPlayerJoinPayload(player));
     other.aoiNeighbors.add(player.id);
   }
 
@@ -630,7 +638,7 @@ function notifyLocationTransition(player, oldLocationId, newLocationId) {
     if (!isInAOI(player, other)) return;
     player.aoiNeighbors.add(id);
     other.aoiNeighbors.add(player.id);
-    safeSend(other.ws, {
+    if (player.ready) safeSend(other.ws, {
       type: 'playerJoinLocation',
       id: player.id,
       nickname: player.nickname,
@@ -653,7 +661,7 @@ function notifyLocationTransition(player, oldLocationId, newLocationId) {
       cosmeticSkinId: player.cosmeticSkinId || null,
       cosmeticAccessoryId: player.cosmeticAccessoryId || null,
     });
-    safeSend(player.ws, {
+    if (other.ready) safeSend(player.ws, {
       type: 'playerJoinLocation',
       id: other.id,
       nickname: other.nickname,
@@ -677,6 +685,37 @@ function notifyLocationTransition(player, oldLocationId, newLocationId) {
       cosmeticAccessoryId: other.cosmeticAccessoryId || null,
     });
   });
+}
+
+function setPlayerLoading(player) {
+  player.ready = false;
+  if (player.readyTimer) clearTimeout(player.readyTimer);
+  player.readyTimer = setTimeout(() => markPlayerReady(player), CLIENT_READY_TIMEOUT_MS);
+}
+
+function markPlayerReady(player) {
+  if (player.readyTimer) {
+    clearTimeout(player.readyTimer);
+    player.readyTimer = null;
+  }
+  if (player.ready || !player.authenticated) return;
+
+  player.ready = true;
+
+  for (const id of player.aoiNeighbors) {
+    const other = players.get(id);
+    if (!other) continue;
+    safeSend(other.ws, buildPlayerJoinPayload(player));
+  }
+}
+
+function isInProtectedZone(player) {
+  if (player.locationId === 'tower-main-hall') return true;
+  if (player.locationId === 'main-world') {
+    const [x, , z] = player.position;
+    return Math.sqrt(x * x + z * z) <= MAIN_WORLD_SAFE_RADIUS;
+  }
+  return false;
 }
 
 function isSpawnProtected(player) {
@@ -1780,6 +1819,8 @@ wss.on('connection', (ws) => {
     lastLocationChangeAt: 0,
     pendingLocationChange: null,
     invulnerableUntil: 0,
+    ready: false,
+    readyTimer: null,
     aoiNeighbors: new Set(),
     weaponAmmo: WEAPON_CONFIG.maxAmmo,
     lastShotAt: 0,
@@ -2002,6 +2043,7 @@ wss.on('connection', (ws) => {
         case 'voiceIceCandidate': handleVoiceIceCandidate(player, data); break;
         case 'saveProgress': handleSaveProgress(player); break;
         case 'locationChange': handleLocationChange(player, data); break;
+        case 'clientReady': markPlayerReady(player); break;
         case 'emote': handleEmote(player, data); break;
         case 'cosmeticListRequest': handleCosmeticListRequest(player); break;
         case 'cosmeticBuy': handleCosmeticBuy(player, data); break;
@@ -2067,6 +2109,11 @@ wss.on('connection', (ws) => {
     if (player.pendingLocationChange) {
       clearTimeout(player.pendingLocationChange);
       player.pendingLocationChange = null;
+    }
+
+    if (player.readyTimer) {
+      clearTimeout(player.readyTimer);
+      player.readyTimer = null;
     }
 
     if (player.authenticated) {
@@ -2282,8 +2329,9 @@ wss.on('connection', (ws) => {
     player.blockedUserIds = new Set((blocksResult?.blocked || []).map((b) => b.userId));
 
     player.justSpawned = true;
- 
+
     player.authenticated = true;
+    setPlayerLoading(player);
     players.set(playerId, player);
 
     console.log(`[+] Authenticated: ${playerId} (${player.userId}, ${player.nickname}, loc:${player.locationId}). Total: ${players.size}`);
@@ -2292,8 +2340,8 @@ wss.on('connection', (ws) => {
     players.forEach((p, id) => {
       if (id !== playerId && p.authenticated) {
         if (isInAOI(player, p)) {
-          existingPlayers.push(buildPlayerJoinPayload(p));
-       
+          if (p.ready) existingPlayers.push(buildPlayerJoinPayload(p));
+
           player.aoiNeighbors.add(id);
           p.aoiNeighbors.add(playerId);
         }
@@ -2371,8 +2419,6 @@ wss.on('connection', (ws) => {
       }
     }
 
-    broadcast(buildPlayerJoinPayload(player), playerId, true, player);
-
     broadcastCount();
   }
 
@@ -2419,6 +2465,8 @@ wss.on('connection', (ws) => {
     player.lastUpdate = now;
 
     recomputeAOI(player);
+
+    if (!player.ready) return;
 
     broadcast({
       type: 'playerUpdate',
@@ -2468,8 +2516,9 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if (oy < 0 || oy > 5) {
-      console.log(`[!] Shoot hack: invalid origin Y=${oy.toFixed(2)}`);
+    const playerY = player.position[1];
+    if (oy < playerY - 3 || oy > playerY + 5) {
+      console.log(`[!] Shoot hack: invalid origin Y=${oy.toFixed(2)} at player Y=${playerY.toFixed(2)}`);
       return;
     }
 
@@ -2477,7 +2526,7 @@ wss.on('connection', (ws) => {
     if (dirLength < 0.001) return;
     const direction = [dx / dirLength, dy / dirLength, dz / dirLength];
 
-    if (player.locationId === 'tower-main-hall') {
+    if (isInProtectedZone(player)) {
       safeSend(ws, { type: 'error', message: 'Cannot shoot in safe zone' });
       return;
     }
@@ -2693,7 +2742,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if (player.locationId === 'tower-main-hall') {
+    if (isInProtectedZone(player) || isInProtectedZone(target)) {
       return;
     }
 
@@ -4745,6 +4794,7 @@ wss.on('connection', (ws) => {
     player.positionHistory = [];
     player.recentShots = [];
 
+    setPlayerLoading(player);
     notifyLocationTransition(player, oldLocation, data.locationId);
 
     if (isShardedLocation(oldLocation) && oldLocation !== data.locationId) {
