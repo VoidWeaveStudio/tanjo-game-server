@@ -17,7 +17,7 @@ const {
 } = require('./factionQuests');
 
 const PORT = process.env.PORT || 3001;
-const MAX_PLAYERS = 100;
+const MAX_CONNECTIONS = 2000;
 
 const EMOTE_KEYS = ['laugh', 'fuck_you', 'angry', 'to_the_moon', 'green_candle'];
 
@@ -38,7 +38,7 @@ const internalCache = new Map();
 const CONFIG = {
   world: {
     size: 1000,
-    zoneSize: 100,
+    zoneSize: 50,
     aoiRadius: 2,
     maxSpeed: 15,
     maxPositionUpdateRate: 50,
@@ -237,6 +237,8 @@ const wss = new WebSocket.Server({
 });
 
 const players = new Map();
+const zoneBuckets = new Map();
+const AOI_RADIUS_OVERRIDES = { 'tower-basement': 8 };
 const userIdToPlayer = new Map();
 const walletToPlayer = new Map();
 const rateLimits = new Map();
@@ -275,8 +277,8 @@ function isKnownLocationId(locationId) {
 
 const GALAXY_LOCATION_ID = 'tower-basement';
 const SEALED_LOCATIONS = new Set(['tower-token-gates']);
-const SHARDED_LOCATIONS = new Set(['tower-basement']);
-const SHARD_CAPACITY = 40;
+const PRIVATE_LOCATION_PREFIXES = ['faction-gate-', 'player-room-'];
+const SHARD_CAPACITY = 50;
 const SHARD_FRIEND_GRACE = 5;
 const MAX_SHARDS = 64;
 const GALAXY_MAX_RADIUS = 2600;
@@ -291,9 +293,33 @@ const LOCATION_MAX_RADIUS = {
   'tower-token-gates': 80,
   'tower-basement': GALAXY_MAX_RADIUS,
   'tower-events': 40,
-  cave: 180,
+  cave: 235,
   'open-world-canyon': 150,
 };
+const CAVE_LOCATION_ID = 'cave';
+const CAVE_CHEST_REWARD = 1000;
+const CAVE_CHEST_COOLDOWN_MS = 60 * 60 * 1000;
+const CAVE_CHEST_REACH = 5;
+const CAVE_CHESTS = {
+  crack: [-93, 0, -33],
+  lever: [89, 0, -51],
+  vault: [0, 0, -180],
+};
+const CAVE_BOSS_SPAWN = [0, 0, -132];
+const CAVE_ENEMY_SPAWNS = [
+  { type: 'voidling', position: [0, 0, -46] },
+  { type: 'voidling', position: [-8, 0, -52] },
+  { type: 'voidling', position: [-54, 0, -72] },
+  { type: 'husk', position: [-48, 0, -66] },
+  { type: 'voidling', position: [50, 0, -78] },
+  { type: 'husk', position: [44, 0, -84] },
+  { type: 'husk', position: [-14, 0, -120] },
+  { type: 'husk', position: [16, 0, -124] },
+  { type: 'voidling', position: [-72, 0, -44] },
+  { type: 'voidling', position: [70, 0, -60] },
+];
+
+const SNAPSHOT_INTERVAL_MS = 80;
 const MAIN_WORLD_LIMIT = 480;
 const MAIN_WORLD_SAFE_RADIUS = 34;
 const MIN_LOCATION_CHANGE_INTERVAL_MS = 1000;
@@ -531,26 +557,91 @@ function safeInterval(fn, ms) {
   }, ms);
 }
 
-function getPlayerZone(player) {
-  const halfSize = CONFIG.world.size / 2;
-  const zoneX = Math.floor((player.position[0] + halfSize) / CONFIG.world.zoneSize);
-  const zoneZ = Math.floor((player.position[2] + halfSize) / CONFIG.world.zoneSize);
-  return { zoneX, zoneZ };
+function zoneIndex(value) {
+  return Math.floor((value + CONFIG.world.size / 2) / CONFIG.world.zoneSize);
+}
+
+function aoiRadiusFor(locationId) {
+  return AOI_RADIUS_OVERRIDES[locationId] ?? CONFIG.world.aoiRadius;
+}
+
+function zoneKeyFor(player) {
+  return `${player.locationId}|${player.instance}|${zoneIndex(player.position[0])}|${zoneIndex(player.position[2])}`;
+}
+
+function removePlayerZone(player) {
+  if (!player.zoneKey) return;
+  const bucket = zoneBuckets.get(player.zoneKey);
+  if (bucket) {
+    bucket.delete(player.id);
+    if (bucket.size === 0) zoneBuckets.delete(player.zoneKey);
+  }
+  player.zoneKey = null;
+}
+
+function updatePlayerZone(player) {
+  const key = zoneKeyFor(player);
+  if (key === player.zoneKey) return false;
+
+  removePlayerZone(player);
+
+  let bucket = zoneBuckets.get(key);
+  if (!bucket) {
+    bucket = new Set();
+    zoneBuckets.set(key, bucket);
+  }
+  bucket.add(player.id);
+  player.zoneKey = key;
+  return true;
+}
+
+function forEachNearbyPlayer(player, fn) {
+  const zx = zoneIndex(player.position[0]);
+  const zz = zoneIndex(player.position[2]);
+  const radius = aoiRadiusFor(player.locationId);
+
+  for (let dx = -radius; dx <= radius; dx++) {
+    for (let dz = -radius; dz <= radius; dz++) {
+      const bucket = zoneBuckets.get(`${player.locationId}|${player.instance}|${zx + dx}|${zz + dz}`);
+      if (!bucket) continue;
+
+      for (const id of bucket) {
+        if (id === player.id) continue;
+        const other = players.get(id);
+        if (other && other.authenticated && other.ws.readyState === WebSocket.OPEN) fn(other);
+      }
+    }
+  }
 }
 
 function isInAOI(player, other) {
   if (player.locationId !== other.locationId) return false;
-  if (SHARDED_LOCATIONS.has(player.locationId) && player.instance !== other.instance) return false;
+  if (player.instance !== other.instance && isShardedLocation(player.locationId)) return false;
 
   if (player.locationId === 'tower-first-floor') {
     return !!(player.canyon && other.canyon && player.canyon.inHub && other.canyon.inHub);
   }
 
-  const pZone = getPlayerZone(player);
-  const oZone = getPlayerZone(other);
-  const dx = Math.abs(pZone.zoneX - oZone.zoneX);
-  const dz = Math.abs(pZone.zoneZ - oZone.zoneZ);
-  return dx <= CONFIG.world.aoiRadius && dz <= CONFIG.world.aoiRadius;
+  const radius = aoiRadiusFor(player.locationId);
+  const dx = Math.abs(zoneIndex(player.position[0]) - zoneIndex(other.position[0]));
+  const dz = Math.abs(zoneIndex(player.position[2]) - zoneIndex(other.position[2]));
+  return dx <= radius && dz <= radius;
+}
+
+function buildPlayerStatePayload(p) {
+  return {
+    id: p.id,
+    position: p.position,
+    rotation: p.rotation,
+    pitch: p.pitch,
+    state: p.state,
+    jumping: p.jumping,
+    velocityY: p.velocityY,
+    health: p.health,
+    alive: p.alive,
+    weaponEquipped: p.weaponEquipped,
+    isShooting: p.isShooting,
+  };
 }
 
 function buildPlayerJoinPayload(p) {
@@ -580,12 +671,12 @@ function buildPlayerJoinPayload(p) {
 }
 
 function recomputeAOI(player) {
+  updatePlayerZone(player);
+
   const newNeighbors = new Set();
 
-  players.forEach((other, id) => {
-    if (id === player.id) return;
-    if (!other.authenticated || other.ws.readyState !== WebSocket.OPEN) return;
-    if (isInAOI(player, other)) newNeighbors.add(id);
+  forEachNearbyPlayer(player, (other) => {
+    if (isInAOI(player, other)) newNeighbors.add(other.id);
   });
 
   const oldNeighbors = player.aoiNeighbors;
@@ -637,8 +728,10 @@ function notifyLocationTransition(player, oldLocationId, newLocationId) {
     });
   }
 
-  players.forEach((other, id) => {
-    if (id === player.id || !other.authenticated) return;
+  updatePlayerZone(player);
+
+  forEachNearbyPlayer(player, (other) => {
+    const id = other.id;
     if (!isInAOI(player, other)) return;
     player.aoiNeighbors.add(id);
     other.aoiNeighbors.add(player.id);
@@ -747,6 +840,10 @@ function spawnInSafeZone(player, locationId) {
     player.position = [...GALAXY_SPAWN];
     return;
   }
+  if (target === CAVE_LOCATION_ID) {
+    player.position = [0, 0, 2];
+    return;
+  }
   const angle = Math.random() * Math.PI * 2;
   const maxRadius = getLocationMaxRadius(target);
   const spread = maxRadius == null ? 25 : Math.min(25, Math.max(0, maxRadius - 6));
@@ -760,7 +857,7 @@ function broadcastToLocation(locationId, data, excludeId = null, instance = null
     if (id === excludeId) return;
     if (!p.authenticated || p.ws.readyState !== WebSocket.OPEN) return;
     if (p.locationId !== locationId) return;
-    if (instance !== null && SHARDED_LOCATIONS.has(locationId) && p.instance !== instance) return;
+    if (instance !== null && p.instance !== instance && isShardedLocation(locationId)) return;
     try {
       p.ws.send(message);
     } catch (err) {
@@ -770,26 +867,25 @@ function broadcastToLocation(locationId, data, excludeId = null, instance = null
 }
 
 function isShardedLocation(locationId) {
-  return SHARDED_LOCATIONS.has(locationId);
+  if (typeof locationId !== 'string') return false;
+  return !PRIVATE_LOCATION_PREFIXES.some((prefix) => locationId.startsWith(prefix));
 }
 
-function countShardPlayers(locationId, instance) {
-  let count = 0;
-  players.forEach((p) => {
-    if (!p.authenticated) return;
-    if (p.locationId !== locationId) return;
-    if (p.instance !== instance) return;
-    count++;
-  });
-  return count;
-}
-
-function listShards(locationId) {
+function shardOccupancy(locationId) {
   const counts = new Map();
   players.forEach((p) => {
     if (!p.authenticated || p.locationId !== locationId) return;
     counts.set(p.instance, (counts.get(p.instance) || 0) + 1);
   });
+  return counts;
+}
+
+function countShardPlayers(locationId, instance) {
+  return shardOccupancy(locationId).get(instance) || 0;
+}
+
+function listShards(locationId) {
+  const counts = shardOccupancy(locationId);
 
   const highest = counts.size > 0 ? Math.max(...counts.keys()) : 1;
   const shards = [];
@@ -800,13 +896,16 @@ function listShards(locationId) {
 }
 
 function pickShard(locationId, requestedInstance) {
+  if (!isShardedLocation(locationId)) return 1;
+
+  const counts = shardOccupancy(locationId);
+
   if (Number.isInteger(requestedInstance) && requestedInstance >= 1 && requestedInstance <= MAX_SHARDS) {
-    const occupancy = countShardPlayers(locationId, requestedInstance);
-    if (occupancy < SHARD_CAPACITY + SHARD_FRIEND_GRACE) return requestedInstance;
+    if ((counts.get(requestedInstance) || 0) < SHARD_CAPACITY + SHARD_FRIEND_GRACE) return requestedInstance;
   }
 
   for (let i = 1; i <= MAX_SHARDS; i++) {
-    if (countShardPlayers(locationId, i) < SHARD_CAPACITY) return i;
+    if ((counts.get(i) || 0) < SHARD_CAPACITY) return i;
   }
   return MAX_SHARDS;
 }
@@ -949,6 +1048,79 @@ function enterCanyonHub(player) {
   safeSend(player.ws, { type: 'enemyState', enemies: [] });
 }
 
+function activeEnemiesFor(player) {
+  if (player.locationId === 'tower-first-floor') return player.canyon?.enemies ?? null;
+  if (player.locationId === CAVE_LOCATION_ID) return player.cave?.enemies ?? null;
+  return null;
+}
+
+function serializeEnemies(enemies) {
+  if (!enemies) return [];
+  return Array.from(enemies.values()).map((e) => ({
+    id: e.id,
+    type: e.type,
+    position: e.position,
+    health: e.health,
+    maxHealth: e.maxHealth,
+    alive: e.alive,
+    targetId: e.targetId,
+  }));
+}
+
+function spawnEnemyInto(container, idPrefix, seq, type, position, healthMult = 1, damageMult = 1) {
+  const cfg = ENEMY_TYPES[type];
+  const id = `${idPrefix}-${seq}`;
+  const maxHealth = Math.round(cfg.maxHealth * healthMult);
+
+  container.set(id, {
+    id,
+    type,
+    position: [...position],
+    spawnPoint: [...position],
+    health: maxHealth,
+    maxHealth,
+    attackDamage: Math.round(cfg.attackDamage * damageMult),
+    alive: true,
+    targetId: null,
+    lastAttackTime: 0,
+    patrolTarget: null,
+    patrolWaitUntil: 0,
+    positionHistory: [],
+  });
+
+  return id;
+}
+
+function enterCave(player) {
+  player.cave = {
+    enemies: new Map(),
+    nextEnemySeq: 1,
+    bossId: null,
+    bossDefeated: false,
+  };
+
+  for (const spawn of CAVE_ENEMY_SPAWNS) {
+    spawnEnemyInto(player.cave.enemies, `cave-${player.id}`, player.cave.nextEnemySeq++, spawn.type, spawn.position);
+  }
+
+  player.cave.bossId = spawnEnemyInto(
+    player.cave.enemies,
+    `cave-${player.id}`,
+    player.cave.nextEnemySeq++,
+    'void_boss',
+    CAVE_BOSS_SPAWN
+  );
+
+  safeSend(player.ws, { type: 'enemyState', enemies: serializeEnemies(player.cave.enemies) });
+  safeSend(player.ws, { type: 'caveBossState', defeated: false });
+}
+
+function leaveCave(player) {
+  if (!player.cave) return;
+  player.cave = null;
+  safeSend(player.ws, { type: 'enemyState', enemies: [] });
+}
+
 function serializeCanyonEnemies(player) {
   if (!player.canyon) return [];
   return Array.from(player.canyon.enemies.values()).map((e) => ({
@@ -1077,10 +1249,12 @@ function canyonTick() {
   const now = Date.now();
 
   for (const player of players.values()) {
-    if (!player.authenticated || player.locationId !== 'tower-first-floor') continue;
-    if (!player.canyon || player.canyon.enemies.size === 0) continue;
+    if (!player.authenticated) continue;
 
-    for (const enemy of player.canyon.enemies.values()) {
+    const enemies = activeEnemiesFor(player);
+    if (!enemies || enemies.size === 0) continue;
+
+    for (const enemy of enemies.values()) {
       if (!enemy.alive) continue;
       const cfg = ENEMY_TYPES[enemy.type];
 
@@ -1128,7 +1302,7 @@ function canyonTick() {
       enemy.positionHistory = enemy.positionHistory.filter((p) => now - p.time < 1000);
     }
 
-    safeSend(player.ws, { type: 'enemyState', enemies: serializeCanyonEnemies(player) });
+    safeSend(player.ws, { type: 'enemyState', enemies: serializeEnemies(enemies) });
   }
 }
 
@@ -1294,9 +1468,9 @@ async function refreshTokenPool() {
 refreshTokenPool();
 safeInterval(refreshTokenPool, LOOT_CONFIG.pollIntervalMs);
 
-function serializeLoot() {
+function serializeLoot(instance) {
   return Array.from(lootDrops.values())
-    .filter((l) => !l.ownerId)
+    .filter((l) => !l.ownerId && l.instance === instance)
     .map((l) => ({
       id: l.id,
       position: l.position,
@@ -1307,8 +1481,8 @@ function serializeLoot() {
 const worldSigns = new Map();
 let signsLoadPromise = null;
 
-function serializeSigns() {
-  return Array.from(worldSigns.values());
+function serializeSigns(instance) {
+  return Array.from(worldSigns.values()).filter((sign) => sign.instance === instance);
 }
 
 async function ensureSignsLoaded(gameId) {
@@ -1321,6 +1495,7 @@ async function ensureSignsLoaded(gameId) {
     });
     for (const sign of result?.signs || []) {
       sign.createdAtMs = new Date(sign.createdAt).getTime();
+      sign.instance = 1;
       worldSigns.set(sign.id, sign);
     }
   })();
@@ -1337,7 +1512,7 @@ async function deleteSign(sign) {
   });
   if (!result || !result.success) return false;
   worldSigns.delete(sign.id);
-  broadcastToLocation('main-world', { type: 'signDespawn', id: sign.id });
+  broadcastToLocation('main-world', { type: 'signDespawn', id: sign.id }, null, sign.instance);
   return true;
 }
 
@@ -1426,12 +1601,12 @@ function rollLootTokens(minCount, maxCount) {
   return tokens;
 }
 
-function dropLoot(position) {
+function dropLoot(position, instance = 1) {
   const tokens = rollLootTokens(LOOT_CONFIG.minDrop, LOOT_CONFIG.maxDrop);
   if (tokens.length === 0) return;
 
   const id = `loot-${nextLootId++}`;
-  const loot = { id, ownerId: null, position: [...position], tokens, createdAt: Date.now() };
+  const loot = { id, ownerId: null, instance, position: [...position], tokens, createdAt: Date.now() };
   lootDrops.set(id, loot);
 
   broadcastToLocation('main-world', {
@@ -1439,7 +1614,7 @@ function dropLoot(position) {
     id: loot.id,
     position: loot.position,
     tokens: loot.tokens,
-  });
+  }, null, instance);
 }
 
 function clearCanyonLoot(player) {
@@ -1456,7 +1631,7 @@ function dropCanyonLoot(player, position, minCount, maxCount) {
   if (tokens.length === 0) return;
 
   const id = `loot-${nextLootId++}`;
-  const loot = { id, ownerId: player.id, position: [...position], tokens, createdAt: Date.now() };
+  const loot = { id, ownerId: player.id, instance: player.instance, position: [...position], tokens, createdAt: Date.now() };
   lootDrops.set(id, loot);
 
   safeSend(player.ws, {
@@ -1476,7 +1651,7 @@ safeInterval(() => {
         const owner = players.get(loot.ownerId);
         if (owner) safeSend(owner.ws, { type: 'lootDespawn', id });
       } else {
-        broadcastToLocation('main-world', { type: 'lootDespawn', id });
+        broadcastToLocation('main-world', { type: 'lootDespawn', id }, null, loot.instance);
       }
     }
   }
@@ -1612,6 +1787,7 @@ function buildSavePayload(player) {
           clearedSegments: Array.from(player.canyon.clearedSegments),
         },
         skinTextureUrl: player.skinTextureUrl || null,
+        caveChests: player.caveChests || {},
       },
     },
     nickname: player.nickname,
@@ -1648,6 +1824,40 @@ function persistPlayer(player) {
   if (!CONFIG.internalSecret) return;
   queuePlayerSave(player, buildSavePayload(player));
 }
+
+safeInterval(() => {
+  const dirty = [];
+  players.forEach((player) => {
+    if (player.stateDirty) dirty.push(player);
+  });
+  if (dirty.length === 0) return;
+
+  const payloadCache = new Map();
+
+  players.forEach((viewer) => {
+    if (!viewer.authenticated || !viewer.wantsSnapshots) return;
+    if (viewer.ws.readyState !== WebSocket.OPEN) return;
+    if (viewer.aoiNeighbors.size === 0) return;
+
+    const batch = [];
+    for (const id of viewer.aoiNeighbors) {
+      const other = players.get(id);
+      if (!other || !other.stateDirty || !other.ready) continue;
+
+      let payload = payloadCache.get(id);
+      if (!payload) {
+        payload = buildPlayerStatePayload(other);
+        payloadCache.set(id, payload);
+      }
+      batch.push(payload);
+    }
+
+    if (batch.length === 0) return;
+    safeSend(viewer.ws, { type: 'snapshot', players: batch });
+  });
+
+  for (const player of dirty) player.stateDirty = false;
+}, SNAPSHOT_INTERVAL_MS);
 
 safeInterval(() => {
   const now = Date.now();
@@ -1700,16 +1910,18 @@ safeInterval(async () => {
   const authedPlayers = Array.from(players.values()).filter((p) => p.authenticated && p.userId);
   if (authedPlayers.length === 0) return;
 
-  const result = await callInternalApi('/api/internal/game/mute-status', {
+  const result = await callInternalApi('/api/internal/game/player-status', {
     userIds: authedPlayers.map((p) => p.userId),
   }).catch((err) => {
-    console.error('[Moderation] status refresh error:', err.message);
+    console.error('[PlayerStatus] refresh error:', err.message);
     return null;
   });
 
   if (!result?.statuses) return;
 
+  const now = Date.now();
   const statusByUserId = new Map(result.statuses.map((s) => [s.id, s]));
+
   authedPlayers.forEach((p) => {
     const status = statusByUserId.get(p.userId);
     if (!status) return;
@@ -1719,38 +1931,27 @@ safeInterval(async () => {
     if (status.isBanned) {
       safeSend(p.ws, { type: 'auth_error', error: 'banned' });
       try { p.ws.close(4008, 'banned'); } catch (e) { }
+      return;
     }
-  });
-}, 8000);
 
-safeInterval(async () => {
-  if (!CONFIG.internalSecret) return;
+    if (now - (p.skinTextureUrlChangedAt || 0) >= 5000) {
+      const nextUrl = status.skinTextureUrl || null;
+      if (nextUrl !== p.skinTextureUrl) {
+        p.skinTextureUrl = nextUrl;
+        broadcast({ type: 'skinUpdate', playerId: p.id, url: p.skinTextureUrl }, null, true, p);
+        safeSend(p.ws, { type: 'skinUpdate', playerId: p.id, url: p.skinTextureUrl });
+      }
+    }
 
-  const authedPlayers = Array.from(players.values()).filter((p) => p.authenticated && p.userId);
-  if (authedPlayers.length === 0) return;
-
-  const result = await callInternalApi('/api/internal/game/skin-status', {
-    userIds: authedPlayers.map((p) => p.userId),
-  }).catch((err) => {
-    console.error('[Moderation] skin status refresh error:', err.message);
-    return null;
-  });
-
-  if (!result?.statuses) return;
-
-  const statusByUserId = new Map(result.statuses.map((s) => [s.id, s]));
-  authedPlayers.forEach((p) => {
-    if (Date.now() - (p.skinTextureUrlChangedAt || 0) < 5000) return;
-
-    const status = statusByUserId.get(p.userId);
-    if (!status) return;
-
-    const nextUrl = status.skinTextureUrl || null;
-    if (nextUrl === p.skinTextureUrl) return;
-
-    p.skinTextureUrl = nextUrl;
-    broadcast({ type: 'skinUpdate', playerId: p.id, url: p.skinTextureUrl }, null, true, p);
-    safeSend(p.ws, { type: 'skinUpdate', playerId: p.id, url: p.skinTextureUrl });
+    if (now - (p.economyChangedAt || 0) >= 5000) {
+      const sameAsh = status.ash === p.ash;
+      const samePlaceables = JSON.stringify(status.placeables) === JSON.stringify(p.placeables);
+      if (!sameAsh || !samePlaceables) {
+        p.ash = status.ash;
+        p.placeables = status.placeables;
+        safeSend(p.ws, { type: 'inventoryUpdate', inventory: p.inventory, ash: p.ash, placeables: p.placeables });
+      }
+    }
   });
 }, 8000);
 
@@ -1758,36 +1959,6 @@ safeInterval(async () => {
   const anyPlayer = Array.from(players.values()).find((p) => p.authenticated && p.gameId);
   if (anyPlayer) await refreshShopPrices(anyPlayer.gameId);
 }, 60000);
-
-safeInterval(async () => {
-  if (!CONFIG.internalSecret) return;
-
-  const authedPlayers = Array.from(players.values()).filter((p) => p.authenticated && p.userId);
-  if (authedPlayers.length === 0) return;
-
-  const result = await callInternalApi('/api/internal/game/economy-status', {
-    userIds: authedPlayers.map((p) => p.userId),
-  }).catch((err) => {
-    console.error('[Moderation] economy status refresh error:', err.message);
-    return null;
-  });
-
-  if (!result?.statuses) return;
-
-  const statusByUserId = new Map(result.statuses.map((s) => [s.id, s]));
-  authedPlayers.forEach((p) => {
-    if (Date.now() - (p.economyChangedAt || 0) < 5000) return;
-
-    const status = statusByUserId.get(p.userId);
-    if (!status) return;
-
-    if (status.ash === p.ash && JSON.stringify(status.placeables) === JSON.stringify(p.placeables)) return;
-
-    p.ash = status.ash;
-    p.placeables = status.placeables;
-    safeSend(p.ws, { type: 'inventoryUpdate', inventory: p.inventory, ash: p.ash, placeables: p.placeables });
-  });
-}, 8000);
 
 safeInterval(async () => {
   if (!CONFIG.internalSecret) return;
@@ -1821,7 +1992,7 @@ safeInterval(async () => {
 }, 8000);
 
 wss.on('connection', (ws) => {
-  if (players.size >= MAX_PLAYERS) {
+  if (players.size >= MAX_CONNECTIONS) {
     ws.close(1013, 'Server full');
     return;
   }
@@ -1858,8 +2029,13 @@ wss.on('connection', (ws) => {
     lastLocationChangeAt: 0,
     pendingLocationChange: null,
     invulnerableUntil: 0,
+    cave: null,
+    caveChests: {},
     ready: false,
     readyTimer: null,
+    wantsSnapshots: false,
+    stateDirty: false,
+    zoneKey: null,
     aoiNeighbors: new Set(),
     weaponAmmo: WEAPON_CONFIG.maxAmmo,
     lastShotAt: 0,
@@ -2082,7 +2258,10 @@ wss.on('connection', (ws) => {
         case 'voiceIceCandidate': handleVoiceIceCandidate(player, data); break;
         case 'saveProgress': handleSaveProgress(player); break;
         case 'locationChange': handleLocationChange(player, data); break;
-        case 'clientReady': markPlayerReady(player); break;
+        case 'clientReady':
+          if (data.snapshots === true) player.wantsSnapshots = true;
+          markPlayerReady(player);
+          break;
         case 'emote': handleEmote(player, data); break;
         case 'cosmeticListRequest': handleCosmeticListRequest(player); break;
         case 'cosmeticBuy': handleCosmeticBuy(player, data); break;
@@ -2090,6 +2269,7 @@ wss.on('connection', (ws) => {
         case 'questInteract': handleQuestInteract(player, data); break;
         case 'questAccept': handleQuestAccept(player, data); break;
         case 'questTurnIn': handleQuestTurnIn(player, data); break;
+        case 'caveChestOpen': handleCaveChestOpen(player, data); break;
         case 'canyonWarp': handleCanyonWarp(player, data); break;
         case 'canyonMapRequest': handleCanyonMapRequest(player); break;
         case 'canyonEnterDungeon': handleCanyonEnterDungeon(player); break;
@@ -2154,6 +2334,8 @@ wss.on('connection', (ws) => {
       clearTimeout(player.readyTimer);
       player.readyTimer = null;
     }
+
+    removePlayerZone(player);
 
     if (player.authenticated) {
       persistPlayer(player);
@@ -2266,9 +2448,6 @@ wss.on('connection', (ws) => {
           player.locationId = 'tower-main-hall';
           spawnInSafeZone(player, player.locationId);
         }
-        if (isShardedLocation(player.locationId)) {
-          player.instance = pickShard(player.locationId, null);
-        }
       } else {
         spawnInSafeZone(player);
       }
@@ -2306,6 +2485,14 @@ wss.on('connection', (ws) => {
             status: state.status,
             progress: Math.max(0, Math.min(QUESTS[questId].targetCount, Math.floor(Number(state.progress) || 0))),
           };
+        }
+      }
+
+      const savedCaveChests = savedProgress.progress?.data?.caveChests;
+      if (savedCaveChests && typeof savedCaveChests === 'object') {
+        for (const [chestId, at] of Object.entries(savedCaveChests)) {
+          const timestamp = Math.floor(Number(at));
+          if (CAVE_CHESTS[chestId] && Number.isFinite(timestamp)) player.caveChests[chestId] = timestamp;
         }
       }
 
@@ -2367,6 +2554,7 @@ wss.on('connection', (ws) => {
     });
     player.blockedUserIds = new Set((blocksResult?.blocked || []).map((b) => b.userId));
 
+    player.instance = pickShard(player.locationId, null);
     player.justSpawned = true;
     player.teleportSettleUntil = Date.now() + TELEPORT_SETTLE_MS;
 
@@ -2376,16 +2564,15 @@ wss.on('connection', (ws) => {
 
     console.log(`[+] Authenticated: ${playerId} (${player.userId}, ${player.nickname}, loc:${player.locationId}). Total: ${players.size}`);
 
-    const existingPlayers = [];
-    players.forEach((p, id) => {
-      if (id !== playerId && p.authenticated) {
-        if (isInAOI(player, p)) {
-          if (p.ready) existingPlayers.push(buildPlayerJoinPayload(p));
+    updatePlayerZone(player);
 
-          player.aoiNeighbors.add(id);
-          p.aoiNeighbors.add(playerId);
-        }
-      }
+    const existingPlayers = [];
+    forEachNearbyPlayer(player, (p) => {
+      if (!isInAOI(player, p)) return;
+      if (p.ready) existingPlayers.push(buildPlayerJoinPayload(p));
+
+      player.aoiNeighbors.add(p.id);
+      p.aoiNeighbors.add(playerId);
     });
 
     safeSend(ws, {
@@ -2413,9 +2600,9 @@ wss.on('connection', (ws) => {
     sendCosmeticState(player);
 
     if (player.locationId === 'main-world') {
-      safeSend(ws, { type: 'lootState', loot: serializeLoot() });
+      safeSend(ws, { type: 'lootState', loot: serializeLoot(player.instance) });
       await ensureSignsLoaded(player.gameId);
-      safeSend(ws, { type: 'signState', signs: serializeSigns() });
+      safeSend(ws, { type: 'signState', signs: serializeSigns(player.instance) });
     }
 
     if (player.locationId === 'tower-first-floor') {
@@ -2424,8 +2611,9 @@ wss.on('connection', (ws) => {
 
     if (player.locationId === GALAXY_LOCATION_ID) {
       safeSend(ws, { type: 'factionGatesState', gates: displayedFactionGatesList, accountCount });
-      sendShardState(player);
     }
+
+    sendShardState(player);
 
     if (typeof player.locationId === 'string' && player.locationId.startsWith(FACTION_ROOM_PREFIX)) {
       const joinRoomFactionId = player.locationId.slice(FACTION_ROOM_PREFIX.length);
@@ -2504,24 +2692,30 @@ wss.on('connection', (ws) => {
     player.isShooting = !!data.isShooting;
     player.lastUpdate = now;
 
-    recomputeAOI(player);
+    if (updatePlayerZone(player)) recomputeAOI(player);
 
     if (!player.ready) return;
 
-    broadcast({
-      type: 'playerUpdate',
-      id: playerId,
-      position: player.position,
-      rotation: player.rotation,
-      pitch: player.pitch,
-      state: player.state,
-      jumping: player.jumping,
-      velocityY: player.velocityY,
-      health: player.health,
-      alive: player.alive,
-      weaponEquipped: player.weaponEquipped,
-      isShooting: player.isShooting,
-    }, playerId, true, player);
+    player.stateDirty = true;
+    sendLiveUpdate(player);
+  }
+
+  function sendLiveUpdate(player) {
+    let message = null;
+
+    for (const id of player.aoiNeighbors) {
+      const other = players.get(id);
+      if (!other || other.wantsSnapshots || other.ws.readyState !== WebSocket.OPEN) continue;
+
+      if (message === null) {
+        message = getCachedMessage({ type: 'playerUpdate', ...buildPlayerStatePayload(player) });
+      }
+      try {
+        other.ws.send(message);
+      } catch (err) {
+        console.error('[!] Update send error:', err.message);
+      }
+    }
   }
 
   function handleShoot(player, data) {
@@ -2782,6 +2976,10 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (player.instance !== target.instance && isShardedLocation(player.locationId)) {
+      return;
+    }
+
     if (isInProtectedZone(player) || isInProtectedZone(target)) {
       return;
     }
@@ -2836,9 +3034,10 @@ wss.on('connection', (ws) => {
     if (!player.alive) return;
     if (typeof data.target !== 'string') return;
     if (!Array.isArray(data.point) || data.point.length !== 3) return;
-    if (player.locationId !== 'tower-first-floor' || !player.canyon) return;
+    const enemies = activeEnemiesFor(player);
+    if (!enemies) return;
 
-    const enemy = player.canyon.enemies.get(data.target);
+    const enemy = enemies.get(data.target);
     if (!enemy || !enemy.alive) return;
 
     const [px, , pz] = player.position;
@@ -2858,7 +3057,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if (isPathBlockedByEntity(player.position, historicalPos, player.locationId, new Set([playerId, enemy.id]), player.canyon.enemies.values())) {
+    if (isPathBlockedByEntity(player.position, historicalPos, player.locationId, new Set([playerId, enemy.id]), enemies.values())) {
       console.log(`[!] Enemy hit rejected: shot from ${playerId} to ${data.target} blocked by another entity`);
       return;
     }
@@ -2884,6 +3083,14 @@ wss.on('connection', (ws) => {
       });
 
       incrementKillQuests(player);
+
+      if (player.locationId === CAVE_LOCATION_ID) {
+        if (player.cave && enemy.id === player.cave.bossId) {
+          player.cave.bossDefeated = true;
+          safeSend(player.ws, { type: 'caveBossState', defeated: true });
+        }
+        return;
+      }
 
       const alreadyCleared = player.canyon.clearedSegments.has(player.canyon.segment);
       if (!alreadyCleared) {
@@ -2916,6 +3123,38 @@ wss.on('connection', (ws) => {
     } else {
       enemy.targetId = playerId;
     }
+  }
+
+  function handleCaveChestOpen(player, data) {
+    if (!player.alive) return;
+    if (player.locationId !== CAVE_LOCATION_ID || !player.cave) return;
+    if (typeof data.chestId !== 'string') return;
+
+    const chest = CAVE_CHESTS[data.chestId];
+    if (!chest) return;
+
+    if (data.chestId === 'vault' && !player.cave.bossDefeated) return;
+
+    const [px, , pz] = player.position;
+    const distance = Math.sqrt((chest[0] - px) ** 2 + (chest[2] - pz) ** 2);
+    if (distance > CAVE_CHEST_REACH) return;
+
+    const now = Date.now();
+    if (!player.caveChests) player.caveChests = {};
+
+    const lootedAt = player.caveChests[data.chestId] || 0;
+    if (now - lootedAt < CAVE_CHEST_COOLDOWN_MS) {
+      safeSend(player.ws, { type: 'error', message: 'This chest is still empty — come back later' });
+      return;
+    }
+
+    player.caveChests[data.chestId] = now;
+    player.ash += CAVE_CHEST_REWARD;
+    player.economyChangedAt = now;
+    persistPlayer(player);
+
+    safeSend(player.ws, { type: 'caveChestOpened', chestId: data.chestId, ash: CAVE_CHEST_REWARD });
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
   }
 
   function handleCanyonWarp(player, data) {
@@ -4315,6 +4554,7 @@ wss.on('connection', (ws) => {
     if (!loot) return;
     if (loot.ownerId && loot.ownerId !== player.id) return;
     if (!loot.ownerId && player.locationId !== 'main-world') return;
+    if (loot.instance !== player.instance) return;
 
     const [px, , pz] = player.position;
     const dist = Math.sqrt((loot.position[0] - px) ** 2 + (loot.position[2] - pz) ** 2);
@@ -4330,7 +4570,7 @@ wss.on('connection', (ws) => {
     if (loot.ownerId) {
       safeSend(ws, { type: 'lootDespawn', id: data.id });
     } else {
-      broadcastToLocation('main-world', { type: 'lootDespawn', id: data.id });
+      broadcastToLocation('main-world', { type: 'lootDespawn', id: data.id }, null, loot.instance);
     }
   }
 
@@ -4509,11 +4749,12 @@ wss.on('connection', (ws) => {
       drawingUrl: null,
       createdAt: result.createdAt,
       createdAtMs: Date.now(),
+      instance: player.instance,
     };
     worldSigns.set(sign.id, sign);
 
     safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
-    broadcastToLocation('main-world', { type: 'signSpawn', sign });
+    broadcastToLocation('main-world', { type: 'signSpawn', sign }, null, sign.instance);
   }
 
   async function handleSignSetText(player, data) {
@@ -4549,7 +4790,7 @@ wss.on('connection', (ws) => {
 
     sign.contentType = 'text';
     sign.textContent = text;
-    broadcastToLocation('main-world', { type: 'signContentSet', id: sign.id, contentType: 'text', textContent: text });
+    broadcastToLocation('main-world', { type: 'signContentSet', id: sign.id, contentType: 'text', textContent: text }, null, sign.instance);
   }
 
   async function handleSignSetDrawingUrl(player, data) {
@@ -4577,7 +4818,7 @@ wss.on('connection', (ws) => {
 
     sign.contentType = 'draw';
     sign.drawingUrl = data.url;
-    broadcastToLocation('main-world', { type: 'signContentSet', id: sign.id, contentType: 'draw', drawingUrl: data.url });
+    broadcastToLocation('main-world', { type: 'signContentSet', id: sign.id, contentType: 'draw', drawingUrl: data.url }, null, sign.instance);
   }
 
   async function handleSignRemove(player, data) {
@@ -4891,13 +5132,21 @@ wss.on('connection', (ws) => {
     }
 
     if (data.locationId === 'main-world') {
-      safeSend(ws, { type: 'lootState', loot: serializeLoot() });
+      safeSend(ws, { type: 'lootState', loot: serializeLoot(player.instance) });
       await ensureSignsLoaded(player.gameId);
-      safeSend(ws, { type: 'signState', signs: serializeSigns() });
+      safeSend(ws, { type: 'signState', signs: serializeSigns(player.instance) });
     }
 
     if (data.locationId === 'tower-first-floor' && player.canyon) {
       enterCanyonHub(player);
+    }
+
+    if (oldLocation === CAVE_LOCATION_ID) {
+      leaveCave(player);
+    }
+
+    if (data.locationId === CAVE_LOCATION_ID) {
+      enterCave(player);
     }
 
     if (data.locationId === GALAXY_LOCATION_ID) {
@@ -4914,6 +5163,24 @@ wss.on('connection', (ws) => {
 
 function broadcast(data, excludeId = null, useAOI = false, senderPlayer = null, applyBlockFilter = false) {
   const message = getCachedMessage(data);
+
+  if (useAOI && senderPlayer) {
+    for (const id of senderPlayer.aoiNeighbors) {
+      if (id === excludeId) continue;
+
+      const p = players.get(id);
+      if (!p || !p.authenticated || p.ws.readyState !== WebSocket.OPEN) continue;
+      if (applyBlockFilter && senderPlayer.userId && p.blockedUserIds?.has(senderPlayer.userId)) continue;
+
+      try {
+        p.ws.send(message);
+      } catch (err) {
+        console.error('[!] Broadcast error:', err.message);
+      }
+    }
+    return;
+  }
+
   players.forEach((p, id) => {
     if (id === excludeId) return;
     if (!p.authenticated || p.ws.readyState !== WebSocket.OPEN) return;
