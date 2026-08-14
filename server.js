@@ -128,6 +128,8 @@ function canyonSegmentName(segment) {
   return segment <= CANYON_BIOMES.length ? biome.name : `${biome.name} — Segment ${segment}`;
 }
 
+const CAVE_BOSS_ARENA = { x: 24, z: -252, radius: 30 };
+
 const ENEMY_TYPES = {
   slime: {
     name: 'Slime', maxHealth: 100, attackDamage: 10, attackRange: 1.5, aggroRadius: 20, aggroLeash: 150,
@@ -138,6 +140,17 @@ const ENEMY_TYPES = {
     name: 'Slime Boss', maxHealth: 600, attackDamage: 25, attackRange: 2.5, aggroRadius: 30, aggroLeash: 180,
     attackCooldown: 1200, chaseSpeedNear: 4, chaseSpeedFar: 10, chaseNearThreshold: 12,
     patrolSpeed: 1.2, patrolRadius: 10, scale: 3, lootMin: 10, lootMax: 20,
+  },
+  cave_warden: {
+    name: 'The Hollow Warden', maxHealth: 2400, attackDamage: 0, attackRange: 0, aggroRadius: 42, aggroLeash: 999,
+    attackCooldown: 2400, chaseSpeedNear: 2.2, chaseSpeedFar: 4.6, chaseNearThreshold: 22,
+    patrolSpeed: 1.4, patrolRadius: 8, scale: 5, lootMin: 40, lootMax: 70,
+    ranged: true, preferredRange: 17, arena: CAVE_BOSS_ARENA,
+    attacks: [
+      { id: 'spit', windup: 700, cooldown: 2400, minRange: 0, maxRange: 46, speed: 30, radius: 3, damage: 22, shots: 1, spread: 0 },
+      { id: 'volley', windup: 1150, cooldown: 6200, minRange: 8, maxRange: 46, speed: 22, radius: 3.4, damage: 15, shots: 5, spread: 7 },
+      { id: 'pool', windup: 1450, cooldown: 9000, minRange: 6, maxRange: 40, speed: 15, radius: 5.5, damage: 14, shots: 1, spread: 0, pool: { duration: 6500, interval: 700, damage: 9 } },
+    ],
   },
   husk: {
     name: 'Ash Husk', maxHealth: 140, attackDamage: 14, attackRange: 1.8, aggroRadius: 24, aggroLeash: 160,
@@ -293,7 +306,7 @@ const LOCATION_MAX_RADIUS = {
   'tower-token-gates': 80,
   'tower-basement': GALAXY_MAX_RADIUS,
   'tower-events': 40,
-  cave: 235,
+  cave: 360,
   'open-world-canyon': 150,
 };
 const CAVE_LOCATION_ID = 'cave';
@@ -301,22 +314,27 @@ const CAVE_CHEST_REWARD = 1000;
 const CAVE_CHEST_COOLDOWN_MS = 60 * 60 * 1000;
 const CAVE_CHEST_REACH = 5;
 const CAVE_CHESTS = {
-  crack: [-93, 0, -33],
-  lever: [89, 0, -51],
-  vault: [0, 0, -180],
+  crack: [-86, 0, -31],
+  lever: [89, 0, -79],
+  vault: [24, 0, -318],
 };
-const CAVE_BOSS_SPAWN = [0, 0, -132];
+const CAVE_BOSS_SPAWN = [24, 0, -262];
 const CAVE_ENEMY_SPAWNS = [
-  { type: 'voidling', position: [0, 0, -46] },
-  { type: 'voidling', position: [-8, 0, -52] },
-  { type: 'voidling', position: [-54, 0, -72] },
-  { type: 'husk', position: [-48, 0, -66] },
-  { type: 'voidling', position: [50, 0, -78] },
-  { type: 'husk', position: [44, 0, -84] },
-  { type: 'husk', position: [-14, 0, -120] },
-  { type: 'husk', position: [16, 0, -124] },
-  { type: 'voidling', position: [-72, 0, -44] },
-  { type: 'voidling', position: [70, 0, -60] },
+  { type: 'voidling', position: [-46, 0, -14] },
+  { type: 'voidling', position: [-52, 0, -46] },
+  { type: 'voidling', position: [-58, 0, -62] },
+  { type: 'husk', position: [-50, 0, -68] },
+  { type: 'voidling', position: [2, 0, -80] },
+  { type: 'husk', position: [8, 0, -84] },
+  { type: 'voidling', position: [44, 0, -44] },
+  { type: 'voidling', position: [62, 0, -66] },
+  { type: 'husk', position: [-10, 0, -126] },
+  { type: 'husk', position: [-4, 0, -120] },
+  { type: 'voidling', position: [40, 0, -134] },
+  { type: 'husk', position: [-56, 0, -160] },
+  { type: 'voidling', position: [-48, 0, -154] },
+  { type: 'husk', position: [-16, 0, -206] },
+  { type: 'voidling', position: [-24, 0, -200] },
 ];
 
 const SNAPSHOT_INTERVAL_MS = 80;
@@ -996,6 +1014,10 @@ function spawnCanyonEnemy(player, type, position, healthMult = 1, damageMult = 1
     patrolTarget: null,
     patrolWaitUntil: 0,
     positionHistory: [],
+    cast: null,
+    attackCooldowns: {},
+    pendingImpacts: [],
+    pools: [],
   });
   return id;
 }
@@ -1086,6 +1108,10 @@ function spawnEnemyInto(container, idPrefix, seq, type, position, healthMult = 1
     patrolTarget: null,
     patrolWaitUntil: 0,
     positionHistory: [],
+    cast: null,
+    attackCooldowns: {},
+    pendingImpacts: [],
+    pools: [],
   });
 
   return id;
@@ -1107,7 +1133,7 @@ function enterCave(player) {
     player.cave.enemies,
     `cave-${player.id}`,
     player.cave.nextEnemySeq++,
-    'void_boss',
+    'cave_warden',
     CAVE_BOSS_SPAWN
   );
 
@@ -1245,6 +1271,225 @@ function damagePlayerByCanyonEnemy(player, enemy) {
   }
 }
 
+function damagePlayerFromZone(player, enemy, damage) {
+  if (!player.alive) return;
+  if (isSpawnProtected(player)) return;
+
+  player.health = Math.max(0, player.health - damage);
+  player.lastDamageTime = Date.now();
+
+  safeSend(player.ws, {
+    type: 'playerDamaged',
+    targetId: player.id,
+    attackerId: enemy.id,
+    damage,
+    health: player.health,
+    point: player.position,
+    historicalPosition: player.position,
+  });
+
+  if (player.health <= 0) {
+    markPlayerDead(player, enemy.id, player.position);
+  }
+}
+
+function clampToArena(position, arena) {
+  const dx = position[0] - arena.x;
+  const dz = position[2] - arena.z;
+  const dist = Math.sqrt(dx * dx + dz * dz);
+  if (dist <= arena.radius) return;
+
+  const scale = arena.radius / (dist || 1);
+  position[0] = arena.x + dx * scale;
+  position[2] = arena.z + dz * scale;
+}
+
+function pickBossAttack(enemy, cfg, dist, now) {
+  const usable = cfg.attacks.filter((attack) => {
+    if (dist < attack.minRange || dist > attack.maxRange) return false;
+    return now - (enemy.attackCooldowns[attack.id] || 0) >= attack.cooldown;
+  });
+
+  if (usable.length === 0) return null;
+
+  const heavy = usable.filter((attack) => attack.id !== 'spit');
+  const pool = heavy.length > 0 ? heavy : usable;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function resolveBossCast(player, enemy, cast, now) {
+  const attack = cast.attack;
+  const origin = [enemy.position[0], enemy.position[1] + 2.4, enemy.position[2]];
+
+  for (let i = 0; i < attack.shots; i++) {
+    const offsetAngle = Math.random() * Math.PI * 2;
+    const offsetDist = attack.shots > 1 ? Math.random() * attack.spread : 0;
+
+    const target = [
+      cast.aim[0] + Math.cos(offsetAngle) * offsetDist,
+      0,
+      cast.aim[2] + Math.sin(offsetAngle) * offsetDist,
+    ];
+
+    const dx = target[0] - origin[0];
+    const dz = target[2] - origin[2];
+    const travel = Math.max(160, (Math.sqrt(dx * dx + dz * dz) / attack.speed) * 1000);
+
+    safeSend(player.ws, {
+      type: 'bossProjectile',
+      enemyId: enemy.id,
+      attack: attack.id,
+      origin,
+      target,
+      travel,
+      radius: attack.radius,
+    });
+
+    enemy.pendingImpacts.push({
+      at: now + travel,
+      x: target[0],
+      z: target[2],
+      radius: attack.radius,
+      damage: attack.damage,
+      pool: attack.pool || null,
+    });
+  }
+}
+
+function processBossImpacts(player, enemy, now) {
+  if (enemy.pendingImpacts.length === 0) return;
+
+  const remaining = [];
+
+  for (const impact of enemy.pendingImpacts) {
+    if (impact.at > now) {
+      remaining.push(impact);
+      continue;
+    }
+
+    const dx = player.position[0] - impact.x;
+    const dz = player.position[2] - impact.z;
+    if (Math.sqrt(dx * dx + dz * dz) <= impact.radius) {
+      damagePlayerFromZone(player, enemy, impact.damage);
+    }
+
+    if (impact.pool) {
+      enemy.pools.push({
+        x: impact.x,
+        z: impact.z,
+        radius: impact.radius,
+        damage: impact.pool.damage,
+        interval: impact.pool.interval,
+        expiresAt: now + impact.pool.duration,
+        nextTickAt: now + impact.pool.interval,
+      });
+
+      safeSend(player.ws, {
+        type: 'bossPool',
+        enemyId: enemy.id,
+        x: impact.x,
+        z: impact.z,
+        radius: impact.radius,
+        duration: impact.pool.duration,
+      });
+    }
+  }
+
+  enemy.pendingImpacts = remaining;
+}
+
+function processBossPools(player, enemy, now) {
+  if (enemy.pools.length === 0) return;
+
+  enemy.pools = enemy.pools.filter((pool) => pool.expiresAt > now);
+
+  for (const pool of enemy.pools) {
+    if (now < pool.nextTickAt) continue;
+    pool.nextTickAt = now + pool.interval;
+
+    const dx = player.position[0] - pool.x;
+    const dz = player.position[2] - pool.z;
+    if (Math.sqrt(dx * dx + dz * dz) <= pool.radius) {
+      damagePlayerFromZone(player, enemy, pool.damage);
+    }
+  }
+}
+
+function updateRangedBoss(player, enemy, cfg, now) {
+  const arena = cfg.arena;
+
+  processBossImpacts(player, enemy, now);
+  processBossPools(player, enemy, now);
+
+  const dx = player.position[0] - enemy.position[0];
+  const dz = player.position[2] - enemy.position[2];
+  const dist = Math.sqrt(dx * dx + dz * dz);
+
+  const playerDx = player.position[0] - arena.x;
+  const playerDz = player.position[2] - arena.z;
+  const playerInArena = Math.sqrt(playerDx * playerDx + playerDz * playerDz) <= arena.radius + 10;
+  const engaged = player.alive && playerInArena && dist <= cfg.aggroRadius;
+
+  enemy.targetId = engaged ? player.id : null;
+
+  if (enemy.cast) {
+    if (now >= enemy.cast.resolveAt) {
+      resolveBossCast(player, enemy, enemy.cast, now);
+      enemy.attackCooldowns[enemy.cast.attack.id] = now;
+      enemy.cast = null;
+    }
+    clampToArena(enemy.position, arena);
+    return;
+  }
+
+  if (!engaged) {
+    const homeDx = arena.x - enemy.position[0];
+    const homeDz = arena.z - enemy.position[2];
+    const homeDist = Math.sqrt(homeDx * homeDx + homeDz * homeDz);
+
+    if (homeDist > 2) {
+      const step = cfg.chaseSpeedNear * (CANYON_CONFIG.tickRate / 1000);
+      enemy.position[0] += (homeDx / homeDist) * step;
+      enemy.position[2] += (homeDz / homeDist) * step;
+    }
+
+    clampToArena(enemy.position, arena);
+    return;
+  }
+
+  const drift = dist - cfg.preferredRange;
+  if (Math.abs(drift) > 3) {
+    const speed = Math.abs(drift) > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear;
+    const step = speed * (CANYON_CONFIG.tickRate / 1000) * Math.sign(drift);
+    const len = dist || 1;
+    enemy.position[0] += (dx / len) * step;
+    enemy.position[2] += (dz / len) * step;
+  }
+
+  clampToArena(enemy.position, arena);
+
+  if (now - enemy.lastAttackTime < cfg.attackCooldown) return;
+
+  const attack = pickBossAttack(enemy, cfg, dist, now);
+  if (!attack) return;
+
+  enemy.lastAttackTime = now;
+  enemy.cast = {
+    attack,
+    resolveAt: now + attack.windup,
+    aim: [player.position[0], 0, player.position[2]],
+  };
+
+  safeSend(player.ws, {
+    type: 'bossCast',
+    enemyId: enemy.id,
+    attack: attack.id,
+    windup: attack.windup,
+    aim: enemy.cast.aim,
+    radius: attack.radius,
+  });
+}
+
 function canyonTick() {
   const now = Date.now();
 
@@ -1257,6 +1502,13 @@ function canyonTick() {
     for (const enemy of enemies.values()) {
       if (!enemy.alive) continue;
       const cfg = ENEMY_TYPES[enemy.type];
+
+      if (cfg.ranged) {
+        updateRangedBoss(player, enemy, cfg, now);
+        enemy.positionHistory.push({ position: [...enemy.position], time: now });
+        enemy.positionHistory = enemy.positionHistory.filter((p) => now - p.time < 1000);
+        continue;
+      }
 
       let hasTarget = enemy.targetId === player.id;
       if (player.alive) {
