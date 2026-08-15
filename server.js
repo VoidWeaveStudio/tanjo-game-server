@@ -101,6 +101,10 @@ const WEAPON_CONFIG = {
 
 const PLAYER_WEAPON_DAMAGE_TO_ENEMY = 25;
 
+const RTT_SAMPLE_CEILING_MS = 1000;
+const RTT_SAMPLE_WINDOW = 5;
+const MAX_LAG_COMPENSATION_MS = 250;
+
 const CANYON_CONFIG = {
   tickRate: 100,
   hitTolerance: 5,
@@ -2549,6 +2553,7 @@ wss.on('connection', (ws) => {
     lastPong: Date.now(),
     lastPingSentAt: 0,
     rtt: 50,
+    rttSamples: [],
     lastUpdate: 0,
     justSpawned: false,
     justTeleported: false,
@@ -2657,7 +2662,11 @@ wss.on('connection', (ws) => {
         const now = Date.now();
         player.lastPong = now;
         if (typeof data.t === 'number' && data.t === player.lastPingSentAt) {
-          player.rtt = Math.max(0, Math.min(1000, now - data.t));
+          const sample = Math.max(0, Math.min(RTT_SAMPLE_CEILING_MS, now - data.t));
+          if (!Array.isArray(player.rttSamples)) player.rttSamples = [];
+          player.rttSamples.push(sample);
+          if (player.rttSamples.length > RTT_SAMPLE_WINDOW) player.rttSamples.shift();
+          player.rtt = Math.min(...player.rttSamples);
         }
         return;
       }
@@ -3513,7 +3522,7 @@ wss.on('connection', (ws) => {
 
     const [px, , pz] = player.position;
 
-    const shotTime = Date.now() - player.rtt;
+    const shotTime = Date.now() - Math.min(player.rtt, MAX_LAG_COMPENSATION_MS);
     const historicalPos = getHistoricalPosition(target, shotTime);
 
     const [tx, , tz] = historicalPos;
@@ -3569,7 +3578,7 @@ wss.on('connection', (ws) => {
 
     const [px, , pz] = player.position;
 
-    const shotTime = Date.now() - player.rtt;
+    const shotTime = Date.now() - Math.min(player.rtt, MAX_LAG_COMPENSATION_MS);
     const historicalPos = getHistoricalPosition(enemy, shotTime);
 
     const dist = Math.sqrt((historicalPos[0] - px) ** 2 + (historicalPos[2] - pz) ** 2);
