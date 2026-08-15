@@ -337,6 +337,262 @@ const CAVE_ENEMY_SPAWNS = [
   { type: 'voidling', position: [-24, 0, -200] },
 ];
 
+const CAVE_CHAMBERS = [
+  [0, 6, 14], [-46, -14, 12], [-58, -62, 15], [2, -80, 13],
+  [44, -44, 11], [62, -66, 10], [-10, -126, 14], [-56, -160, 12],
+  [-16, -206, 10], [24, -252, 38], [-102, -56, 7], [40, -134, 8],
+  [-98, -178, 7], [-84, -30, 9], [88, -80, 9], [24, -316, 11],
+];
+
+const CAVE_TUNNELS = [
+  [0, 6, -34, -2, 3.6], [-34, -2, -46, -14, 3.6], [-46, -14, -52, -46, 4],
+  [-52, -46, -58, -62, 4], [-58, -62, -14, -74, 3.8], [-14, -74, 2, -80, 3.8],
+  [2, -80, 44, -44, 3.4], [44, -44, 12, -2, 3.4], [2, -80, 46, -70, 3.4],
+  [46, -70, 62, -66, 3.4], [2, -80, -6, -112, 4.2], [-6, -112, -10, -126, 4.2],
+  [-10, -126, -44, -146, 3.6], [-44, -146, -56, -160, 3.6], [-56, -160, -30, -196, 4],
+  [-30, -196, -16, -206, 4], [-16, -206, 4, -230, 5], [4, -230, 18, -240, 5],
+  [-58, -62, -92, -58, 2.8], [-92, -58, -102, -56, 2.8], [-10, -126, 26, -132, 3],
+  [26, -132, 40, -134, 3], [-56, -160, -88, -172, 2.8], [-88, -172, -98, -178, 2.8],
+  [-46, -14, -70, -24, 3], [-70, -24, -84, -30, 3], [62, -66, 78, -74, 3],
+  [78, -74, 88, -80, 3], [24, -288, 24, -316, 3.4],
+];
+
+const CAVE_ENEMY_CLEARANCE = 1.1;
+const CAVE_DIRECT_SIGHT = 45;
+const CAVE_STEER_REFRESH_MS = 400;
+const CAVE_STEER_ANGLES = [0, 0.45, -0.45, 0.9, -0.9, 1.4, -1.4, 1.95, -1.95];
+
+function segmentDistance2D(px, pz, ax, az, bx, bz) {
+  const dx = bx - ax;
+  const dz = bz - az;
+  const lengthSquared = dx * dx + dz * dz;
+
+  let t = lengthSquared > 0 ? ((px - ax) * dx + (pz - az) * dz) / lengthSquared : 0;
+  t = Math.max(0, Math.min(1, t));
+
+  return Math.hypot(px - (ax + dx * t), pz - (az + dz * t));
+}
+
+function caveDistance(x, z) {
+  let distance = Infinity;
+
+  for (const [cx, cz, radius] of CAVE_CHAMBERS) {
+    const d = Math.hypot(x - cx, z - cz) - radius;
+    if (d < distance) distance = d;
+  }
+
+  for (const [ax, az, bx, bz, halfWidth] of CAVE_TUNNELS) {
+    const d = segmentDistance2D(x, z, ax, az, bx, bz) - halfWidth;
+    if (d < distance) distance = d;
+  }
+
+  return distance;
+}
+
+function caveWalkable(x, z) {
+  return caveDistance(x, z) <= -CAVE_ENEMY_CLEARANCE;
+}
+
+function nudgeIntoCave(position) {
+  if (caveWalkable(position[0], position[2])) return;
+
+  let bestX = position[0];
+  let bestZ = position[2];
+  let bestDistance = caveDistance(position[0], position[2]);
+
+  for (let ring = 1; ring <= 6; ring++) {
+    const radius = ring * 1.5;
+    for (let i = 0; i < 12; i++) {
+      const angle = (i / 12) * Math.PI * 2;
+      const x = position[0] + Math.cos(angle) * radius;
+      const z = position[2] + Math.sin(angle) * radius;
+      const d = caveDistance(x, z);
+      if (d < bestDistance) {
+        bestDistance = d;
+        bestX = x;
+        bestZ = z;
+      }
+    }
+    if (bestDistance <= -CAVE_ENEMY_CLEARANCE) break;
+  }
+
+  if (bestDistance > -CAVE_ENEMY_CLEARANCE) {
+    const node = nearestCaveNode(position[0], position[2]);
+    if (node >= 0) {
+      position[0] = CAVE_NODES[node][0];
+      position[2] = CAVE_NODES[node][1];
+      return;
+    }
+  }
+
+  position[0] = bestX;
+  position[2] = bestZ;
+}
+
+const CAVE_NODES = [];
+const CAVE_EDGES = [];
+
+(function buildCaveGraph() {
+  const key = (x, z) => `${x.toFixed(2)},${z.toFixed(2)}`;
+  const index = new Map();
+
+  const nodeFor = (x, z) => {
+    const k = key(x, z);
+    if (index.has(k)) return index.get(k);
+    const id = CAVE_NODES.length;
+    CAVE_NODES.push([x, z]);
+    CAVE_EDGES.push([]);
+    index.set(k, id);
+    return id;
+  };
+
+  for (const [ax, az, bx, bz] of CAVE_TUNNELS) {
+    const a = nodeFor(ax, az);
+    const b = nodeFor(bx, bz);
+    if (!CAVE_EDGES[a].includes(b)) CAVE_EDGES[a].push(b);
+    if (!CAVE_EDGES[b].includes(a)) CAVE_EDGES[b].push(a);
+  }
+
+  for (const [cx, cz, radius] of CAVE_CHAMBERS) {
+    const centre = nodeFor(cx, cz);
+    for (let i = 0; i < CAVE_NODES.length; i++) {
+      if (i === centre) continue;
+      const [nx, nz] = CAVE_NODES[i];
+      if (Math.hypot(nx - cx, nz - cz) > radius) continue;
+      if (!CAVE_EDGES[centre].includes(i)) CAVE_EDGES[centre].push(i);
+      if (!CAVE_EDGES[i].includes(centre)) CAVE_EDGES[i].push(centre);
+    }
+  }
+})();
+
+const cavePathCache = new Map();
+
+function caveLineClear(x1, z1, x2, z2) {
+  const distance = Math.hypot(x2 - x1, z2 - z1);
+  const steps = Math.max(2, Math.ceil(distance / 1.5));
+
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    if (!caveWalkable(x1 + (x2 - x1) * t, z1 + (z2 - z1) * t)) return false;
+  }
+
+  return true;
+}
+
+function nearestCaveNode(x, z) {
+  let best = -1;
+  let bestScore = Infinity;
+
+  for (let i = 0; i < CAVE_NODES.length; i++) {
+    const [nx, nz] = CAVE_NODES[i];
+    const d = Math.hypot(nx - x, nz - z);
+    if (d >= bestScore) continue;
+    bestScore = d;
+    best = i;
+  }
+
+  return best;
+}
+
+function caveRoute(from, to) {
+  if (from === to) return [to];
+
+  const cacheKey = from * 1000 + to;
+  const cached = cavePathCache.get(cacheKey);
+  if (cached) return cached;
+
+  const previous = new Array(CAVE_NODES.length).fill(-1);
+  const seen = new Array(CAVE_NODES.length).fill(false);
+  const queue = [from];
+  seen[from] = true;
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === to) break;
+    for (const next of CAVE_EDGES[current]) {
+      if (seen[next]) continue;
+      seen[next] = true;
+      previous[next] = current;
+      queue.push(next);
+    }
+  }
+
+  if (!seen[to]) return null;
+
+  const path = [];
+  for (let at = to; at !== -1; at = previous[at]) path.unshift(at);
+
+  cavePathCache.set(cacheKey, path);
+  return path;
+}
+
+function caveChaseDirection(enemy, targetX, targetZ, now) {
+  if (enemy.caveSteer && now < enemy.caveSteerUntil) {
+    const [gx, gz] = enemy.caveSteer;
+    if (Math.hypot(gx - enemy.position[0], gz - enemy.position[2]) > 1.5) {
+      return [gx - enemy.position[0], gz - enemy.position[2]];
+    }
+  }
+
+  const goal = resolveCaveGoal(enemy, targetX, targetZ);
+  enemy.caveSteer = goal;
+  enemy.caveSteerUntil = now + CAVE_STEER_REFRESH_MS;
+  return [goal[0] - enemy.position[0], goal[1] - enemy.position[2]];
+}
+
+function resolveCaveGoal(enemy, targetX, targetZ) {
+  const direct = Math.hypot(targetX - enemy.position[0], targetZ - enemy.position[2]);
+  if (direct <= CAVE_DIRECT_SIGHT && caveLineClear(enemy.position[0], enemy.position[2], targetX, targetZ)) {
+    return [targetX, targetZ];
+  }
+
+  const from = nearestCaveNode(enemy.position[0], enemy.position[2]);
+  const to = nearestCaveNode(targetX, targetZ);
+  const path = caveRoute(from, to);
+  if (!path) return [targetX, targetZ];
+
+  const [ax, az] = CAVE_NODES[path[0]];
+  const atFirst = Math.hypot(ax - enemy.position[0], az - enemy.position[2]) < 1.5;
+
+  if (path.length < 2) return atFirst ? [targetX, targetZ] : [ax, az];
+
+  const [bx, bz] = CAVE_NODES[path[1]];
+  if (atFirst || caveLineClear(enemy.position[0], enemy.position[2], bx, bz)) {
+    return [bx, bz];
+  }
+
+  return [ax, az];
+}
+
+function stepEnemy(enemy, dirX, dirZ, step, constrained) {
+  const length = Math.hypot(dirX, dirZ) || 1;
+  const nx = dirX / length;
+  const nz = dirZ / length;
+
+  if (!constrained) {
+    enemy.position[0] += nx * step;
+    enemy.position[2] += nz * step;
+    return true;
+  }
+
+  for (const angle of CAVE_STEER_ANGLES) {
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const sx = nx * cos - nz * sin;
+    const sz = nx * sin + nz * cos;
+    const x = enemy.position[0] + sx * step;
+    const z = enemy.position[2] + sz * step;
+
+    if (caveWalkable(x, z)) {
+      enemy.position[0] = x;
+      enemy.position[2] = z;
+      return true;
+    }
+  }
+
+  return false;
+}
+
 const SNAPSHOT_INTERVAL_MS = 80;
 const MAIN_WORLD_LIMIT = 480;
 const MAIN_WORLD_SAFE_RADIUS = 34;
@@ -1160,15 +1416,28 @@ function serializeCanyonEnemies(player) {
   }));
 }
 
-function updateCanyonPatrol(enemy, cfg, now) {
+function updateCanyonPatrol(enemy, cfg, now, constrained = false) {
   if (!enemy.patrolTarget) {
     if (now < enemy.patrolWaitUntil) return;
-    const angle = Math.random() * Math.PI * 2;
-    const r = Math.random() * cfg.patrolRadius;
-    enemy.patrolTarget = [
-      enemy.spawnPoint[0] + Math.cos(angle) * r,
-      enemy.spawnPoint[2] + Math.sin(angle) * r,
-    ];
+
+    const radius = constrained ? Math.min(cfg.patrolRadius, 9) : cfg.patrolRadius;
+
+    for (let attempt = 0; attempt < (constrained ? 10 : 1); attempt++) {
+      const angle = Math.random() * Math.PI * 2;
+      const r = Math.random() * radius;
+      const x = enemy.spawnPoint[0] + Math.cos(angle) * r;
+      const z = enemy.spawnPoint[2] + Math.sin(angle) * r;
+
+      if (!constrained || caveWalkable(x, z)) {
+        enemy.patrolTarget = [x, z];
+        break;
+      }
+    }
+
+    if (!enemy.patrolTarget) {
+      enemy.patrolWaitUntil = now + 1500;
+      return;
+    }
   }
 
   const dx = enemy.patrolTarget[0] - enemy.position[0];
@@ -1182,10 +1451,11 @@ function updateCanyonPatrol(enemy, cfg, now) {
     return;
   }
 
-  const len = dist || 1;
   const step = cfg.patrolSpeed * (CANYON_CONFIG.tickRate / 1000);
-  enemy.position[0] += (dx / len) * step;
-  enemy.position[2] += (dz / len) * step;
+  if (!stepEnemy(enemy, dx, dz, step, constrained)) {
+    enemy.patrolTarget = null;
+    enemy.patrolWaitUntil = now + 800;
+  }
 }
 
 function markPlayerDead(target, killerId, position) {
@@ -1499,6 +1769,8 @@ function canyonTick() {
     const enemies = activeEnemiesFor(player);
     if (!enemies || enemies.size === 0) continue;
 
+    const inCave = player.locationId === CAVE_LOCATION_ID;
+
     for (const enemy of enemies.values()) {
       if (!enemy.alive) continue;
       const cfg = ENEMY_TYPES[enemy.type];
@@ -1538,17 +1810,20 @@ function canyonTick() {
 
         if (dist > cfg.attackRange) {
           const speed = dist > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear;
-          const len = dist || 1;
           const step = speed * (CANYON_CONFIG.tickRate / 1000);
-          enemy.position[0] += (dx / len) * step;
-          enemy.position[2] += (dz / len) * step;
+          const [steerX, steerZ] = inCave
+            ? caveChaseDirection(enemy, player.position[0], player.position[2], now)
+            : [dx, dz];
+          stepEnemy(enemy, steerX, steerZ, step, inCave);
         } else if (now - enemy.lastAttackTime >= cfg.attackCooldown) {
           enemy.lastAttackTime = now;
           damagePlayerByCanyonEnemy(player, enemy);
         }
       } else {
-        updateCanyonPatrol(enemy, cfg, now);
+        updateCanyonPatrol(enemy, cfg, now, inCave);
       }
+
+      if (inCave) nudgeIntoCave(enemy.position);
 
       enemy.positionHistory.push({ position: [...enemy.position], time: now });
       enemy.positionHistory = enemy.positionHistory.filter((p) => now - p.time < 1000);
