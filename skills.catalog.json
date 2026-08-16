@@ -1,0 +1,1016 @@
+{
+  "version": 1,
+  "capstoneColumnPoints": 18,
+  "columns": [
+    { "id": "core", "branch": "core", "name": "Foundation", "description": "Health, stamina and resources both specialisations rely on." },
+    { "id": "ordnance", "branch": "gunslinger", "name": "Ordnance", "description": "Damage, fire modes and ammunition." },
+    { "id": "kinetics", "branch": "gunslinger", "name": "Kinetics", "description": "Rolls, barriers and staying alive." },
+    { "id": "fire_support", "branch": "gunslinger", "name": "Fire Support", "description": "Grenades, zones and squad buffs." },
+    { "id": "evocation", "branch": "arcanist", "name": "Evocation", "description": "Bolt damage, staff modes and burst spells." },
+    { "id": "warding", "branch": "arcanist", "name": "Warding", "description": "Blinks, shields and survival." },
+    { "id": "sorcery", "branch": "arcanist", "name": "Sorcery", "description": "Slows, wells and support runes." }
+  ],
+  "nodes": [
+    {
+      "id": "core_vitality",
+      "column": "core",
+      "row": 1,
+      "name": "Vitality",
+      "description": "Raises maximum health.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 2, "columnPoints": 0 },
+      "effects": [{ "stat": "maxHealth", "op": "add", "perRank": [8, 16, 25] }]
+    },
+    {
+      "id": "core_conditioning",
+      "column": "core",
+      "row": 2,
+      "name": "Conditioning",
+      "description": "Move faster on foot.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 6, "columnPoints": 0 },
+      "effects": [{ "stat": "moveSpeed", "op": "addPercent", "perRank": [4, 8, 12] }]
+    },
+    {
+      "id": "core_energy_flow",
+      "column": "core",
+      "row": 3,
+      "name": "Energy Flow",
+      "description": "Regenerate energy faster.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 12, "columnPoints": 0 },
+      "effects": [{ "stat": "energyRegen", "op": "add", "perRank": [1.5, 3, 5] }]
+    },
+    {
+      "id": "core_battle_focus",
+      "column": "core",
+      "row": 4,
+      "name": "Battle Focus",
+      "description": "Raises the energy pool.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 18, "columnPoints": 0 },
+      "effects": [{ "stat": "maxEnergy", "op": "add", "perRank": [5, 10, 15] }]
+    },
+    {
+      "id": "core_scavenger",
+      "column": "core",
+      "row": 5,
+      "name": "Scavenger",
+      "description": "Enemies drop more loot and Ash.",
+      "kind": "passive",
+      "maxRank": 2,
+      "requires": { "level": 22, "columnPoints": 0 },
+      "effects": [{ "stat": "lootBonus", "op": "addPercent", "perRank": [10, 20] }]
+    },
+    {
+      "id": "core_resilience",
+      "column": "core",
+      "row": 6,
+      "name": "Resilience",
+      "description": "Take less damage from every source.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 30, "columnPoints": 0 },
+      "effects": [{ "stat": "damageTaken", "op": "addPercent", "perRank": [-4, -8, -12] }]
+    },
+
+    {
+      "id": "gun_steady_aim",
+      "column": "ordnance",
+      "row": 1,
+      "name": "Steady Aim",
+      "description": "Rifle rounds hit harder.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 2, "columnPoints": 0 },
+      "effects": [{ "stat": "weaponDamage", "op": "addPercent", "perRank": [4, 8, 12] }]
+    },
+    {
+      "id": "gun_burst_fire",
+      "column": "ordnance",
+      "row": 2,
+      "name": "Burst Fire",
+      "description": "Unlocks a three-round burst mode.",
+      "kind": "mode",
+      "maxRank": 1,
+      "requires": { "level": 8, "columnPoints": 3 },
+      "mode": { "id": "burst", "name": "Burst", "fireRateMs": 90, "burstSize": 3, "burstPauseMs": 320, "damageMult": 1.1, "spreadMult": 1 }
+    },
+    {
+      "id": "gun_extended_mag",
+      "column": "ordnance",
+      "row": 3,
+      "name": "Extended Mag",
+      "description": "Carry more rounds per magazine.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 10, "columnPoints": 4 },
+      "effects": [{ "stat": "magSize", "op": "add", "perRank": [5, 10, 15] }]
+    },
+    {
+      "id": "gun_armor_piercing",
+      "column": "ordnance",
+      "row": 4,
+      "name": "Armor Piercing",
+      "description": "Rounds ignore part of enemy armour and player shields.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 16, "columnPoints": 6 },
+      "effects": [{ "stat": "armorPen", "op": "addPercent", "perRank": [15, 30, 45] }]
+    },
+    {
+      "id": "gun_hollow_point",
+      "column": "ordnance",
+      "row": 5,
+      "name": "Hollow Point",
+      "description": "More damage against targets with no shield left.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 20, "columnPoints": 9 },
+      "effects": [{ "stat": "damageVsUnshielded", "op": "addPercent", "perRank": [10, 20, 30] }]
+    },
+    {
+      "id": "gun_full_auto",
+      "column": "ordnance",
+      "row": 6,
+      "name": "Full Auto",
+      "description": "Unlocks continuous fire at the cost of damage and accuracy.",
+      "kind": "mode",
+      "maxRank": 1,
+      "requires": { "level": 24, "columnPoints": 11 },
+      "mode": { "id": "auto", "name": "Full Auto", "fireRateMs": 100, "burstSize": 0, "burstPauseMs": 0, "damageMult": 0.92, "spreadMult": 1.35 }
+    },
+    {
+      "id": "gun_overpressure",
+      "column": "ordnance",
+      "row": 7,
+      "name": "Overpressure",
+      "description": "Hotter loads: more damage, smaller magazine.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 32, "columnPoints": 13 },
+      "effects": [
+        { "stat": "weaponDamage", "op": "addPercent", "perRank": [6, 12, 20] },
+        { "stat": "magSize", "op": "addPercent", "perRank": [-10, -10, -10] }
+      ]
+    },
+    {
+      "id": "gun_ricochet",
+      "column": "ordnance",
+      "row": 8,
+      "name": "Ricochet",
+      "description": "Shots can bounce into a second target.",
+      "kind": "passive",
+      "maxRank": 2,
+      "requires": { "level": 36, "columnPoints": 15 },
+      "effects": [
+        { "stat": "ricochetChance", "op": "addPercent", "perRank": [25, 45] },
+        { "stat": "ricochetDamage", "op": "addPercent", "perRank": [50, 50] }
+      ]
+    },
+    {
+      "id": "gun_explosive_rounds",
+      "column": "ordnance",
+      "row": 9,
+      "name": "Explosive Rounds",
+      "description": "Every fifth round detonates on impact.",
+      "kind": "passive",
+      "maxRank": 2,
+      "requires": { "level": 40, "columnPoints": 17 },
+      "effects": [
+        { "stat": "explosiveEveryNthShot", "op": "set", "perRank": [5, 4] },
+        { "stat": "explosiveDamage", "op": "addPercent", "perRank": [40, 55] },
+        { "stat": "explosiveRadius", "op": "set", "perRank": [2.5, 3] }
+      ]
+    },
+    {
+      "id": "gun_overdrive",
+      "column": "ordnance",
+      "row": 10,
+      "name": "Overdrive",
+      "description": "Eight seconds with no reloads and a faster trigger.",
+      "kind": "active",
+      "capstone": true,
+      "maxRank": 1,
+      "requires": { "level": 46, "columnPoints": 18 },
+      "ability": {
+        "id": "overdrive",
+        "castType": "self",
+        "cooldownMs": 120000,
+        "energyCost": 100,
+        "durationMs": 8000,
+        "params": { "noReload": true, "fireRateMult": 0.75 }
+      }
+    },
+
+    {
+      "id": "gun_combat_roll",
+      "column": "kinetics",
+      "row": 1,
+      "name": "Combat Roll",
+      "description": "Roll six metres with a brief window of invulnerability.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 2, "columnPoints": 0 },
+      "ability": {
+        "id": "combat_roll",
+        "castType": "self",
+        "cooldownMs": 8000,
+        "energyCost": 25,
+        "durationMs": 400,
+        "params": { "distance": 6, "iframesMs": 250 }
+      }
+    },
+    {
+      "id": "gun_toughened_plate",
+      "column": "kinetics",
+      "row": 2,
+      "name": "Toughened Plate",
+      "description": "Heavier plating, more health.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 8, "columnPoints": 1 },
+      "effects": [{ "stat": "maxHealth", "op": "add", "perRank": [10, 20, 30] }]
+    },
+    {
+      "id": "gun_kinetic_barrier",
+      "column": "kinetics",
+      "row": 3,
+      "name": "Kinetic Barrier",
+      "description": "Projects a shield that absorbs damage for six seconds.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 12, "columnPoints": 4 },
+      "ability": {
+        "id": "kinetic_barrier",
+        "castType": "self",
+        "cooldownMs": 20000,
+        "energyCost": 40,
+        "durationMs": 6000,
+        "params": { "shield": 120 }
+      }
+    },
+    {
+      "id": "gun_adrenaline",
+      "column": "kinetics",
+      "row": 4,
+      "name": "Adrenaline",
+      "description": "Kills restore health.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 18, "columnPoints": 5 },
+      "effects": [{ "stat": "healOnKill", "op": "add", "perRank": [5, 10, 15] }]
+    },
+    {
+      "id": "gun_rolling_reload",
+      "column": "kinetics",
+      "row": 5,
+      "name": "Rolling Reload",
+      "description": "Reload faster, and keep reloading through a roll.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 22, "columnPoints": 8 },
+      "effects": [
+        { "stat": "reloadSpeed", "op": "addPercent", "perRank": [20, 30, 40] },
+        { "stat": "reloadWhileDashing", "op": "set", "perRank": [1, 1, 1] }
+      ]
+    },
+    {
+      "id": "gun_evasive_momentum",
+      "column": "kinetics",
+      "row": 6,
+      "name": "Evasive Momentum",
+      "description": "Sprint burst for two seconds after a roll.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 26, "columnPoints": 11 },
+      "effects": [{ "stat": "postDashSpeed", "op": "addPercent", "perRank": [20, 30, 40] }]
+    },
+    {
+      "id": "gun_barrier_overcharge",
+      "column": "kinetics",
+      "row": 7,
+      "name": "Barrier Overcharge",
+      "description": "Your shields hold far more damage.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 32, "columnPoints": 13 },
+      "effects": [{ "stat": "shieldStrength", "op": "add", "perRank": [40, 80, 120] }]
+    },
+    {
+      "id": "gun_double_tap",
+      "column": "kinetics",
+      "row": 8,
+      "name": "Double Tap",
+      "description": "Carry a second roll charge.",
+      "kind": "passive",
+      "maxRank": 1,
+      "requires": { "level": 36, "columnPoints": 15 },
+      "effects": [{ "stat": "dashCharges", "op": "add", "perRank": [1] }]
+    },
+    {
+      "id": "gun_last_stand",
+      "column": "kinetics",
+      "row": 9,
+      "name": "Last Stand",
+      "description": "Tougher while badly wounded.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 38, "columnPoints": 16 },
+      "effects": [
+        { "stat": "lowHealthDamageTaken", "op": "addPercent", "perRank": [-8, -16, -25] },
+        { "stat": "lowHealthThreshold", "op": "set", "perRank": [0.35, 0.35, 0.35] }
+      ]
+    },
+    {
+      "id": "gun_second_wind",
+      "column": "kinetics",
+      "row": 9,
+      "name": "Second Wind",
+      "description": "A lethal hit leaves you standing instead of dead.",
+      "kind": "trigger",
+      "maxRank": 1,
+      "requires": { "level": 40, "columnPoints": 17 },
+      "trigger": {
+        "id": "second_wind",
+        "cooldownMs": 180000,
+        "pvpCooldownMs": 300000,
+        "params": { "reviveHealth": 25, "invulnerabilityMs": 2000 }
+      }
+    },
+    {
+      "id": "gun_bulwark",
+      "column": "kinetics",
+      "row": 10,
+      "name": "Bulwark",
+      "description": "Six seconds of heavy damage reduction and crowd control immunity.",
+      "kind": "active",
+      "capstone": true,
+      "maxRank": 1,
+      "requires": { "level": 46, "columnPoints": 18 },
+      "ability": {
+        "id": "bulwark",
+        "castType": "self",
+        "cooldownMs": 100000,
+        "energyCost": 100,
+        "durationMs": 6000,
+        "params": { "damageTakenMult": 0.4, "ccImmune": true }
+      }
+    },
+
+    {
+      "id": "gun_frag_grenade",
+      "column": "fire_support",
+      "row": 1,
+      "name": "Frag Grenade",
+      "description": "Thrown charge that detonates in a six metre radius.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 2, "columnPoints": 0 },
+      "ability": {
+        "id": "frag_grenade",
+        "castType": "projectile",
+        "cooldownMs": 12000,
+        "energyCost": 30,
+        "params": { "damage": 90, "radius": 6, "fuseMs": 1200, "damageClass": "singleHit" }
+      }
+    },
+    {
+      "id": "gun_demolition",
+      "column": "fire_support",
+      "row": 2,
+      "name": "Demolition",
+      "description": "Bigger, nastier explosions.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 8, "columnPoints": 1 },
+      "effects": [
+        { "stat": "aoeDamage", "op": "addPercent", "perRank": [15, 30, 50] },
+        { "stat": "aoeRadius", "op": "addPercent", "perRank": [10, 10, 10] }
+      ]
+    },
+    {
+      "id": "gun_suppression_field",
+      "column": "fire_support",
+      "row": 3,
+      "name": "Suppression Field",
+      "description": "Zone that slows enemies and blunts their damage.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 14, "columnPoints": 4 },
+      "ability": {
+        "id": "suppression_field",
+        "castType": "ground",
+        "cooldownMs": 25000,
+        "energyCost": 45,
+        "durationMs": 6000,
+        "params": { "radius": 8, "slowPercent": 35, "enemyDamagePercent": -20 }
+      }
+    },
+    {
+      "id": "gun_marked_target",
+      "column": "fire_support",
+      "row": 4,
+      "name": "Marked Target",
+      "description": "Paint a target so everyone hurts it more.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 20, "columnPoints": 5 },
+      "ability": {
+        "id": "marked_target",
+        "castType": "target",
+        "cooldownMs": 15000,
+        "energyCost": 20,
+        "durationMs": 10000,
+        "params": { "damageTakenPercent": 15 }
+      }
+    },
+    {
+      "id": "gun_shrapnel",
+      "column": "fire_support",
+      "row": 5,
+      "name": "Shrapnel",
+      "description": "Explosions leave bleeding wounds.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 24, "columnPoints": 6 },
+      "effects": [
+        { "stat": "bleedDamage", "op": "add", "perRank": [10, 20, 30] },
+        { "stat": "bleedDurationMs", "op": "set", "perRank": [4000, 4000, 4000] }
+      ]
+    },
+    {
+      "id": "gun_field_engineer",
+      "column": "fire_support",
+      "row": 6,
+      "name": "Field Engineer",
+      "description": "Grenades and zones come back sooner.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 28, "columnPoints": 9 },
+      "effects": [{ "stat": "supportCooldown", "op": "addPercent", "perRank": [-10, -20, -30] }]
+    },
+    {
+      "id": "gun_shockwave",
+      "column": "fire_support",
+      "row": 7,
+      "name": "Shockwave",
+      "description": "Blast that throws everything nearby off its feet.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 30, "columnPoints": 12 },
+      "ability": {
+        "id": "shockwave",
+        "castType": "self",
+        "cooldownMs": 30000,
+        "energyCost": 50,
+        "params": { "damage": 60, "radius": 7, "knockback": 7, "stunMs": 1500, "damageClass": "singleHit" }
+      }
+    },
+    {
+      "id": "gun_squad_tactics",
+      "column": "fire_support",
+      "row": 8,
+      "name": "Squad Tactics",
+      "description": "Your mark also speeds up allied trigger fingers.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 34, "columnPoints": 13 },
+      "effects": [{ "stat": "markedAllyFireRate", "op": "addPercent", "perRank": [5, 10, 15] }]
+    },
+    {
+      "id": "gun_cluster_charge",
+      "column": "fire_support",
+      "row": 9,
+      "name": "Cluster Charge",
+      "description": "Grenades split into smaller charges after the first blast.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 38, "columnPoints": 16 },
+      "effects": [
+        { "stat": "clusterCount", "op": "add", "perRank": [2, 3, 4] },
+        { "stat": "clusterDamage", "op": "addPercent", "perRank": [35, 40, 45] }
+      ]
+    },
+    {
+      "id": "gun_extra_charge",
+      "column": "fire_support",
+      "row": 9,
+      "name": "Extra Charge",
+      "description": "One more grenade in the pouch.",
+      "kind": "passive",
+      "maxRank": 2,
+      "requires": { "level": 42, "columnPoints": 17 },
+      "effects": [{ "stat": "grenadeCharges", "op": "add", "perRank": [1, 2] }]
+    },
+    {
+      "id": "gun_barrage",
+      "column": "fire_support",
+      "row": 10,
+      "name": "Barrage",
+      "description": "Call five shells down on a marked area.",
+      "kind": "active",
+      "capstone": true,
+      "maxRank": 1,
+      "requires": { "level": 46, "columnPoints": 18 },
+      "ability": {
+        "id": "barrage",
+        "castType": "ground",
+        "cooldownMs": 150000,
+        "energyCost": 100,
+        "durationMs": 4000,
+        "params": { "salvos": 5, "damage": 120, "radius": 8, "damageClass": "ultimate" }
+      }
+    },
+
+    {
+      "id": "arc_focused_core",
+      "column": "evocation",
+      "row": 1,
+      "name": "Focused Core",
+      "description": "Sharpens every spell you cast.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 2, "columnPoints": 0 },
+      "effects": [{ "stat": "spellDamage", "op": "addPercent", "perRank": [4, 8, 12] }]
+    },
+    {
+      "id": "arc_charged_bolt",
+      "column": "evocation",
+      "row": 2,
+      "name": "Charged Bolt",
+      "description": "Hold to charge a heavy bolt that punches through two targets.",
+      "kind": "mode",
+      "maxRank": 1,
+      "requires": { "level": 8, "columnPoints": 3 },
+      "mode": { "id": "charged", "name": "Charged", "chargeMs": 600, "damageMult": 2.2, "pierceCount": 2, "manaCostMult": 2.5 }
+    },
+    {
+      "id": "arc_mana_well",
+      "column": "evocation",
+      "row": 3,
+      "name": "Mana Well",
+      "description": "Deepens the mana pool.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 10, "columnPoints": 4 },
+      "effects": [{ "stat": "maxEnergy", "op": "add", "perRank": [10, 20, 30] }]
+    },
+    {
+      "id": "arc_shatter_ward",
+      "column": "evocation",
+      "row": 4,
+      "name": "Shatter Ward",
+      "description": "Strips a target's shield outright and burns what is underneath.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 16, "columnPoints": 7 },
+      "ability": {
+        "id": "shatter_ward",
+        "castType": "target",
+        "cooldownMs": 18000,
+        "energyCost": 35,
+        "params": { "damage": 80, "shieldStrip": 1, "armorStripPercent": 45, "armorStripMs": 6000, "damageClass": "singleHit" }
+      }
+    },
+    {
+      "id": "arc_spell_velocity",
+      "column": "evocation",
+      "row": 5,
+      "name": "Spell Velocity",
+      "description": "Faster bolts that cost less to sling.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 20, "columnPoints": 8 },
+      "effects": [
+        { "stat": "projectileSpeed", "op": "addPercent", "perRank": [10, 20, 30] },
+        { "stat": "manaCost", "op": "addPercent", "perRank": [-5, -10, -15] }
+      ]
+    },
+    {
+      "id": "arc_chain_lightning",
+      "column": "evocation",
+      "row": 6,
+      "name": "Chain Lightning",
+      "description": "Arc that leaps between nearby enemies.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 24, "columnPoints": 11 },
+      "ability": {
+        "id": "chain_lightning",
+        "castType": "target",
+        "cooldownMs": 14000,
+        "energyCost": 45,
+        "params": { "damage": 110, "jumps": 4, "jumpFalloffPercent": 20, "jumpRange": 8, "damageClass": "singleHit" }
+      }
+    },
+    {
+      "id": "arc_arcane_surge",
+      "column": "evocation",
+      "row": 7,
+      "name": "Arcane Surge",
+      "description": "More power drawn per cast, at a higher mana price.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 32, "columnPoints": 12 },
+      "effects": [
+        { "stat": "spellDamage", "op": "addPercent", "perRank": [6, 12, 20] },
+        { "stat": "manaCost", "op": "addPercent", "perRank": [8, 8, 8] }
+      ]
+    },
+    {
+      "id": "arc_elemental_attunement",
+      "column": "evocation",
+      "row": 8,
+      "name": "Elemental Attunement",
+      "description": "Charged bolts set the target alight.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 28, "columnPoints": 15 },
+      "effects": [
+        { "stat": "burnDamage", "op": "add", "perRank": [30, 60, 90] },
+        { "stat": "burnDurationMs", "op": "set", "perRank": [5000, 5000, 5000] }
+      ]
+    },
+    {
+      "id": "arc_bolt_splitting",
+      "column": "evocation",
+      "row": 9,
+      "name": "Bolt Splitting",
+      "description": "Basic attack fans out into three bolts.",
+      "kind": "mode",
+      "maxRank": 1,
+      "requires": { "level": 34, "columnPoints": 16 },
+      "mode": { "id": "split", "name": "Split", "projectiles": 3, "damageMult": 0.45, "spreadDegrees": 12 }
+    },
+    {
+      "id": "arc_meteor",
+      "column": "evocation",
+      "row": 9,
+      "name": "Meteor",
+      "description": "Drags a burning rock down onto a chosen spot.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 40, "columnPoints": 17 },
+      "ability": {
+        "id": "meteor",
+        "castType": "ground",
+        "cooldownMs": 45000,
+        "energyCost": 70,
+        "params": { "damage": 260, "radius": 5, "impactDelayMs": 1400, "groundFireMs": 6000, "groundFireTick": 20, "damageClass": "ultimate" }
+      }
+    },
+    {
+      "id": "arc_ascendance",
+      "column": "evocation",
+      "row": 10,
+      "name": "Ascendance",
+      "description": "Eight seconds where nothing costs mana.",
+      "kind": "active",
+      "capstone": true,
+      "maxRank": 1,
+      "requires": { "level": 46, "columnPoints": 18 },
+      "ability": {
+        "id": "ascendance",
+        "castType": "self",
+        "cooldownMs": 120000,
+        "energyCost": 100,
+        "durationMs": 8000,
+        "params": { "freeCasts": true, "spellDamagePercent": 20 }
+      }
+    },
+
+    {
+      "id": "arc_blink",
+      "column": "warding",
+      "row": 1,
+      "name": "Blink",
+      "description": "Step eight metres through space.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 2, "columnPoints": 0 },
+      "ability": {
+        "id": "blink",
+        "castType": "self",
+        "cooldownMs": 9000,
+        "energyCost": 25,
+        "params": { "distance": 8 }
+      }
+    },
+    {
+      "id": "arc_arcane_skin",
+      "column": "warding",
+      "row": 2,
+      "name": "Arcane Skin",
+      "description": "Woven robes that hold you together.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 8, "columnPoints": 1 },
+      "effects": [{ "stat": "maxHealth", "op": "add", "perRank": [10, 20, 30] }]
+    },
+    {
+      "id": "arc_mana_shield",
+      "column": "warding",
+      "row": 3,
+      "name": "Mana Shield",
+      "description": "A ward that soaks damage and drains mana as it holds.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 12, "columnPoints": 4 },
+      "ability": {
+        "id": "mana_shield",
+        "castType": "self",
+        "cooldownMs": 20000,
+        "energyCost": 40,
+        "durationMs": 6000,
+        "params": { "shield": 120, "manaPerDamage": 0.5 }
+      }
+    },
+    {
+      "id": "arc_leyline_draw",
+      "column": "warding",
+      "row": 4,
+      "name": "Leyline Draw",
+      "description": "Kills feed mana straight back to you.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 18, "columnPoints": 5 },
+      "effects": [{ "stat": "energyOnKill", "op": "add", "perRank": [8, 16, 24] }]
+    },
+    {
+      "id": "arc_phase_weave",
+      "column": "warding",
+      "row": 5,
+      "name": "Phase Weave",
+      "description": "Briefly half-real after a blink.",
+      "kind": "passive",
+      "maxRank": 2,
+      "requires": { "level": 22, "columnPoints": 8 },
+      "effects": [
+        { "stat": "postDashSpeed", "op": "addPercent", "perRank": [25, 35] },
+        { "stat": "postDashDamageTaken", "op": "addPercent", "perRank": [-20, -30] }
+      ]
+    },
+    {
+      "id": "arc_ward_overcharge",
+      "column": "warding",
+      "row": 6,
+      "name": "Ward Overcharge",
+      "description": "Your wards hold far more damage.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 28, "columnPoints": 10 },
+      "effects": [{ "stat": "shieldStrength", "op": "add", "perRank": [40, 80, 120] }]
+    },
+    {
+      "id": "arc_arcane_fortitude",
+      "column": "warding",
+      "row": 7,
+      "name": "Arcane Fortitude",
+      "description": "Standing ward against everything thrown at you.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 32, "columnPoints": 13 },
+      "effects": [{ "stat": "damageTaken", "op": "addPercent", "perRank": [-4, -8, -12] }]
+    },
+    {
+      "id": "arc_reflect_ward",
+      "column": "warding",
+      "row": 8,
+      "name": "Reflect Ward",
+      "description": "Three seconds where part of the damage goes home to the sender.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 34, "columnPoints": 15 },
+      "ability": {
+        "id": "reflect_ward",
+        "castType": "self",
+        "cooldownMs": 35000,
+        "energyCost": 50,
+        "durationMs": 3000,
+        "params": { "reflectPercent": 40, "damageClass": "singleHit" }
+      }
+    },
+    {
+      "id": "arc_runic_regeneration",
+      "column": "warding",
+      "row": 9,
+      "name": "Runic Regeneration",
+      "description": "Casting a ward knits your wounds for a few seconds.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 38, "columnPoints": 16 },
+      "effects": [
+        { "stat": "postShieldRegen", "op": "add", "perRank": [2, 4, 6] },
+        { "stat": "postShieldRegenMs", "op": "set", "perRank": [5000, 5000, 5000] }
+      ]
+    },
+    {
+      "id": "arc_soul_tether",
+      "column": "warding",
+      "row": 9,
+      "name": "Soul Tether",
+      "description": "A lethal hit phases you out instead of killing you.",
+      "kind": "trigger",
+      "maxRank": 1,
+      "requires": { "level": 40, "columnPoints": 17 },
+      "trigger": {
+        "id": "soul_tether",
+        "cooldownMs": 180000,
+        "pvpCooldownMs": 300000,
+        "params": { "reviveHealth": 25, "invulnerabilityMs": 2000 }
+      }
+    },
+    {
+      "id": "arc_phase_step",
+      "column": "warding",
+      "row": 10,
+      "name": "Phase Step",
+      "description": "Three seconds outside of harm entirely.",
+      "kind": "active",
+      "capstone": true,
+      "maxRank": 1,
+      "requires": { "level": 46, "columnPoints": 18 },
+      "ability": {
+        "id": "phase_step",
+        "castType": "self",
+        "cooldownMs": 100000,
+        "energyCost": 100,
+        "durationMs": 3000,
+        "params": { "invulnerable": true, "passThroughEnemies": true }
+      }
+    },
+
+    {
+      "id": "arc_slow_field",
+      "column": "sorcery",
+      "row": 1,
+      "name": "Slow Field",
+      "description": "Ground zone that drags enemies to a crawl.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 2, "columnPoints": 0 },
+      "ability": {
+        "id": "slow_field",
+        "castType": "ground",
+        "cooldownMs": 20000,
+        "energyCost": 30,
+        "durationMs": 6000,
+        "params": { "radius": 8, "slowPercent": 40 }
+      }
+    },
+    {
+      "id": "arc_runic_insight",
+      "column": "sorcery",
+      "row": 2,
+      "name": "Runic Insight",
+      "description": "Control spells recharge sooner.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 8, "columnPoints": 1 },
+      "effects": [{ "stat": "controlCooldown", "op": "addPercent", "perRank": [-8, -15, -22] }]
+    },
+    {
+      "id": "arc_gravity_well",
+      "column": "sorcery",
+      "row": 3,
+      "name": "Gravity Well",
+      "description": "Pulls everything nearby into one spot.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 14, "columnPoints": 4 },
+      "ability": {
+        "id": "gravity_well",
+        "castType": "ground",
+        "cooldownMs": 28000,
+        "energyCost": 50,
+        "durationMs": 3000,
+        "params": { "radius": 5, "pullStrength": 6 }
+      }
+    },
+    {
+      "id": "arc_healing_rune",
+      "column": "sorcery",
+      "row": 4,
+      "name": "Healing Rune",
+      "description": "A rune that mends you and anyone standing on it.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 20, "columnPoints": 5 },
+      "ability": {
+        "id": "healing_rune",
+        "castType": "ground",
+        "cooldownMs": 30000,
+        "energyCost": 45,
+        "durationMs": 8000,
+        "params": { "radius": 5, "healPerSecond": 8 }
+      }
+    },
+    {
+      "id": "arc_amplify",
+      "column": "sorcery",
+      "row": 5,
+      "name": "Amplify",
+      "description": "Wider zones that linger longer.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 24, "columnPoints": 6 },
+      "effects": [
+        { "stat": "zoneRadius", "op": "addPercent", "perRank": [15, 30, 50] },
+        { "stat": "zoneDuration", "op": "addPercent", "perRank": [15, 30, 50] }
+      ]
+    },
+    {
+      "id": "arc_rune_mastery",
+      "column": "sorcery",
+      "row": 6,
+      "name": "Rune Mastery",
+      "description": "Your runes mend faster and hold longer.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 26, "columnPoints": 9 },
+      "effects": [{ "stat": "healingPower", "op": "addPercent", "perRank": [10, 20, 30] }]
+    },
+    {
+      "id": "arc_hex",
+      "column": "sorcery",
+      "row": 7,
+      "name": "Hex",
+      "description": "Curse that leaves the target slower and softer.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 30, "columnPoints": 12 },
+      "ability": {
+        "id": "hex",
+        "castType": "target",
+        "cooldownMs": 15000,
+        "energyCost": 20,
+        "durationMs": 10000,
+        "params": { "damageTakenPercent": 18, "slowPercent": 20 }
+      }
+    },
+    {
+      "id": "arc_mana_feedback",
+      "column": "sorcery",
+      "row": 8,
+      "name": "Mana Feedback",
+      "description": "Your zones burn whatever stands in them.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 34, "columnPoints": 13 },
+      "effects": [{ "stat": "zoneTickDamage", "op": "add", "perRank": [8, 16, 24] }]
+    },
+    {
+      "id": "arc_arcane_conduit",
+      "column": "sorcery",
+      "row": 9,
+      "name": "Arcane Conduit",
+      "description": "Allies standing in your zones hit harder.",
+      "kind": "passive",
+      "maxRank": 3,
+      "requires": { "level": 38, "columnPoints": 16 },
+      "effects": [{ "stat": "allyDamageInZone", "op": "addPercent", "perRank": [10, 15, 20] }]
+    },
+    {
+      "id": "arc_time_dilation",
+      "column": "sorcery",
+      "row": 9,
+      "name": "Time Dilation",
+      "description": "Bubble where enemies crawl and allies sprint.",
+      "kind": "active",
+      "maxRank": 1,
+      "requires": { "level": 40, "columnPoints": 17 },
+      "ability": {
+        "id": "time_dilation",
+        "castType": "ground",
+        "cooldownMs": 50000,
+        "energyCost": 70,
+        "durationMs": 5000,
+        "params": { "radius": 6, "enemySlowPercent": 60, "allySpeedPercent": 20 }
+      }
+    },
+    {
+      "id": "arc_cataclysm",
+      "column": "sorcery",
+      "row": 10,
+      "name": "Cataclysm",
+      "description": "Five seconds of storm over a ten metre circle.",
+      "kind": "active",
+      "capstone": true,
+      "maxRank": 1,
+      "requires": { "level": 46, "columnPoints": 18 },
+      "ability": {
+        "id": "cataclysm",
+        "castType": "ground",
+        "cooldownMs": 150000,
+        "energyCost": 100,
+        "durationMs": 5000,
+        "params": { "damagePerSecond": 60, "radius": 10, "slowPercent": 30, "damageClass": "ultimate" }
+      }
+    }
+  ]
+}

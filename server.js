@@ -4,6 +4,7 @@ const WebSocket = require('ws');
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
+const worldTerrain = require('./worldTerrain');
 const { FACTION_TASKS, FACTION_TASKS_BY_KEY } = require('./factionTasks');
 const {
   QUEST_LISTING_FEE_ASH,
@@ -15,6 +16,8 @@ const {
   isValidXPostUrl,
   questTotalCostAsh,
 } = require('./factionQuests');
+const progression = require('./progression');
+const skills = require('./skills');
 
 const PORT = process.env.PORT || 3001;
 const MAX_CONNECTIONS = 2000;
@@ -60,6 +63,7 @@ const CONFIG = {
     skinUpdateRateLimit: 3,
     saveProgressRateLimit: 5,
     questRateLimit: 10,
+    progressionRateLimit: 10,
     canyonRateLimit: 10,
     factionRateLimit: 10,
     factionSearchRateLimit: 15,
@@ -100,6 +104,14 @@ const WEAPON_CONFIG = {
 };
 
 const PLAYER_WEAPON_DAMAGE_TO_ENEMY = 25;
+const BASE_PVP_DAMAGE = 5;
+const BASE_MAX_HEALTH = 100;
+
+const BRANCH_UNLOCK_LEVEL = 2;
+const ABILITY_SLOTS = ['q', 'f', 'c', 'v', 'x'];
+const CANYON_LEVELS_PER_SEGMENT = 5;
+const CAVE_CONTENT_LEVEL = 15;
+const MAIN_WORLD_CONTENT_LEVEL = 10;
 
 const RTT_SAMPLE_CEILING_MS = 1000;
 const RTT_SAMPLE_WINDOW = 5;
@@ -154,6 +166,17 @@ const ENEMY_TYPES = {
       { id: 'spit', windup: 700, cooldown: 2400, minRange: 0, maxRange: 46, speed: 30, radius: 3, damage: 22, shots: 1, spread: 0 },
       { id: 'volley', windup: 1150, cooldown: 6200, minRange: 8, maxRange: 46, speed: 22, radius: 3.4, damage: 15, shots: 5, spread: 7 },
       { id: 'pool', windup: 1450, cooldown: 9000, minRange: 6, maxRange: 40, speed: 15, radius: 5.5, damage: 14, shots: 1, spread: 0, pool: { duration: 6500, interval: 700, damage: 9 } },
+    ],
+  },
+  slime_warden: {
+    name: 'Slime Warden', maxHealth: 1600, attackDamage: 0, attackRange: 0, aggroRadius: 58, aggroLeash: 999,
+    attackCooldown: 2000, chaseSpeedNear: 3.4, chaseSpeedFar: 7, chaseNearThreshold: 18,
+    patrolSpeed: 1.6, patrolRadius: 12, scale: 3.4, lootMin: 8, lootMax: 16,
+    ranged: true, preferredRange: 16,
+    attacks: [
+      { id: 'spit', windup: 750, cooldown: 2600, minRange: 0, maxRange: 52, speed: 28, radius: 3, damage: 18, shots: 1, spread: 0 },
+      { id: 'volley', windup: 1200, cooldown: 7000, minRange: 10, maxRange: 52, speed: 21, radius: 3.2, damage: 12, shots: 4, spread: 6 },
+      { id: 'pool', windup: 1500, cooldown: 11000, minRange: 8, maxRange: 46, speed: 15, radius: 5, damage: 8, shots: 1, spread: 0, pool: { duration: 6000, interval: 750, damage: 6 } },
     ],
   },
   husk: {
@@ -211,18 +234,44 @@ function canyonBiomeFor(segment) {
   return CANYON_BIOMES[index];
 }
 
+const ORIENTATION_TARGETS = [
+  { id: 'token-vendor', name: 'Tony', role: 'Trader', locationId: 'tower-main-hall' },
+  { id: 'npc-alfredo', name: 'Alfredo', role: 'Appearance', locationId: 'tower-main-hall' },
+  { id: 'faction-broker', name: 'Alaric', role: 'Factions', locationId: 'tower-main-hall' },
+  { id: 'canyon-dispatcher', name: 'Canyon Dispatcher', role: 'Expeditions', locationId: 'tower-first-floor' },
+  { id: 'gate-steward', name: 'Keeper of Gates', role: 'Token Gates', locationId: 'tower-basement' },
+];
+
+const ORIENTATION_TARGET_IDS = new Set(ORIENTATION_TARGETS.map((t) => t.id));
+
 const QUESTS = {
+  sola_orientation: {
+    id: 'sola_orientation',
+    npc: 'sola',
+    order: 1,
+    title: 'Getting Your Bearings',
+    description: 'Meet every steward in the tower, then come back to me. I will make sure the effort counts.',
+    type: 'visit_npcs',
+    targets: ORIENTATION_TARGETS,
+    targetCount: ORIENTATION_TARGETS.length,
+    rewardAsh: 25,
+    autoStart: true,
+  },
   sola_kill_10: {
     id: 'sola_kill_10',
     npc: 'sola',
+    order: 2,
     title: 'Pest Control',
     description: 'Kill 10 slimes in Slime Valley.',
     type: 'kill_enemies',
     locationId: 'tower-first-floor',
     targetCount: 10,
     rewardAsh: 30,
+    requiresQuest: 'sola_orientation',
   },
 };
+
+const QUEST_LIST = Object.values(QUESTS).sort((a, b) => (a.order || 0) - (b.order || 0));
 
 const DAY_NIGHT_CONFIG = {
   dayDurationMs: 40 * 60 * 1000,
@@ -614,6 +663,15 @@ function getLocationMaxRadius(locationId) {
 
 function isValidPositionForLocation(locationId, pos) {
   if (!isValidPosition(pos, locationId)) return false;
+
+  if (locationId === 'main-world') {
+    const wallLimit = mainWorldPlayerLimit();
+    if (wallLimit !== null) {
+      const [wx, , wz] = pos;
+      if (Math.sqrt(wx * wx + wz * wz) > wallLimit) return false;
+    }
+  }
+
   const maxRadius = getLocationMaxRadius(locationId);
   if (maxRadius == null) return true;
   const [x, , z] = pos;
@@ -694,7 +752,8 @@ function isValidMovement(player, newPosition, deltaTimeMs) {
 
   const seconds = deltaTimeMs / 1000;
   const speed = distance / seconds;
-  const limit = player.locationId === GALAXY_LOCATION_ID ? GALAXY_MAX_SPEED : CONFIG.world.maxSpeed;
+  const base = player.locationId === GALAXY_LOCATION_ID ? GALAXY_MAX_SPEED : CONFIG.world.maxSpeed;
+  const limit = base * (player.combat ? player.combat.moveSpeedMult : 1);
   return speed <= limit * 1.5;
 }
 
@@ -945,6 +1004,10 @@ function buildPlayerJoinPayload(p) {
     skinTextureUrl: p.skinTextureUrl || null,
     cosmeticSkinId: p.cosmeticSkinId || null,
     cosmeticAccessoryId: p.cosmeticAccessoryId || null,
+    level: p.progression.level,
+    tier: progression.tierForLevel(p.progression.level).id,
+    branch: p.progression.branch,
+    weaponTier: progression.weaponTierForLevel(p.progression.level).tier,
   };
 }
 
@@ -1214,6 +1277,391 @@ function broadcastShardState(locationId) {
   });
 }
 
+const TNJ_MINT = process.env.TNJ_TOKEN_MINT_ADDRESS || '';
+
+const WORLD_WALL_TIERS = [
+  { mc: 0, radius: 44 },
+  { mc: 25000, radius: 68 },
+  { mc: 60000, radius: 92 },
+  { mc: 120000, radius: 116 },
+  { mc: 200000, radius: 140 },
+  { mc: 320000, radius: 168 },
+  { mc: 500000, radius: 200 },
+  { mc: 750000, radius: 400 },
+  { mc: 1000000, radius: null },
+];
+
+const WORLD_WALL_MAX_TIER = WORLD_WALL_TIERS.length - 1;
+
+const WORLD_UNLOCKS = [
+  { id: 'lakes', mc: 200000 },
+  { id: 'rift', mc: 500000 },
+  { id: 'port', mc: 500000 },
+  { id: 'tower', mc: 750000 },
+];
+
+const CAVE_PORTAL_MIN_MC = 500000;
+
+const WALL_TIER_ENV = process.env.WORLD_WALL_TIER && Number.isFinite(Number(process.env.WORLD_WALL_TIER))
+  ? Math.max(0, Math.min(WORLD_WALL_TIERS.length - 1, Math.floor(Number(process.env.WORLD_WALL_TIER))))
+  : null;
+const WORLD_MC_POLL_MS = 60000;
+const WORLD_COMMAND_POLL_MS = 15000;
+const WORLD_PERSIST_DEBOUNCE_MS = 2000;
+const WALL_STAND_CLEARANCE = 2.2;
+
+const worldState = {
+  mc: 0,
+  mcPeak: 0,
+  tier: 0,
+  adminTier: null,
+  portal: { status: 'locked', x: 0, z: 0, cooldownUntil: 0, spawnedAt: 0 },
+  lastCommandId: null,
+  loaded: false,
+};
+
+let worldPersistTimer = null;
+
+function wallTierForMc(mc) {
+  let tier = 0;
+  for (let i = 0; i < WORLD_WALL_TIERS.length; i++) {
+    if (mc >= WORLD_WALL_TIERS[i].mc) tier = i;
+  }
+  return tier;
+}
+
+function effectiveWallTier() {
+  if (WALL_TIER_ENV !== null) return WALL_TIER_ENV;
+  if (worldState.adminTier !== null) {
+    return Math.max(0, Math.min(WORLD_WALL_MAX_TIER, worldState.adminTier));
+  }
+  return Math.max(0, Math.min(WORLD_WALL_MAX_TIER, worldState.tier));
+}
+
+function wallRadius() {
+  return WORLD_WALL_TIERS[effectiveWallTier()].radius;
+}
+
+function nextWallTierMc() {
+  const tier = effectiveWallTier();
+  if (tier >= WORLD_WALL_MAX_TIER) return null;
+  return WORLD_WALL_TIERS[tier + 1].mc;
+}
+
+function mainWorldPlayerLimit() {
+  const radius = wallRadius();
+  return radius === null ? null : radius + WALL_STAND_CLEARANCE;
+}
+
+function authenticatedPlayerCount() {
+  let count = 0;
+  players.forEach((p) => {
+    if (p.authenticated) count++;
+  });
+  return count;
+}
+
+function buildWorldStatusPayload() {
+  const tier = effectiveWallTier();
+
+  return {
+    type: 'worldStatus',
+    mc: worldState.mc,
+    mcPeak: worldState.mcPeak,
+    tier,
+    maxTier: WORLD_WALL_MAX_TIER,
+    radius: WORLD_WALL_TIERS[tier].radius,
+    tierMc: WORLD_WALL_TIERS[tier].mc,
+    nextTierMc: nextWallTierMc(),
+    portal: {
+      status: worldState.portal.status,
+      x: worldState.portal.x,
+      z: worldState.portal.z,
+      cooldownUntil: worldState.portal.cooldownUntil,
+    },
+    monster: { id: 'redwick', status: 'dormant', nextWindowAt: null },
+    unlocks: WORLD_UNLOCKS.map((entry) => ({
+      id: entry.id,
+      mc: entry.mc,
+      unlocked: WORLD_WALL_TIERS[tier].mc >= entry.mc,
+    })),
+    traders: authenticatedPlayerCount(),
+  };
+}
+
+function broadcastWorldStatus() {
+  const message = getCachedMessage(buildWorldStatusPayload());
+
+  players.forEach((p) => {
+    if (!p.authenticated || p.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      p.ws.send(message);
+    } catch (err) {
+      console.error('[!] World status send error:', err.message);
+    }
+  });
+}
+
+function persistWorldState(immediate = false) {
+  if (!CONFIG.internalSecret) return;
+  if (worldPersistTimer) {
+    if (!immediate) return;
+    clearTimeout(worldPersistTimer);
+  }
+
+  worldPersistTimer = setTimeout(() => {
+    worldPersistTimer = null;
+    callInternalApi('/api/internal/game/world-state', {
+      action: 'patch',
+      state: {
+        mc: worldState.mc,
+        mcPeak: worldState.mcPeak,
+        tier: worldState.tier,
+        adminTier: worldState.adminTier,
+        portal: worldState.portal,
+        lastCommandId: worldState.lastCommandId,
+      },
+    }).catch((err) => console.error('[World] Persist failed:', err.message));
+  }, immediate ? 0 : WORLD_PERSIST_DEBOUNCE_MS);
+}
+
+function pullPlayersInsideWall() {
+  const limit = mainWorldPlayerLimit();
+  if (limit === null) return;
+
+  players.forEach((player) => {
+    if (!player.authenticated || player.locationId !== 'main-world') return;
+
+    const [x, , z] = player.position;
+    if (Math.sqrt(x * x + z * z) <= limit) return;
+
+    spawnInSafeZone(player, 'main-world');
+    player.justTeleported = true;
+    player.teleportSettleUntil = Date.now() + TELEPORT_SETTLE_MS;
+    grantSpawnProtection(player);
+    safeSend(player.ws, { type: 'positionCorrection', position: player.position });
+  });
+}
+
+function applyMarketCap(mc) {
+  if (!Number.isFinite(mc) || mc <= 0) return;
+
+  const previousTier = effectiveWallTier();
+  worldState.mc = mc;
+  if (mc > worldState.mcPeak) worldState.mcPeak = mc;
+
+  const peakTier = wallTierForMc(worldState.mcPeak);
+  if (peakTier > worldState.tier) worldState.tier = peakTier;
+
+  persistWorldState();
+
+  if (effectiveWallTier() !== previousTier) {
+    console.log(`[World] Wall tier ${previousTier} -> ${effectiveWallTier()} (mc ${Math.round(mc)})`);
+    pullPlayersInsideWall();
+    rebuildWorldEnemies();
+  }
+
+  broadcastWorldStatus();
+}
+
+async function fetchTokenMarketCap(address) {
+  const url = new URL('/api/token-by-ca', CONFIG.siteUrl);
+  url.searchParams.set('ca', address);
+
+  const res = await fetch(url.toString());
+  const json = await res.json();
+  return Number(json?.mc) || 0;
+}
+
+async function pollMarketCap() {
+  if (!TNJ_MINT) return;
+
+  try {
+    applyMarketCap(await fetchTokenMarketCap(TNJ_MINT));
+  } catch (err) {
+    console.error('[World] Market cap poll failed:', err.message);
+  }
+}
+
+function applyWorldCommand(command) {
+  const previousTier = effectiveWallTier();
+
+  if (command.type === 'set_tier') {
+    worldState.adminTier = Math.max(0, Math.min(WORLD_WALL_MAX_TIER, Math.floor(Number(command.tier) || 0)));
+  } else if (command.type === 'clear_tier') {
+    worldState.adminTier = null;
+  } else if (command.type === 'force_portal') {
+    console.log('[World] Admin forced a rift spawn');
+    spawnCavePortal(true);
+    return;
+  }
+
+  persistWorldState(true);
+
+  if (effectiveWallTier() !== previousTier) {
+    console.log(`[World] Admin set wall tier ${previousTier} -> ${effectiveWallTier()}`);
+    pullPlayersInsideWall();
+    rebuildWorldEnemies();
+  }
+
+  broadcastWorldStatus();
+}
+
+async function pollWorldCommands() {
+  if (!CONFIG.internalSecret) return;
+
+  const result = await callInternalApi('/api/internal/game/world-state', { action: 'get' }).catch((err) => {
+    console.error('[World] Command poll failed:', err.message);
+    return null;
+  });
+
+  const command = result?.state?.command;
+  if (!command || typeof command.id !== 'string') return;
+  if (command.id === worldState.lastCommandId) return;
+
+  worldState.lastCommandId = command.id;
+  applyWorldCommand(command);
+}
+
+async function loadWorldState() {
+  if (!CONFIG.internalSecret) {
+    worldState.loaded = true;
+    return;
+  }
+
+  const result = await callInternalApi('/api/internal/game/world-state', { action: 'get' }).catch((err) => {
+    console.error('[World] Load failed:', err.message);
+    return null;
+  });
+
+  const state = result?.state;
+  if (state) {
+    worldState.mc = Math.max(0, Number(state.mc) || 0);
+    worldState.mcPeak = Math.max(0, Number(state.mcPeak) || 0);
+    worldState.tier = Math.max(0, Math.floor(Number(state.tier) || 0));
+    worldState.adminTier = state.adminTier === null || state.adminTier === undefined
+      ? null
+      : Math.max(0, Math.floor(Number(state.adminTier) || 0));
+    worldState.lastCommandId = typeof state.lastCommandId === 'string' ? state.lastCommandId : null;
+
+    if (state.portal) {
+      worldState.portal.status = state.portal.status || 'locked';
+      worldState.portal.x = Number(state.portal.x) || 0;
+      worldState.portal.z = Number(state.portal.z) || 0;
+      worldState.portal.cooldownUntil = Number(state.portal.cooldownUntil) || 0;
+      worldState.portal.spawnedAt = Number(state.portal.spawnedAt) || 0;
+    }
+  }
+
+  worldState.loaded = true;
+  console.log(`[World] Loaded: tier ${effectiveWallTier()}, radius ${wallRadius()}, mcPeak ${Math.round(worldState.mcPeak)}`);
+  rebuildWorldEnemies();
+  broadcastWorldStatus();
+}
+
+const CAVE_PORTAL_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const PORTAL_MIN_RING_GAP = 12;
+const PORTAL_SAFE_MARGIN = 8;
+const PORTAL_NEAR_BASE_SPAN = 26;
+const PORTAL_MAX_SLOPE = 0.32;
+const PORTAL_EDGE_SLOPE = 0.42;
+const PORTAL_SAMPLE_ATTEMPTS = 500;
+
+function portalUnlocked() {
+  return WORLD_WALL_TIERS[effectiveWallTier()].mc >= CAVE_PORTAL_MIN_MC;
+}
+
+function portalSpotValid(x, z) {
+  if (!worldTerrain.isDryLand(x, z, 1.5)) return false;
+  if (worldTerrain.getSlopeAt(x, z) > PORTAL_MAX_SLOPE) return false;
+  if (Math.hypot(x - worldTerrain.TOWER_X, z - worldTerrain.TOWER_Z) < worldTerrain.TOWER_FLAT_RADIUS + 6) return false;
+
+  for (const [ox, oz] of [[4, 0], [-4, 0], [0, 4], [0, -4]]) {
+    if (!worldTerrain.isDryLand(x + ox, z + oz, 1)) return false;
+    if (worldTerrain.getSlopeAt(x + ox, z + oz) > PORTAL_EDGE_SLOPE) return false;
+  }
+
+  return true;
+}
+
+function pickPortalPosition(nearBase) {
+  const wall = wallRadius();
+  const outer = wall === null ? worldTerrain.PLAY_RADIUS - 24 : wall - PORTAL_MIN_RING_GAP;
+  const inner = worldTerrain.SAFE_ZONE_RADIUS + PORTAL_SAFE_MARGIN;
+  const max = nearBase ? Math.min(outer, inner + PORTAL_NEAR_BASE_SPAN) : outer;
+
+  if (max <= inner) return null;
+
+  for (let attempt = 0; attempt < PORTAL_SAMPLE_ATTEMPTS; attempt++) {
+    const angle = Math.random() * Math.PI * 2;
+    const distance = inner + Math.sqrt(Math.random()) * (max - inner);
+    const x = Math.sin(angle) * distance;
+    const z = -Math.cos(angle) * distance;
+
+    if (!portalSpotValid(x, z)) continue;
+    return [Math.round(x * 100) / 100, Math.round(z * 100) / 100];
+  }
+
+  return null;
+}
+
+function spawnCavePortal(nearBase) {
+  const spot = pickPortalPosition(nearBase);
+  if (!spot) {
+    console.error('[World] Could not find a valid rift location');
+    return false;
+  }
+
+  worldState.portal.status = 'active';
+  worldState.portal.x = spot[0];
+  worldState.portal.z = spot[1];
+  worldState.portal.spawnedAt = Date.now();
+  worldState.portal.cooldownUntil = 0;
+
+  console.log(`[World] Rift opened at ${spot[0]}, ${spot[1]}`);
+  persistWorldState(true);
+  broadcastWorldStatus();
+  return true;
+}
+
+function closeCavePortal() {
+  if (worldState.portal.status !== 'active') return;
+
+  worldState.portal.status = 'cooldown';
+  worldState.portal.cooldownUntil = Date.now() + CAVE_PORTAL_COOLDOWN_MS;
+
+  console.log('[World] Rift collapsed, cooldown started');
+  persistWorldState(true);
+  broadcastWorldStatus();
+}
+
+function updatePortalState() {
+  if (!worldState.loaded) return;
+
+  if (!portalUnlocked()) {
+    if (worldState.portal.status === 'locked') return;
+    worldState.portal.status = 'locked';
+    worldState.portal.cooldownUntil = 0;
+    persistWorldState(true);
+    broadcastWorldStatus();
+    return;
+  }
+
+  if (worldState.portal.status === 'active') return;
+  if (worldState.portal.status === 'cooldown' && Date.now() < worldState.portal.cooldownUntil) return;
+
+  spawnCavePortal(false);
+}
+
+loadWorldState().then(() => {
+  updatePortalState();
+  return pollMarketCap();
+});
+
+safeInterval(pollMarketCap, WORLD_MC_POLL_MS);
+safeInterval(pollWorldCommands, WORLD_COMMAND_POLL_MS);
+safeInterval(updatePortalState, WORLD_COMMAND_POLL_MS);
+
 function getSegmentDifficulty(segment) {
   const beyond = Math.max(0, segment - CANYON_BIOMES.length);
   const healthMult = 1 + beyond * 0.2;
@@ -1333,6 +1781,7 @@ function enterCanyonHub(player) {
 function activeEnemiesFor(player) {
   if (player.locationId === 'tower-first-floor') return player.canyon?.enemies ?? null;
   if (player.locationId === CAVE_LOCATION_ID) return player.cave?.enemies ?? null;
+  if (player.locationId === 'main-world') return worldEnemies.get(player.instance) ?? null;
   return null;
 }
 
@@ -1383,6 +1832,7 @@ function enterCave(player) {
     nextEnemySeq: 1,
     bossId: null,
     bossDefeated: false,
+    portalDoomed: false,
   };
 
   for (const spawn of CAVE_ENEMY_SPAWNS) {
@@ -1403,8 +1853,12 @@ function enterCave(player) {
 
 function leaveCave(player) {
   if (!player.cave) return;
+
+  const collapsed = player.cave.portalDoomed === true;
   player.cave = null;
   safeSend(player.ws, { type: 'enemyState', enemies: [] });
+
+  if (collapsed) closeCavePortal();
 }
 
 function serializeCanyonEnemies(player) {
@@ -1526,7 +1980,7 @@ function damagePlayerByCanyonEnemy(player, enemy) {
   if (!player.alive) return;
   if (isSpawnProtected(player)) return;
 
-  const damage = enemy.attackDamage;
+  const damage = Math.max(1, Math.round(enemy.attackDamage * player.combat.damageTakenMult));
   player.health = Math.max(0, player.health - damage);
   player.lastDamageTime = Date.now();
 
@@ -1549,14 +2003,15 @@ function damagePlayerFromZone(player, enemy, damage) {
   if (!player.alive) return;
   if (isSpawnProtected(player)) return;
 
-  player.health = Math.max(0, player.health - damage);
+  const mitigated = Math.max(1, Math.round(damage * player.combat.damageTakenMult));
+  player.health = Math.max(0, player.health - mitigated);
   player.lastDamageTime = Date.now();
 
   safeSend(player.ws, {
     type: 'playerDamaged',
     targetId: player.id,
     attackerId: enemy.id,
-    damage,
+    damage: mitigated,
     health: player.health,
     point: player.position,
     historicalPosition: player.position,
@@ -1763,6 +2218,411 @@ function updateRangedBoss(player, enemy, cfg, now) {
     radius: attack.radius,
   });
 }
+
+const WORLD_ENEMY_TICK_MS = 100;
+const WARDEN_RESPAWN_MS = 110000;
+const WARDEN_BAND_NEAR = 8;
+const WARDEN_BAND_FAR = 34;
+const WARDEN_WALL_GRIP = 3;
+const WARDEN_WALL_CLEARANCE = 3;
+const WARDEN_MIN_COUNT = 3;
+const WARDEN_MAX_COUNT = 14;
+const WARDEN_ARC_SPACING = 110;
+
+const worldEnemies = new Map();
+let worldEnemySeq = 1;
+
+function normalizeRingAngle(value) {
+  let result = value;
+  while (result > Math.PI) result -= Math.PI * 2;
+  while (result < -Math.PI) result += Math.PI * 2;
+  return result;
+}
+
+function ringPosition(angle, radius) {
+  return [Math.sin(angle) * radius, 0, -Math.cos(angle) * radius];
+}
+
+function wardenCountFor(radius) {
+  const suggested = Math.round((Math.PI * 2 * radius) / WARDEN_ARC_SPACING);
+  return Math.max(WARDEN_MIN_COUNT, Math.min(WARDEN_MAX_COUNT, suggested));
+}
+
+function spawnWarden(pool, instance, index, count, radius) {
+  const cfg = ENEMY_TYPES.slime_warden;
+  const arcCenter = ((index + 0.5) * Math.PI * 2) / count;
+  const band = radius + (WARDEN_BAND_NEAR + WARDEN_BAND_FAR) / 2;
+  const id = `world-${instance}-${worldEnemySeq++}`;
+
+  pool.set(id, {
+    id,
+    type: 'slime_warden',
+    instance,
+    position: ringPosition(arcCenter, band),
+    spawnPoint: ringPosition(arcCenter, band),
+    health: cfg.maxHealth,
+    maxHealth: cfg.maxHealth,
+    attackDamage: cfg.attackDamage,
+    alive: true,
+    targetId: null,
+    lastAttackTime: 0,
+    patrolTarget: null,
+    patrolWaitUntil: 0,
+    positionHistory: [],
+    cast: null,
+    attackCooldowns: {},
+    pendingImpacts: [],
+    pools: [],
+    arcCenter,
+    arcHalf: Math.PI / count,
+    respawnAt: 0,
+  });
+}
+
+function ensureWorldEnemies(instance) {
+  let pool = worldEnemies.get(instance);
+  if (!pool) {
+    pool = new Map();
+    worldEnemies.set(instance, pool);
+  }
+
+  const radius = wallRadius();
+  if (radius === null) {
+    pool.clear();
+    return pool;
+  }
+
+  if (pool.size > 0) return pool;
+
+  const count = wardenCountFor(radius);
+  for (let i = 0; i < count; i++) {
+    spawnWarden(pool, instance, i, count, radius);
+  }
+
+  return pool;
+}
+
+function sendWorldEnemyState(player) {
+  const pool = ensureWorldEnemies(player.instance);
+  safeSend(player.ws, { type: 'enemyState', enemies: serializeEnemies(pool) });
+}
+
+function broadcastWorldEnemyState(instance) {
+  const pool = worldEnemies.get(instance);
+  if (!pool) return;
+  broadcastToLocation('main-world', { type: 'enemyState', enemies: serializeEnemies(pool) }, null, instance);
+}
+
+function rebuildWorldEnemies() {
+  for (const pool of worldEnemies.values()) {
+    pool.clear();
+  }
+
+  const instances = new Set();
+  players.forEach((p) => {
+    if (p.authenticated && p.locationId === 'main-world') instances.add(p.instance);
+  });
+
+  for (const instance of instances) {
+    ensureWorldEnemies(instance);
+    broadcastWorldEnemyState(instance);
+  }
+}
+
+function forEachWorldPlayer(instance, fn) {
+  players.forEach((p) => {
+    if (!p.authenticated || p.locationId !== 'main-world') return;
+    if (p.instance !== instance) return;
+    if (p.ws.readyState !== WebSocket.OPEN) return;
+    fn(p);
+  });
+}
+
+function playerOnRampart(player, radius) {
+  const [x, y, z] = player.position;
+  const distance = Math.hypot(x, z);
+  if (distance < radius - WARDEN_WALL_GRIP || distance > radius + WARDEN_WALL_GRIP) return false;
+  return y >= worldTerrain.getHeightAt(x, z) + WARDEN_WALL_CLEARANCE;
+}
+
+function pickWardenTarget(enemy, cfg, radius) {
+  let best = null;
+  let bestDistance = Infinity;
+
+  forEachWorldPlayer(enemy.instance, (player) => {
+    if (!player.alive || isSpawnProtected(player)) return;
+    if (!playerOnRampart(player, radius)) return;
+
+    const distance = Math.hypot(player.position[0] - enemy.position[0], player.position[2] - enemy.position[2]);
+    if (distance > cfg.aggroRadius || distance >= bestDistance) return;
+
+    bestDistance = distance;
+    best = player;
+  });
+
+  return best;
+}
+
+function clampWardenToBand(enemy, radius) {
+  const near = radius + WARDEN_BAND_NEAR;
+  const far = radius + WARDEN_BAND_FAR;
+
+  const distance = Math.hypot(enemy.position[0], enemy.position[2]);
+  const angle = Math.atan2(enemy.position[0], -enemy.position[2]);
+  const offset = normalizeRingAngle(angle - enemy.arcCenter);
+
+  const clampedAngle = enemy.arcCenter + Math.max(-enemy.arcHalf, Math.min(enemy.arcHalf, offset));
+  const clampedDistance = Math.max(near, Math.min(far, distance));
+
+  enemy.position[0] = Math.sin(clampedAngle) * clampedDistance;
+  enemy.position[2] = -Math.cos(clampedAngle) * clampedDistance;
+}
+
+function damageWorldPlayersAt(enemy, x, z, radius, damage) {
+  forEachWorldPlayer(enemy.instance, (player) => {
+    if (!player.alive) return;
+    if (Math.hypot(player.position[0] - x, player.position[2] - z) > radius) return;
+    damagePlayerFromZone(player, enemy, damage);
+  });
+}
+
+function resolveWardenCast(enemy, cast, now) {
+  const attack = cast.attack;
+  const origin = [enemy.position[0], enemy.position[1] + 2.4, enemy.position[2]];
+
+  for (let i = 0; i < attack.shots; i++) {
+    const offsetAngle = Math.random() * Math.PI * 2;
+    const offsetDist = attack.shots > 1 ? Math.random() * attack.spread : 0;
+
+    const target = [
+      cast.aim[0] + Math.cos(offsetAngle) * offsetDist,
+      0,
+      cast.aim[2] + Math.sin(offsetAngle) * offsetDist,
+    ];
+
+    const dx = target[0] - origin[0];
+    const dz = target[2] - origin[2];
+    const travel = Math.max(160, (Math.sqrt(dx * dx + dz * dz) / attack.speed) * 1000);
+
+    broadcastToLocation('main-world', {
+      type: 'bossProjectile',
+      enemyId: enemy.id,
+      attack: attack.id,
+      origin,
+      target,
+      travel,
+      radius: attack.radius,
+    }, null, enemy.instance);
+
+    enemy.pendingImpacts.push({
+      at: now + travel,
+      x: target[0],
+      z: target[2],
+      radius: attack.radius,
+      damage: attack.damage,
+      pool: attack.pool || null,
+    });
+  }
+}
+
+function processWardenImpacts(enemy, now) {
+  if (enemy.pendingImpacts.length === 0) return;
+
+  const remaining = [];
+
+  for (const impact of enemy.pendingImpacts) {
+    if (impact.at > now) {
+      remaining.push(impact);
+      continue;
+    }
+
+    damageWorldPlayersAt(enemy, impact.x, impact.z, impact.radius, impact.damage);
+
+    if (impact.pool) {
+      enemy.pools.push({
+        x: impact.x,
+        z: impact.z,
+        radius: impact.radius,
+        damage: impact.pool.damage,
+        interval: impact.pool.interval,
+        expiresAt: now + impact.pool.duration,
+        nextTickAt: now + impact.pool.interval,
+      });
+
+      broadcastToLocation('main-world', {
+        type: 'bossPool',
+        enemyId: enemy.id,
+        x: impact.x,
+        z: impact.z,
+        radius: impact.radius,
+        duration: impact.pool.duration,
+      }, null, enemy.instance);
+    }
+  }
+
+  enemy.pendingImpacts = remaining;
+}
+
+function processWardenPools(enemy, now) {
+  if (enemy.pools.length === 0) return;
+
+  enemy.pools = enemy.pools.filter((pool) => pool.expiresAt > now);
+
+  for (const pool of enemy.pools) {
+    if (now < pool.nextTickAt) continue;
+    pool.nextTickAt = now + pool.interval;
+    damageWorldPlayersAt(enemy, pool.x, pool.z, pool.radius, pool.damage);
+  }
+}
+
+function updateWardenPatrol(enemy, cfg, radius, now) {
+  if (!enemy.patrolTarget) {
+    if (now < enemy.patrolWaitUntil) return;
+
+    const angle = enemy.arcCenter + (Math.random() * 2 - 1) * enemy.arcHalf * 0.85;
+    const band = radius + WARDEN_BAND_NEAR + Math.random() * (WARDEN_BAND_FAR - WARDEN_BAND_NEAR);
+    const point = ringPosition(angle, band);
+    enemy.patrolTarget = [point[0], point[2]];
+  }
+
+  const dx = enemy.patrolTarget[0] - enemy.position[0];
+  const dz = enemy.patrolTarget[1] - enemy.position[2];
+  const distance = Math.hypot(dx, dz);
+
+  if (distance < 0.8) {
+    enemy.patrolTarget = null;
+    enemy.patrolWaitUntil = now + CANYON_CONFIG.patrolPauseMinMs +
+      Math.random() * (CANYON_CONFIG.patrolPauseMaxMs - CANYON_CONFIG.patrolPauseMinMs);
+    return;
+  }
+
+  const step = cfg.patrolSpeed * (WORLD_ENEMY_TICK_MS / 1000);
+  enemy.position[0] += (dx / distance) * step;
+  enemy.position[2] += (dz / distance) * step;
+}
+
+function updateWarden(enemy, cfg, radius, now) {
+  processWardenImpacts(enemy, now);
+  processWardenPools(enemy, now);
+
+  const target = pickWardenTarget(enemy, cfg, radius);
+  enemy.targetId = target ? target.id : null;
+
+  if (enemy.cast) {
+    if (now >= enemy.cast.resolveAt) {
+      resolveWardenCast(enemy, enemy.cast, now);
+      enemy.attackCooldowns[enemy.cast.attack.id] = now;
+      enemy.cast = null;
+    }
+    clampWardenToBand(enemy, radius);
+    return;
+  }
+
+  if (!target) {
+    updateWardenPatrol(enemy, cfg, radius, now);
+    clampWardenToBand(enemy, radius);
+    return;
+  }
+
+  enemy.patrolTarget = null;
+
+  const dx = target.position[0] - enemy.position[0];
+  const dz = target.position[2] - enemy.position[2];
+  const distance = Math.hypot(dx, dz);
+  const drift = distance - cfg.preferredRange;
+
+  if (Math.abs(drift) > 3) {
+    const speed = Math.abs(drift) > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear;
+    const step = speed * (WORLD_ENEMY_TICK_MS / 1000) * Math.sign(drift);
+    const length = distance || 1;
+    enemy.position[0] += (dx / length) * step;
+    enemy.position[2] += (dz / length) * step;
+  }
+
+  clampWardenToBand(enemy, radius);
+
+  if (now - enemy.lastAttackTime < cfg.attackCooldown) return;
+
+  const attack = pickBossAttack(enemy, cfg, distance, now);
+  if (!attack) return;
+
+  enemy.lastAttackTime = now;
+  enemy.cast = {
+    attack,
+    resolveAt: now + attack.windup,
+    aim: [target.position[0], 0, target.position[2]],
+  };
+
+  broadcastToLocation('main-world', {
+    type: 'bossCast',
+    enemyId: enemy.id,
+    attack: attack.id,
+    windup: attack.windup,
+    aim: enemy.cast.aim,
+    radius: attack.radius,
+  }, null, enemy.instance);
+}
+
+function worldEnemyTick() {
+  const radius = wallRadius();
+  const now = Date.now();
+
+  const occupied = new Set();
+  players.forEach((p) => {
+    if (p.authenticated && p.locationId === 'main-world') occupied.add(p.instance);
+  });
+
+  for (const [instance, pool] of worldEnemies) {
+    if (!occupied.has(instance)) {
+      if (pool.size > 0) pool.clear();
+      continue;
+    }
+
+    if (radius === null) {
+      if (pool.size > 0) {
+        pool.clear();
+        broadcastWorldEnemyState(instance);
+      }
+      continue;
+    }
+
+    const cfg = ENEMY_TYPES.slime_warden;
+    let respawned = false;
+
+    for (const enemy of pool.values()) {
+      if (!enemy.alive) {
+        if (enemy.respawnAt > 0 && now >= enemy.respawnAt) {
+          enemy.alive = true;
+          enemy.health = enemy.maxHealth;
+          enemy.respawnAt = 0;
+          enemy.cast = null;
+          enemy.pendingImpacts = [];
+          enemy.pools = [];
+          enemy.position = ringPosition(enemy.arcCenter, radius + (WARDEN_BAND_NEAR + WARDEN_BAND_FAR) / 2);
+          respawned = true;
+        }
+        continue;
+      }
+
+      updateWarden(enemy, cfg, radius, now);
+
+      enemy.positionHistory.push({ position: [...enemy.position], time: now });
+      enemy.positionHistory = enemy.positionHistory.filter((entry) => now - entry.time < 1000);
+    }
+
+    if (respawned) broadcastWorldEnemyState(instance);
+    else broadcastToLocation('main-world', { type: 'enemyState', enemies: serializeEnemies(pool) }, null, instance);
+  }
+
+  for (const instance of occupied) {
+    if (!worldEnemies.has(instance)) {
+      ensureWorldEnemies(instance);
+      broadcastWorldEnemyState(instance);
+    }
+  }
+}
+
+safeInterval(worldEnemyTick, WORLD_ENEMY_TICK_MS);
 
 function canyonTick() {
   const now = Date.now();
@@ -2132,8 +2992,11 @@ function rollLootTokens(minCount, maxCount) {
   return tokens;
 }
 
-function dropLoot(position, instance = 1) {
-  const tokens = rollLootTokens(LOOT_CONFIG.minDrop, LOOT_CONFIG.maxDrop);
+function dropLoot(position, instance = 1, minCount = null, maxCount = null) {
+  const tokens = rollLootTokens(
+    minCount === null ? LOOT_CONFIG.minDrop : minCount,
+    maxCount === null ? LOOT_CONFIG.maxDrop : maxCount
+  );
   if (tokens.length === 0) return;
 
   const id = `loot-${nextLootId++}`;
@@ -2302,8 +3165,203 @@ async function savePlayerProgress(userId, gameId, data) {
   }
 }
 
+function createProgressionState() {
+  return {
+    totalXp: 0,
+    level: 1,
+    branch: null,
+    skills: {},
+    loadout: {},
+    fireMode: 'single',
+    respecCount: 0,
+  };
+}
+
+function progressionPoints(player) {
+  const total = progression.skillPointsForLevel(player.progression.level);
+  const spent = skills.pointsSpent(player.progression.skills);
+  return { total, spent, available: Math.max(0, total - spent) };
+}
+
+function computeCombatStats(player) {
+  const stats = skills.computeBuildStats(player.progression.skills);
+  const percent = (key) => (stats.percent[key] || 0) / 100;
+
+  return {
+    maxHealth: Math.round(skills.statValue(stats, 'maxHealth', BASE_MAX_HEALTH)),
+    enemyDamage: skills.statValue(stats, 'weaponDamage', PLAYER_WEAPON_DAMAGE_TO_ENEMY),
+    pvpDamage: skills.statValue(stats, 'weaponDamage', BASE_PVP_DAMAGE),
+    damageTakenMult: Math.max(0.2, 1 + percent('damageTaken')),
+    armorPen: Math.min(0.9, Math.max(0, percent('armorPen'))),
+    damageVsUnshielded: Math.max(0, percent('damageVsUnshielded')),
+    magSize: Math.max(1, Math.round(skills.statValue(stats, 'magSize', WEAPON_CONFIG.maxAmmo))),
+    reloadMs: Math.max(400, Math.round(WEAPON_CONFIG.reloadDurationMs / (1 + percent('reloadSpeed')))),
+    moveSpeedMult: Math.max(1, 1 + percent('moveSpeed')),
+    maxEnergy: Math.round(skills.statValue(stats, 'maxEnergy', progression.ENERGY.base)),
+    energyRegen: skills.statValue(stats, 'energyRegen', progression.ENERGY.regenPerSecond),
+    healOnKill: stats.add.healOnKill || 0,
+    energyOnKill: stats.add.energyOnKill || 0,
+    lootMult: Math.max(1, 1 + percent('lootBonus')),
+    shieldStrength: stats.add.shieldStrength || 0,
+  };
+}
+
+function refreshCombatStats(player) {
+  player.combat = computeCombatStats(player);
+
+  const previousMax = player.maxHealth;
+  player.maxHealth = player.combat.maxHealth;
+
+  if (player.maxHealth > previousMax && player.alive) {
+    player.health = Math.min(player.maxHealth, player.health + (player.maxHealth - previousMax));
+  } else if (player.health > player.maxHealth) {
+    player.health = player.maxHealth;
+  }
+
+  if (player.weaponAmmo > player.combat.magSize) player.weaponAmmo = player.combat.magSize;
+}
+
+function buildCombatStatsPayload(player) {
+  return {
+    maxHealth: player.combat.maxHealth,
+    magSize: player.combat.magSize,
+    reloadMs: player.combat.reloadMs,
+    moveSpeedMult: player.combat.moveSpeedMult,
+    maxEnergy: player.combat.maxEnergy,
+    energyRegen: player.combat.energyRegen,
+  };
+}
+
+function buildProgressionPayload(player) {
+  const state = player.progression;
+  const levelState = progression.levelFromTotalXp(state.totalXp);
+  const points = progressionPoints(player);
+  const tier = progression.tierForLevel(state.level);
+  const weaponTier = progression.weaponTierForLevel(state.level);
+
+  return {
+    type: 'progressionState',
+    level: state.level,
+    totalXp: state.totalXp,
+    xpIntoLevel: levelState.xpIntoLevel,
+    xpForLevel: levelState.xpForLevel,
+    branch: state.branch,
+    branchUnlocked: state.level >= BRANCH_UNLOCK_LEVEL,
+    skills: state.skills,
+    loadout: state.loadout,
+    fireMode: state.fireMode,
+    respecCount: state.respecCount,
+    respecCostAsh: progression.respecCostAsh(state.level, state.respecCount),
+    skillPoints: points.available,
+    skillPointsTotal: points.total,
+    tier: tier.id,
+    tierIndex: tier.index,
+    weaponTier: weaponTier.tier,
+    memeAbilities: progression.memeAbilityIdsForLevel(state.level),
+    stats: buildCombatStatsPayload(player),
+    health: player.health,
+  };
+}
+
+function sendProgressionState(player) {
+  safeSend(player.ws, buildProgressionPayload(player));
+}
+
+function broadcastPlayerLevel(player) {
+  broadcastToLocation(player.locationId, {
+    type: 'playerLevelUpdate',
+    playerId: player.id,
+    level: player.progression.level,
+    tier: progression.tierForLevel(player.progression.level).id,
+    weaponTier: progression.weaponTierForLevel(player.progression.level).tier,
+  }, player.id, player.instance);
+}
+
+function contentLevelFor(player) {
+  if (player.locationId === CAVE_LOCATION_ID) return CAVE_CONTENT_LEVEL;
+  if (player.locationId === 'main-world') return MAIN_WORLD_CONTENT_LEVEL;
+  if (player.locationId === 'tower-first-floor') {
+    const segment = Math.max(1, player.canyon?.segment || 1);
+    return Math.min(progression.MAX_LEVEL, 1 + (segment - 1) * CANYON_LEVELS_PER_SEGMENT);
+  }
+  return player.progression.level;
+}
+
+function isBossType(type) {
+  return type.endsWith('_boss') || type.endsWith('_warden');
+}
+
+function grantXp(player, amount, source) {
+  if (!player.authenticated) return 0;
+
+  const gain = Math.max(0, Math.floor(amount));
+  if (gain <= 0) return 0;
+
+  const state = player.progression;
+  const previousLevel = state.level;
+  state.totalXp += gain;
+
+  const levelState = progression.levelFromTotalXp(state.totalXp);
+  state.level = levelState.level;
+
+  safeSend(player.ws, {
+    type: 'xpGain',
+    amount: gain,
+    source: source || 'unknown',
+    totalXp: state.totalXp,
+    level: state.level,
+    xpIntoLevel: levelState.xpIntoLevel,
+    xpForLevel: levelState.xpForLevel,
+  });
+
+  if (state.level > previousLevel) {
+    const tier = progression.tierForLevel(state.level);
+    const previousTier = progression.tierForLevel(previousLevel);
+    const weaponTier = progression.weaponTierForLevel(state.level);
+    const previousWeaponTier = progression.weaponTierForLevel(previousLevel);
+
+    safeSend(player.ws, {
+      type: 'levelUp',
+      level: state.level,
+      previousLevel,
+      skillPoints: progressionPoints(player).available,
+      tier: tier.id,
+      tierName: tier.name,
+      tierChanged: tier.id !== previousTier.id,
+      newMemeAbility: tier.id !== previousTier.id ? tier.memeAbility : null,
+      weaponTier: weaponTier.tier,
+      weaponTierChanged: weaponTier.tier !== previousWeaponTier.tier,
+      branchUnlocked: state.branch === null && state.level >= BRANCH_UNLOCK_LEVEL,
+    });
+
+    broadcastPlayerLevel(player);
+    sendProgressionState(player);
+    persistPlayer(player);
+  }
+
+  return gain;
+}
+
+function grantEnemyKillXp(player, enemyType) {
+  const cfg = ENEMY_TYPES[enemyType];
+  if (!cfg) return 0;
+
+  const base = progression.enemyXp(cfg.maxHealth, isBossType(enemyType));
+  const multiplier = progression.levelGapMultiplier(player.progression.level, contentLevelFor(player));
+  return grantXp(player, base * multiplier, `enemy:${enemyType}`);
+}
+
 function buildSavePayload(player) {
   return {
+    progression: {
+      totalXp: player.progression.totalXp,
+      level: player.progression.level,
+      branch: player.progression.branch,
+      skills: player.progression.skills,
+      loadout: player.progression.loadout,
+      fireMode: player.progression.fireMode,
+      respecCount: player.progression.respecCount,
+    },
     progress: {
       locationId: player.locationId,
       position: player.position,
@@ -2589,6 +3647,8 @@ wss.on('connection', (ws) => {
     blockedUserIds: new Set(),
     inventory: [],
     ash: 0,
+    progression: createProgressionState(),
+    combat: null,
     economyChangedAt: 0,
     placeables: {},
     activeTradeId: null,
@@ -2628,6 +3688,7 @@ wss.on('connection', (ws) => {
     authAttempts: 0,
   };
 
+  refreshCombatStats(player);
   players.set(playerId, player);
 
   ws.on('message', (raw) => {
@@ -2712,8 +3773,10 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'cosmetic', CONFIG.network.cosmeticRateLimit)) return;
       } else if (data.type === 'emote') {
         if (!checkRateLimit(playerId, 'emote', CONFIG.network.emoteRateLimit)) return;
-      } else if (data.type === 'questInteract' || data.type === 'questAccept' || data.type === 'questTurnIn') {
+      } else if (data.type === 'questInteract' || data.type === 'questAccept' || data.type === 'questTurnIn' || data.type === 'npcVisit') {
         if (!checkRateLimit(playerId, 'quest', CONFIG.network.questRateLimit)) return;
+      } else if (data.type === 'branchSelect' || data.type === 'skillRespec' || data.type === 'skillLearn' || data.type === 'abilityBind') {
+        if (!checkRateLimit(playerId, 'progression', CONFIG.network.progressionRateLimit)) return;
       } else if (data.type === 'canyonWarp' || data.type === 'canyonMapRequest' || data.type === 'canyonEnterDungeon' || data.type === 'canyonReturnToHub' || data.type === 'canyonCrossThreshold') {
         if (!checkRateLimit(playerId, 'canyon', CONFIG.network.canyonRateLimit)) return;
       } else if (data.type === 'factionCreate' || data.type === 'factionJoin' || data.type === 'factionLeave' || data.type === 'factionList' || data.type === 'factionInfo' || data.type === 'factionTaskListRequest' || data.type === 'factionAcceptTask' || data.type === 'factionClaimCreator' || data.type === 'factionSetDisplayed' || data.type === 'factionMyListRequest') {
@@ -2805,6 +3868,11 @@ wss.on('connection', (ws) => {
         case 'questInteract': handleQuestInteract(player, data); break;
         case 'questAccept': handleQuestAccept(player, data); break;
         case 'questTurnIn': handleQuestTurnIn(player, data); break;
+        case 'npcVisit': handleNpcVisit(player, data); break;
+        case 'branchSelect': handleBranchSelect(player, data); break;
+        case 'skillRespec': handleSkillRespec(player); break;
+        case 'skillLearn': handleSkillLearn(player, data); break;
+        case 'abilityBind': handleAbilityBind(player, data); break;
         case 'caveChestOpen': handleCaveChestOpen(player, data); break;
         case 'canyonWarp': handleCanyonWarp(player, data); break;
         case 'canyonMapRequest': handleCanyonMapRequest(player); break;
@@ -2872,6 +3940,11 @@ wss.on('connection', (ws) => {
     }
 
     removePlayerZone(player);
+
+    if (player.cave?.portalDoomed) {
+      player.cave = null;
+      closeCavePortal();
+    }
 
     if (player.authenticated) {
       persistPlayer(player);
@@ -2996,6 +4069,38 @@ wss.on('connection', (ws) => {
         player.stats.playtimeSeconds = savedProgress.statistics.playtimeSeconds || 0;
       }
 
+      const savedProgression = savedProgress.progression;
+      if (savedProgression && typeof savedProgression === 'object') {
+        const state = player.progression;
+        state.totalXp = Math.max(0, Math.floor(Number(savedProgression.totalXp) || 0));
+        state.level = progression.levelFromTotalXp(state.totalXp).level;
+        state.branch = progression.isBranchId(savedProgression.branch) ? savedProgression.branch : null;
+        state.respecCount = Math.max(0, Math.floor(Number(savedProgression.respecCount) || 0));
+
+        const validated = skills.validateBuild(
+          savedProgression.skills,
+          state.level,
+          state.branch,
+          progression.skillPointsForLevel(state.level)
+        );
+        state.skills = validated.ranks;
+
+        state.fireMode = skills.hasMode(state.skills, savedProgression.fireMode)
+          ? savedProgression.fireMode
+          : 'single';
+
+        refreshCombatStats(player);
+
+        if (savedProgression.loadout && typeof savedProgression.loadout === 'object') {
+          for (const [slot, abilityId] of Object.entries(savedProgression.loadout)) {
+            if (typeof abilityId !== 'string') continue;
+            if (!ABILITY_SLOTS.includes(slot)) continue;
+            if (!skills.hasAbility(state.skills, abilityId)) continue;
+            state.loadout[slot] = abilityId;
+          }
+        }
+      }
+
       player.ash = Math.max(0, Math.floor(Number(savedProgress.progress?.data?.ash) || 0));
 
       const savedPlaceables = savedProgress.progress?.data?.placeables;
@@ -3017,9 +4122,17 @@ wss.on('connection', (ws) => {
           if (!state || typeof state !== 'object') continue;
           const validStatuses = new Set(['active', 'ready_to_turn_in', 'completed']);
           if (!validStatuses.has(state.status)) continue;
+          const quest = QUESTS[questId];
+          const visited = quest.type === 'visit_npcs' && Array.isArray(state.visited)
+            ? state.visited.filter((id) => quest.targets.some((t) => t.id === id))
+            : [];
+
           player.quests[questId] = {
             status: state.status,
-            progress: Math.max(0, Math.min(QUESTS[questId].targetCount, Math.floor(Number(state.progress) || 0))),
+            progress: quest.type === 'visit_npcs'
+              ? visited.length
+              : Math.max(0, Math.min(quest.targetCount, Math.floor(Number(state.progress) || 0))),
+            visited,
           };
         }
       }
@@ -3133,12 +4246,14 @@ wss.on('connection', (ws) => {
     });
 
     safeSend(ws, { type: 'factionMyListResult', factions: player.factions });
+    safeSend(ws, buildWorldStatusPayload());
     sendCosmeticState(player);
 
     if (player.locationId === 'main-world') {
       safeSend(ws, { type: 'lootState', loot: serializeLoot(player.instance) });
       await ensureSignsLoaded(player.gameId);
       safeSend(ws, { type: 'signState', signs: serializeSigns(player.instance) });
+      sendWorldEnemyState(player);
     }
 
     if (player.locationId === 'tower-first-floor') {
@@ -3158,6 +4273,7 @@ wss.on('connection', (ws) => {
     }
 
     safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+    sendProgressionState(player);
 
     if (savedProgress) {
       safeSend(ws, {
@@ -3166,20 +4282,12 @@ wss.on('connection', (ws) => {
       });
     }
 
-    for (const quest of Object.values(QUESTS)) {
+    autoStartQuests(player);
+
+    for (const quest of QUEST_LIST) {
       const state = getQuestState(player, quest.id);
       if (state.status === 'active' || state.status === 'ready_to_turn_in') {
-        safeSend(ws, {
-          type: 'questInfo',
-          questId: quest.id,
-          npc: quest.npc,
-          title: quest.title,
-          description: quest.description,
-          targetCount: quest.targetCount,
-          rewardAsh: quest.rewardAsh,
-          status: state.status,
-          progress: state.progress,
-        });
+        safeSend(ws, buildQuestInfoPayload(player, quest));
       }
     }
 
@@ -3264,10 +4372,10 @@ wss.on('connection', (ws) => {
     const now = Date.now();
 
     if (player.weaponAmmo <= 0) {
-      if (now - player.ammoEmptyAt >= WEAPON_CONFIG.reloadDurationMs) {
-        player.weaponAmmo = WEAPON_CONFIG.maxAmmo;
+      if (now - player.ammoEmptyAt >= player.combat.reloadMs) {
+        player.weaponAmmo = player.combat.magSize;
       } else {
-        return; 
+        return;
       }
     }
 
@@ -3545,7 +4653,7 @@ wss.on('connection', (ws) => {
 
     if (isSpawnProtected(target)) return;
 
-    const damage = 5;
+    const damage = Math.max(1, Math.round(player.combat.pvpDamage * target.combat.damageTakenMult));
     target.health = Math.max(0, target.health - damage);
     target.lastDamageTime = Date.now();
 
@@ -3598,31 +4706,60 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    enemy.health = Math.max(0, enemy.health - PLAYER_WEAPON_DAMAGE_TO_ENEMY);
+    const enemyDamage = Math.max(1, Math.round(player.combat.enemyDamage));
+    enemy.health = Math.max(0, enemy.health - enemyDamage);
 
-    safeSend(player.ws, {
+    const shared = player.locationId === 'main-world';
+    const damagedMessage = {
       type: 'enemyDamaged',
       id: enemy.id,
       health: enemy.health,
       attackerId: playerId,
       point: data.point,
-    });
+    };
+
+    if (shared) broadcastToLocation('main-world', damagedMessage, null, player.instance);
+    else safeSend(player.ws, damagedMessage);
 
     if (enemy.health <= 0) {
       enemy.alive = false;
       enemy.targetId = null;
 
-      safeSend(player.ws, {
+      const deathMessage = {
         type: 'enemyDeath',
         id: enemy.id,
         killerId: playerId,
-      });
+      };
+
+      if (shared) broadcastToLocation('main-world', deathMessage, null, player.instance);
+      else safeSend(player.ws, deathMessage);
 
       incrementKillQuests(player);
+      grantEnemyKillXp(player, enemy.type);
+
+      if (player.combat.healOnKill > 0 && player.alive) {
+        const healed = Math.min(player.maxHealth, player.health + player.combat.healOnKill);
+        if (healed !== player.health) {
+          player.health = healed;
+          safeSend(player.ws, { type: 'playerHealed', health: player.health, maxHealth: player.maxHealth });
+        }
+      }
+
+      if (shared) {
+        const cfg = ENEMY_TYPES[enemy.type];
+        enemy.cast = null;
+        enemy.pendingImpacts = [];
+        enemy.pools = [];
+        enemy.respawnAt = Date.now() + WARDEN_RESPAWN_MS;
+        dropLoot(enemy.position, player.instance, cfg.lootMin, cfg.lootMax);
+        return;
+      }
 
       if (player.locationId === CAVE_LOCATION_ID) {
         if (player.cave && enemy.id === player.cave.bossId) {
           player.cave.bossDefeated = true;
+          player.cave.portalDoomed = true;
+          grantXp(player, progression.XP_SOURCES.caveBossXp, 'cave_boss');
           safeSend(player.ws, { type: 'caveBossState', defeated: true });
         }
         return;
@@ -3631,7 +4768,12 @@ wss.on('connection', (ws) => {
       const alreadyCleared = player.canyon.clearedSegments.has(player.canyon.segment);
       if (!alreadyCleared) {
         const cfg = ENEMY_TYPES[enemy.type];
-        dropCanyonLoot(player, enemy.position, cfg.lootMin, cfg.lootMax);
+        dropCanyonLoot(
+          player,
+          enemy.position,
+          cfg.lootMin,
+          Math.round(cfg.lootMax * player.combat.lootMult)
+        );
       }
 
       if (enemy.type === 'slime_boss') {
@@ -3639,6 +4781,7 @@ wss.on('connection', (ws) => {
         if (!alreadyCleared) {
           player.canyon.clearedSegments.add(clearedSegment);
         }
+        grantXp(player, progression.canyonSegmentXp(clearedSegment, alreadyCleared), `canyon:${clearedSegment}`);
         const nextSegment = Math.min(clearedSegment + 1, CANYON_MAX_SEGMENT_CAP);
         if (nextSegment > player.canyon.maxSegmentReached) {
           player.canyon.maxSegmentReached = nextSegment;
@@ -3687,6 +4830,7 @@ wss.on('connection', (ws) => {
     player.caveChests[data.chestId] = now;
     player.ash += CAVE_CHEST_REWARD;
     player.economyChangedAt = now;
+    grantXp(player, progression.XP_SOURCES.caveChestXp, 'cave_chest');
     persistPlayer(player);
 
     safeSend(player.ws, { type: 'caveChestOpened', chestId: data.chestId, ash: CAVE_CHEST_REWARD });
@@ -4290,6 +5434,7 @@ wss.on('connection', (ws) => {
 
     player.ash += result.rewardAsh;
     player.economyChangedAt = Date.now();
+    grantXp(player, progression.XP_SOURCES.factionTaskXp, 'faction_quest');
     bumpFactionTaskProgress(player, 'ash', result.rewardAsh).catch((err) => console.error('[FactionTask] bump error:', err.message));
     persistPlayer(player);
 
@@ -4864,7 +6009,90 @@ wss.on('connection', (ws) => {
   }
 
   function getQuestState(player, questId) {
-    return player.quests[questId] || { status: 'not_started', progress: 0 };
+    return player.quests[questId] || { status: 'not_started', progress: 0, visited: [] };
+  }
+
+  function questAvailable(player, quest) {
+    if (!quest.requiresQuest) return true;
+    return getQuestState(player, quest.requiresQuest).status === 'completed';
+  }
+
+  function activeQuestForNpc(player, npc) {
+    for (const quest of QUEST_LIST) {
+      if (quest.npc !== npc) continue;
+      if (!questAvailable(player, quest)) continue;
+      if (getQuestState(player, quest.id).status === 'completed') continue;
+      return quest;
+    }
+    return null;
+  }
+
+  function buildQuestInfoPayload(player, quest) {
+    const state = getQuestState(player, quest.id);
+    return {
+      type: 'questInfo',
+      questId: quest.id,
+      npc: quest.npc,
+      questType: quest.type,
+      title: quest.title,
+      description: quest.description,
+      targetCount: quest.targetCount,
+      rewardAsh: quest.rewardAsh,
+      rewardXp: progression.questXp(quest.id),
+      status: state.status,
+      progress: state.progress,
+      targets: quest.targets || null,
+      visited: state.visited || [],
+    };
+  }
+
+  function autoStartQuests(player) {
+    for (const quest of QUEST_LIST) {
+      if (!quest.autoStart) continue;
+      if (!questAvailable(player, quest)) continue;
+
+      const state = getQuestState(player, quest.id);
+      if (state.status !== 'not_started') continue;
+
+      player.quests[quest.id] = { status: 'active', progress: 0, visited: [] };
+      safeSend(player.ws, buildQuestInfoPayload(player, quest));
+    }
+  }
+
+  function handleNpcVisit(player, data) {
+    if (typeof data.npcId !== 'string') return;
+    if (!ORIENTATION_TARGET_IDS.has(data.npcId)) return;
+
+    for (const quest of QUEST_LIST) {
+      if (quest.type !== 'visit_npcs') continue;
+
+      const state = getQuestState(player, quest.id);
+      if (state.status !== 'active') continue;
+
+      const target = quest.targets.find((t) => t.id === data.npcId);
+      if (!target) continue;
+      if (target.locationId !== player.locationId) continue;
+
+      const visited = Array.isArray(state.visited) ? state.visited : [];
+      if (visited.includes(target.id)) continue;
+
+      visited.push(target.id);
+      state.visited = visited;
+      state.progress = visited.length;
+      if (state.progress >= quest.targetCount) state.status = 'ready_to_turn_in';
+      player.quests[quest.id] = state;
+      persistPlayer(player);
+
+      safeSend(player.ws, {
+        type: 'questUpdate',
+        questId: quest.id,
+        status: state.status,
+        progress: state.progress,
+        targetCount: quest.targetCount,
+        visited: state.visited,
+        visitedName: target.name,
+      });
+    }
   }
 
   function incrementKillQuests(player) {
@@ -5018,22 +6246,18 @@ wss.on('connection', (ws) => {
   }
 
   function handleQuestInteract(player, data) {
-    if (typeof data.questId !== 'string') return;
-    const quest = getQuest(data.questId);
-    if (!quest) return;
+    const quest = typeof data.npc === 'string'
+      ? activeQuestForNpc(player, data.npc)
+      : (typeof data.questId === 'string' ? getQuest(data.questId) : null);
 
-    const state = getQuestState(player, quest.id);
-    safeSend(player.ws, {
-      type: 'questInfo',
-      questId: quest.id,
-      npc: quest.npc,
-      title: quest.title,
-      description: quest.description,
-      targetCount: quest.targetCount,
-      rewardAsh: quest.rewardAsh,
-      status: state.status,
-      progress: state.progress,
-    });
+    if (!quest) {
+      if (typeof data.npc === 'string') {
+        safeSend(player.ws, { type: 'questInfo', npc: data.npc, questId: null, status: 'none' });
+      }
+      return;
+    }
+
+    safeSend(player.ws, buildQuestInfoPayload(player, quest));
   }
 
   function handleQuestAccept(player, data) {
@@ -5043,8 +6267,9 @@ wss.on('connection', (ws) => {
 
     const state = getQuestState(player, quest.id);
     if (state.status !== 'not_started') return;
+    if (!questAvailable(player, quest)) return;
 
-    player.quests[quest.id] = { status: 'active', progress: 0 };
+    player.quests[quest.id] = { status: 'active', progress: 0, visited: [] };
     persistPlayer(player);
 
     safeSend(player.ws, {
@@ -5064,9 +6289,14 @@ wss.on('connection', (ws) => {
     const state = getQuestState(player, quest.id);
     if (state.status !== 'ready_to_turn_in') return;
 
-    player.quests[quest.id] = { status: 'completed', progress: quest.targetCount };
+    player.quests[quest.id] = {
+      status: 'completed',
+      progress: quest.targetCount,
+      visited: state.visited || [],
+    };
     player.ash += quest.rewardAsh;
     player.economyChangedAt = Date.now();
+    const rewardXp = grantXp(player, progression.questXp(quest.id), `quest:${quest.id}`);
     bumpFactionTaskProgress(player, 'ash', quest.rewardAsh).catch((err) => console.error('[FactionTask] bump error:', err.message));
     persistPlayer(player);
 
@@ -5077,8 +6307,113 @@ wss.on('connection', (ws) => {
       progress: quest.targetCount,
       targetCount: quest.targetCount,
       rewardAsh: quest.rewardAsh,
+      rewardXp,
     });
     safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+
+    const nextQuest = activeQuestForNpc(player, quest.npc);
+    if (nextQuest) safeSend(player.ws, buildQuestInfoPayload(player, nextQuest));
+  }
+
+  function handleBranchSelect(player, data) {
+    if (!progression.isBranchId(data.branch)) return;
+
+    const state = player.progression;
+    if (state.branch !== null) {
+      safeSend(player.ws, { type: 'error', message: 'Specialisation already chosen — respec with Sola to switch' });
+      return;
+    }
+    if (state.level < BRANCH_UNLOCK_LEVEL) {
+      safeSend(player.ws, { type: 'error', message: "Finish Sola's orientation first" });
+      return;
+    }
+
+    state.branch = data.branch;
+    persistPlayer(player);
+
+    safeSend(player.ws, { type: 'branchSelected', branch: state.branch });
+    sendProgressionState(player);
+    broadcastPlayerLevel(player);
+  }
+
+  function handleAbilityBind(player, data) {
+    if (typeof data.slot !== 'string') return;
+    if (!ABILITY_SLOTS.includes(data.slot)) return;
+
+    const state = player.progression;
+
+    if (data.abilityId === null) {
+      delete state.loadout[data.slot];
+    } else {
+      if (typeof data.abilityId !== 'string') return;
+      if (!skills.hasAbility(state.skills, data.abilityId)) {
+        safeSend(player.ws, { type: 'error', message: 'You have not learned that skill' });
+        return;
+      }
+
+      for (const slot of ABILITY_SLOTS) {
+        if (state.loadout[slot] === data.abilityId) delete state.loadout[slot];
+      }
+      state.loadout[data.slot] = data.abilityId;
+    }
+
+    persistPlayer(player);
+    sendProgressionState(player);
+  }
+
+  function handleSkillLearn(player, data) {
+    if (typeof data.nodeId !== 'string') return;
+
+    const state = player.progression;
+    const points = progressionPoints(player);
+
+    const check = skills.canLearn(data.nodeId, {
+      level: state.level,
+      branch: state.branch,
+      ranks: state.skills,
+      availablePoints: points.available,
+    });
+
+    if (!check.ok) {
+      safeSend(player.ws, { type: 'skillLearnRejected', nodeId: data.nodeId, reason: check.reason });
+      return;
+    }
+
+    state.skills[data.nodeId] = (state.skills[data.nodeId] || 0) + 1;
+    refreshCombatStats(player);
+    persistPlayer(player);
+
+    safeSend(player.ws, {
+      type: 'skillLearned',
+      nodeId: data.nodeId,
+      rank: state.skills[data.nodeId],
+    });
+    sendProgressionState(player);
+  }
+
+  function handleSkillRespec(player) {
+    const state = player.progression;
+    if (state.branch === null) return;
+
+    const cost = progression.respecCostAsh(state.level, state.respecCount);
+    if (player.ash < cost) {
+      safeSend(player.ws, { type: 'error', message: `Respec costs ${cost} Ash` });
+      return;
+    }
+
+    player.ash -= cost;
+    player.economyChangedAt = Date.now();
+    state.skills = {};
+    state.loadout = {};
+    state.fireMode = 'single';
+    state.branch = null;
+    state.respecCount += 1;
+    refreshCombatStats(player);
+    persistPlayer(player);
+
+    safeSend(player.ws, { type: 'skillsRespecced', costAsh: cost });
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+    sendProgressionState(player);
   }
 
   function handleLootPickup(player, data) {
@@ -5671,6 +7006,7 @@ wss.on('connection', (ws) => {
       safeSend(ws, { type: 'lootState', loot: serializeLoot(player.instance) });
       await ensureSignsLoaded(player.gameId);
       safeSend(ws, { type: 'signState', signs: serializeSigns(player.instance) });
+      sendWorldEnemyState(player);
     }
 
     if (data.locationId === 'tower-first-floor' && player.canyon) {
@@ -5792,5 +7128,6 @@ server.listen(PORT, () => {
   console.log(`[TANJO] Health check: http://localhost:${PORT}/health`);
   console.log(`[TANJO] Site URL: ${CONFIG.siteUrl}`);
   console.log(`[TANJO] Persistence: ${CONFIG.internalSecret ? 'enabled' : 'DISABLED'}`);
+  console.log(`[TANJO] Catalogs: progression ${progression.CATALOG_HASH}, skills ${skills.CATALOG_HASH}`);
   console.log(`[TANJO] AoI: ${CONFIG.world.zoneSize}m zones, radius ${CONFIG.world.aoiRadius}`);
 });
