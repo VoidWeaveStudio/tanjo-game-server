@@ -10,7 +10,9 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "check:terrain": "node scripts/checkTerrain.js",
-    "check:abilities": "node scripts/check-abilities.js"
+    "check:abilities": "node scripts/check-abilities.js",
+    "check:party": "node scripts/check-party.js",
+    "check:arena": "node scripts/check-arena.js"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

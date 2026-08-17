@@ -19,6 +19,8 @@ const {
 const progression = require('./progression');
 const skills = require('./skills');
 const abilities = require('./abilities');
+const party = require('./party');
+const arena = require('./arena');
 
 const PORT = process.env.PORT || 3001;
 const MAX_CONNECTIONS = 2000;
@@ -77,6 +79,11 @@ const CONFIG = {
     mailSendRateLimit: 5,
     mailReadRateLimit: 15,
     respawnRateLimit: 3,
+    stuckRateLimit: 2,
+    crateRateLimit: 5,
+    partyRateLimit: 5,
+    arenaRateLimit: 5,
+    storageRateLimit: 12,
     tokenLookupRateLimit: 1,
     supportRateLimit: 1,
     blockRateLimit: 5,
@@ -116,6 +123,12 @@ const ABILITY_SLOTS = ['s1', 's2', 's3', 's4', 's5', 's6'];
 const LEGACY_ABILITY_SLOTS = { q: 's1', f: 's2', c: 's3', v: 's4', x: 's5' };
 const ABILITY_TICK_MS = 200;
 const ABILITY_ORIGIN_TOLERANCE = 3;
+const COMBAT_MODE_MS = 10000;
+const COMBAT_STATE_THROTTLE_MS = 2000;
+const STUCK_COOLDOWN_MS = 60 * 60 * 1000;
+const STUCK_DESTINATION_ID = 'main-world';
+const HOME_TELEPORT_COOLDOWN_MS = 10 * 60 * 1000;
+const HOME_TELEPORT_CAST_MS = 5000;
 const SHOT_SPREAD_TOLERANCE_DEG = 6;
 const CANYON_LEVELS_PER_SEGMENT = 5;
 const CAVE_CONTENT_LEVEL = 15;
@@ -140,6 +153,10 @@ const CANYON_COMBAT_DEPTH = 360;
 const CANYON_BOSS_ZONE_DEPTH = 40;
 const CANYON_SEGMENT_LENGTH = CANYON_SAFE_ENTRANCE_DEPTH + CANYON_COMBAT_DEPTH + CANYON_BOSS_ZONE_DEPTH;
 const CANYON_MAX_SEGMENT_CAP = 200;
+const ARENA_LOCATION_ID = arena.ARENA_CONFIG.locationId;
+const CANYON_RETURN_PAD_OFFSET = 20;
+const CANYON_RETURN_PAD_REACH = 6;
+const CANYON_REPEAT_LOOT_MULT = 0.3;
 
 const CANYON_HUB_POSITION = [0, 0, 20];
 
@@ -1193,6 +1210,31 @@ function clearSpawnProtection(player) {
   safeSend(player.ws, { type: 'spawnProtection', untilMs: 0, durationMs: 0 });
 }
 
+function isInCombat(player) {
+  return !!player && !!player.combatUntil && Date.now() < player.combatUntil;
+}
+
+function markInCombat(player) {
+  if (!player || !player.authenticated || !player.alive) return;
+
+  const now = Date.now();
+  const wasInCombat = player.combatUntil > now;
+  player.combatUntil = now + COMBAT_MODE_MS;
+  cancelHomeTeleport(player, 'in_combat');
+
+  if (wasInCombat && now - player.combatStateSentAt < COMBAT_STATE_THROTTLE_MS) return;
+
+  player.combatStateSentAt = now;
+  safeSend(player.ws, { type: 'combatState', until: player.combatUntil });
+}
+
+function clearCombat(player) {
+  if (!player.combatUntil) return;
+  player.combatUntil = 0;
+  player.combatStateSentAt = 0;
+  safeSend(player.ws, { type: 'combatState', until: 0 });
+}
+
 function spawnInSafeZone(player, locationId) {
   const target = locationId || player.locationId;
   if (typeof target === 'string' && (target.startsWith('faction-gate-') || target.startsWith(PLAYER_ROOM_PREFIX))) {
@@ -1792,6 +1834,11 @@ function canyonSegmentEntrancePosition(segment) {
   return [canyonPathOffsetX(z), 0, z];
 }
 
+function canyonReturnPadPosition(segment) {
+  const z = canyonSegmentStartZ(segment) + CANYON_SAFE_ENTRANCE_DEPTH + CANYON_COMBAT_DEPTH + CANYON_RETURN_PAD_OFFSET;
+  return [canyonPathOffsetX(z), 0, z];
+}
+
 function spawnCanyonEnemy(player, type, position, healthMult = 1, damageMult = 1) {
   const cfg = ENEMY_TYPES[type];
   const id = `canyon-${player.id}-${player.canyon.nextEnemySeq++}`;
@@ -1820,6 +1867,7 @@ function spawnCanyonEnemy(player, type, position, healthMult = 1, damageMult = 1
 
 function preparePlayerEnemiesForSegment(player, segment) {
   player.canyon.segment = segment;
+  player.canyon.runCleared = false;
   player.canyon.enemies.clear();
   clearCanyonLoot(player);
 
@@ -1828,11 +1876,12 @@ function preparePlayerEnemiesForSegment(player, segment) {
   for (let i = 0; i < mobCount; i++) {
     spawnCanyonEnemy(player, biome.mob, randomCanyonCombatPoint(segment), healthMult, damageMult);
   }
-  spawnCanyonEnemy(player, biome.boss, randomCanyonBossPoint(segment), healthMult, damageMult);
+  player.canyon.bossId = spawnCanyonEnemy(player, biome.boss, randomCanyonBossPoint(segment), healthMult, damageMult);
 }
 
 function populateCanyonSegment(player, segment) {
   player.canyon.inHub = false;
+  cancelHomeTeleport(player, 'canyon');
   clearPlayerAbilityBuffs(player, true);
   preparePlayerEnemiesForSegment(player, segment);
   player.position = canyonSegmentEntrancePosition(segment);
@@ -1849,10 +1898,12 @@ function populateCanyonSegment(player, segment) {
     biome: canyonBiomeFor(segment).key,
   });
   safeSend(player.ws, { type: 'enemyState', enemies: serializeCanyonEnemies(player) });
+  sendCrateState(player);
 }
 
 function enterCanyonHub(player) {
   player.canyon.inHub = true;
+  player.canyon.runCleared = false;
   clearPlayerAbilityBuffs(player, true);
   player.canyon.enemies.clear();
   clearCanyonLoot(player);
@@ -1866,9 +1917,11 @@ function enterCanyonHub(player) {
     maxSegmentReached: player.canyon.maxSegmentReached,
   });
   safeSend(player.ws, { type: 'enemyState', enemies: [] });
+  sendCrateState(player);
 }
 
 function activeEnemiesFor(player) {
+  if (player.locationId === ARENA_LOCATION_ID) return arena.runForPlayer(player.id)?.enemies ?? null;
   if (player.locationId === 'tower-first-floor') return player.canyon?.enemies ?? null;
   if (player.locationId === CAVE_LOCATION_ID) return player.cave?.enemies ?? null;
   if (player.locationId === 'main-world') return worldEnemies.get(player.instance) ?? null;
@@ -2006,10 +2059,219 @@ function updateCanyonPatrol(enemy, cfg, now, constrained = false) {
   }
 }
 
+function cancelHomeTeleport(player, reason) {
+  if (!player.homeTeleportCastUntil) return;
+  player.homeTeleportCastUntil = 0;
+  safeSend(player.ws, { type: 'homeTeleportResult', casting: false, cancelled: true, reason });
+}
+
+function completeHomeTeleport(player, now) {
+  player.homeTeleportCastUntil = 0;
+
+  const refuse = (reason) => safeSend(player.ws, { type: 'homeTeleportResult', casting: false, cancelled: true, reason });
+
+  if (!player.alive) return refuse('dead');
+  if (!player.homeSpawn) return refuse('no_beacon');
+  if (isInCombat(player)) return refuse('in_combat');
+  if (isInCanyonSegment(player)) return refuse('canyon');
+
+  const charges = player.placeables['home-teleport'] || 0;
+  if (charges <= 0) return refuse('no_charge');
+
+  player.placeables['home-teleport'] = charges - 1;
+  player.homeTeleportUsedAt = now;
+  player.economyChangedAt = now;
+
+  const destination = `${PLAYER_ROOM_PREFIX}${player.userId}`;
+  const sameRoom = player.locationId === destination;
+
+  player.position = [...player.homeSpawn];
+  player.justTeleported = true;
+  player.teleportSettleUntil = now + TELEPORT_SETTLE_MS;
+  player.positionHistory = [];
+  player.recentShots = [];
+  grantSpawnProtection(player);
+  persistPlayer(player);
+
+  safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+  safeSend(player.ws, {
+    type: 'homeTeleportResult',
+    casting: false,
+    done: true,
+    locationId: destination,
+    position: player.position,
+    sameRoom,
+    cooldownUntil: now + HOME_TELEPORT_COOLDOWN_MS,
+    charges: player.placeables['home-teleport'],
+  });
+}
+
+function partyErrorMessage(code) {
+  switch (code) {
+    case 'self': return 'You cannot invite yourself';
+    case 'target_in_party': return 'That player is already in a party';
+    case 'already_invited': return 'You already invited them';
+    case 'already_in_party': return 'You are already in a party';
+    case 'full': return `A party holds ${party.MAX_PARTY_SIZE} people at most`;
+    case 'no_invite': return 'That invite is no longer valid';
+    case 'expired': return 'That invite expired';
+    case 'gone': return 'That party no longer exists';
+    case 'not_leader': return 'Only the party leader can do that';
+    case 'not_member': return 'They are not in your party';
+    case 'no_party': return 'You are not in a party';
+    default: return 'Party action failed';
+  }
+}
+
+function partyRosterPayload(group) {
+  return {
+    type: 'partyState',
+    partyId: group.id,
+    leaderId: group.leaderId,
+    members: group.memberIds.map((id) => {
+      const member = players.get(id);
+      return {
+        id,
+        nickname: member?.nickname || 'Unknown',
+        level: member?.progression?.level || 1,
+        health: member?.health ?? 0,
+        maxHealth: member?.maxHealth ?? BASE_MAX_HEALTH,
+        alive: member?.alive !== false,
+        locationId: member?.locationId || null,
+      };
+    }),
+  };
+}
+
+const EMPTY_PARTY_PAYLOAD = { type: 'partyState', partyId: null, leaderId: null, members: [] };
+
+function broadcastPartyState(group) {
+  if (!group) return;
+  const payload = partyRosterPayload(group);
+  for (const id of group.memberIds) {
+    const member = players.get(id);
+    if (member) safeSend(member.ws, payload);
+  }
+}
+
+function sendPartyDisbanded(memberIds, reason) {
+  for (const id of memberIds) {
+    const member = players.get(id);
+    if (!member) continue;
+    safeSend(member.ws, EMPTY_PARTY_PAYLOAD);
+    safeSend(member.ws, { type: 'partyDisbanded', reason });
+  }
+}
+
+function applyPartyDeparture(result, reason) {
+  if (!result.removed) return;
+
+  if (result.disbanded) {
+    sendPartyDisbanded(result.remaining, reason);
+    return;
+  }
+
+  broadcastPartyState(result.party);
+}
+
+function cancelArenaRevive(player, reason) {
+  if (!player.arenaReviveUntil) return;
+  player.arenaReviveUntil = 0;
+  player.arenaReviveTargetId = null;
+  safeSend(player.ws, { type: 'arenaReviveResult', channelling: false, cancelled: true, reason });
+}
+
+function completeArenaRevive(player, now) {
+  const targetId = player.arenaReviveTargetId;
+  player.arenaReviveUntil = 0;
+  player.arenaReviveTargetId = null;
+
+  const run = arena.runForPlayer(player.id);
+  const target = targetId ? players.get(targetId) : null;
+
+  if (!run || run.phase !== 'pause' || !target || !run.downIds.has(targetId)) {
+    safeSend(player.ws, { type: 'arenaReviveResult', channelling: false, cancelled: true, reason: 'gone' });
+    return;
+  }
+
+  arena.markUp(run, targetId);
+  target.alive = true;
+  target.health = Math.max(1, Math.round(target.maxHealth * 0.5));
+  target.justTeleported = true;
+  target.teleportSettleUntil = now + TELEPORT_SETTLE_MS;
+  grantSpawnProtection(target);
+
+  safeSend(target.ws, {
+    type: 'respawn',
+    locationId: target.locationId,
+    position: target.position,
+    health: target.health,
+  });
+  broadcast({ type: 'playerRespawn', id: target.id, position: target.position, health: target.health }, target.id, true, target);
+
+  safeSend(player.ws, { type: 'arenaReviveResult', channelling: false, done: true, targetId });
+  broadcastArena(run, { type: 'arenaPlayerRevived', playerId: targetId, byId: player.id });
+  broadcastArenaState(run);
+}
+
+function isInCanyonSegment(player) {
+  return player.locationId === 'tower-first-floor' && !!player.canyon && !player.canyon.inHub;
+}
+
+function isCombatLogout(player) {
+  if (!player.alive) return false;
+  return isInCombat(player) || isInCanyonSegment(player);
+}
+
+function consumeInsurance(player) {
+  const charges = player.placeables['run-insurance'] || 0;
+  if (charges <= 0) return false;
+
+  player.placeables['run-insurance'] = charges - 1;
+  player.economyChangedAt = Date.now();
+
+  safeSend(player.ws, { type: 'insuranceConsumed' });
+  safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+  return true;
+}
+
+function dropRunLoot(player) {
+  if (!Array.isArray(player.inventory) || player.inventory.length === 0) return { outcome: 'empty' };
+  if (CRATE_BLOCKED_LOCATIONS.has(player.locationId)) return { outcome: 'kept' };
+
+  if (consumeInsurance(player)) {
+    persistPlayer(player);
+    return { outcome: 'insured' };
+  }
+
+  const crate = spawnDeathCrate(player, player.position);
+  persistPlayer(player);
+
+  if (!crate) return { outcome: 'kept' };
+
+  return {
+    outcome: 'crate',
+    stacks: crate.entries.length,
+    expiresAt: crate.createdAt + CRATE_CONFIG.despawnMs,
+    segment: crate.segment,
+  };
+}
+
 function markPlayerDead(target, killerId, position) {
   target.alive = false;
   target.stats.deaths++;
+  clearCombat(target);
+  cancelHomeTeleport(target, 'dead');
   clearPlayerAbilityBuffs(target, false);
+  cancelArenaRevive(target, 'dead');
+  const loot = dropRunLoot(target);
+
+  const arenaRun = arena.runForPlayer(target.id);
+  if (arenaRun) {
+    arena.markDown(arenaRun, target.id);
+    broadcastArena(arenaRun, { type: 'arenaPlayerDown', playerId: target.id });
+    broadcastArenaState(arenaRun);
+  }
 
   const deathMessage = {
     type: 'playerDeath',
@@ -2018,31 +2280,65 @@ function markPlayerDead(target, killerId, position) {
     position,
   };
 
-  safeSend(target.ws, deathMessage);
+  safeSend(target.ws, { ...deathMessage, options: respawnOptionsFor(target), loot });
   broadcast(deathMessage, target.id, true, target);
 }
 
-function respawnPlayer(target) {
+function respawnDestinationFor(target, requested) {
+  const inCanyon = target.locationId === 'tower-first-floor' && !!target.canyon;
+
+  if (requested === 'canyon_hub') return inCanyon ? 'canyon_hub' : 'hall';
+  if (requested === 'home') return target.homeSpawn ? 'home' : 'hall';
+  if (requested === 'hall') return 'hall';
+
+  return inCanyon ? 'canyon_hub' : 'hall';
+}
+
+function respawnPlayer(target, requested) {
   if (target.alive) return;
   if (target.ws.readyState !== WebSocket.OPEN) return;
+
+  const leavingRun = arena.runForPlayer(target.id);
+  if (leavingRun) {
+    arena.dropMember(leavingRun, target.id);
+    safeSend(target.ws, { type: 'arenaEnded', reason: 'left', wavesCleared: 0, ash: 0, xp: 0, bestWave: target.arenaBestWave || 0, cooldownUntil: target.arenaCooldownUntil || 0 });
+    broadcastArenaState(leavingRun);
+  }
+
+  const destination = respawnDestinationFor(target, requested);
+  const oldLocation = target.locationId;
 
   target.health = target.maxHealth;
   target.alive = true;
   clearPlayerAbilityBuffs(target, true);
-  if (target.locationId === 'tower-first-floor' && target.canyon) {
+
+  if (destination === 'canyon_hub') {
     enterCanyonHub(target);
   } else {
-    const oldLocation = target.locationId;
-    target.locationId = 'tower-main-hall';
+    target.locationId = destination === 'home' ? `${PLAYER_ROOM_PREFIX}${target.userId}` : 'tower-main-hall';
     target.weaponEquipped = false;
-    spawnInSafeZone(target);
+
+    if (destination === 'home') {
+      target.instance = 1;
+      target.position = [...target.homeSpawn];
+    } else {
+      spawnInSafeZone(target);
+    }
+
     target.positionHistory = [];
     target.recentShots = [];
     safeSend(target.ws, { type: 'weaponForceUnequip' });
+
     if (oldLocation !== target.locationId) {
       notifyLocationTransition(target, oldLocation, target.locationId);
+      if (isShardedLocation(oldLocation)) broadcastShardState(oldLocation);
+      if (isShardedLocation(target.locationId)) broadcastShardState(target.locationId);
+      if (destination === 'home') {
+        refreshRoomEditRights(target).catch((err) => console.error('[Respawn] edit rights error:', err.message));
+      }
     }
   }
+
   target.justTeleported = true;
   target.teleportSettleUntil = Date.now() + TELEPORT_SETTLE_MS;
   grantSpawnProtection(target);
@@ -2062,10 +2358,17 @@ function respawnPlayer(target) {
   }, target.id, true, target);
 }
 
-function handleRespawnRequest(player) {
-  if (!player.alive) {
-    respawnPlayer(player);
-  }
+function handleRespawnRequest(player, data) {
+  if (player.alive) return;
+  respawnPlayer(player, typeof data?.target === 'string' ? data.target : null);
+}
+
+function respawnOptionsFor(player) {
+  return {
+    hall: true,
+    home: !!player.homeSpawn,
+    canyon_hub: isInCanyonSegment(player) || (player.locationId === 'tower-first-floor' && !!player.canyon),
+  };
 }
 
 function damagePlayerByCanyonEnemy(player, enemy) {
@@ -2761,10 +3064,259 @@ function canyonTick() {
 
 safeInterval(canyonTick, CANYON_CONFIG.tickRate);
 
+function isArenaMemberPresent(run, member) {
+  if (!member || !member.authenticated) return false;
+  return member.locationId === ARENA_LOCATION_ID && member.instance === run.instance;
+}
+
+function arenaMembersInPlay(run) {
+  const list = [];
+  for (const id of arena.activeMembers(run)) {
+    const member = players.get(id);
+    if (isArenaMemberPresent(run, member)) list.push(member);
+  }
+  return list;
+}
+
+function broadcastArena(run, message) {
+  for (const id of run.memberIds) {
+    const member = players.get(id);
+    if (member) safeSend(member.ws, message);
+  }
+}
+
+function arenaStatePayload(run) {
+  return {
+    type: 'arenaState',
+    runId: run.id,
+    phase: run.phase,
+    wave: run.wave,
+    phaseUntil: run.phaseUntil,
+    candleHealth: run.candleHealth,
+    candleMaxHealth: arena.ARENA_CONFIG.candleHealth,
+    members: run.memberIds.map((id) => ({
+      id,
+      nickname: players.get(id)?.nickname || 'Unknown',
+      down: run.downIds.has(id),
+      left: run.leftIds.has(id),
+    })),
+  };
+}
+
+function broadcastArenaState(run) {
+  broadcastArena(run, arenaStatePayload(run));
+}
+
+function sendArenaEnemies(run) {
+  const payload = { type: 'enemyState', enemies: serializeEnemies(run.enemies) };
+  for (const member of arenaMembersInPlay(run)) safeSend(member.ws, payload);
+}
+
+function arenaSpawnPoint(index) {
+  const gates = arena.ARENA_CONFIG.spawnGates;
+  const gate = gates[index % gates.length];
+  const spread = 3;
+  return [
+    gate[0] + (Math.random() * 2 - 1) * spread,
+    0,
+    gate[2] + (Math.random() * 2 - 1) * spread,
+  ];
+}
+
+function startArenaWave(run, now) {
+  run.wave += 1;
+  run.phase = 'wave';
+  run.phaseUntil = 0;
+
+  const plan = arena.waveComposition(run.wave);
+  const biome = CANYON_BIOMES[plan.biomeIndex];
+
+  for (let i = 0; i < plan.mobs; i++) {
+    spawnEnemyInto(run.enemies, `arena-${run.id}`, run.nextEnemySeq++, biome.mob, arenaSpawnPoint(i), plan.healthMult, plan.damageMult);
+  }
+  for (let i = 0; i < plan.bosses; i++) {
+    spawnEnemyInto(run.enemies, `arena-${run.id}`, run.nextEnemySeq++, biome.boss, arenaSpawnPoint(i + 2), plan.healthMult, plan.damageMult);
+  }
+
+  broadcastArena(run, {
+    type: 'arenaWaveStart',
+    wave: run.wave,
+    boss: plan.bosses > 0,
+    biome: biome.key,
+    enemies: plan.mobs + plan.bosses,
+  });
+  broadcastArenaState(run);
+  sendArenaEnemies(run);
+}
+
+function finishArenaRun(run, reason, now) {
+  const cleared = run.wavesCleared;
+  const reward = arena.rewardsFor(cleared);
+
+  for (const id of run.memberIds) {
+    const member = players.get(id);
+    if (!member) continue;
+
+    if (cleared > 0) {
+      member.ash += reward.ash;
+      member.economyChangedAt = now;
+      grantXp(member, reward.xp, 'arena');
+      if (cleared > (member.arenaBestWave || 0)) member.arenaBestWave = cleared;
+    }
+
+    member.arenaCooldownUntil = now + arena.ARENA_CONFIG.cooldownMs;
+    member.arenaReviveUntil = 0;
+    member.arenaReviveTargetId = null;
+
+    safeSend(member.ws, {
+      type: 'arenaEnded',
+      reason,
+      wavesCleared: cleared,
+      ash: cleared > 0 ? reward.ash : 0,
+      xp: cleared > 0 ? reward.xp : 0,
+      bestWave: member.arenaBestWave || 0,
+      cooldownUntil: member.arenaCooldownUntil,
+    });
+    safeSend(member.ws, { type: 'inventoryUpdate', inventory: member.inventory, ash: member.ash, placeables: member.placeables });
+    safeSend(member.ws, { type: 'enemyState', enemies: [] });
+    persistPlayer(member);
+  }
+
+  arena.endRun(run);
+}
+
+function damageCandle(run, enemy, now) {
+  if (run.candleHealth <= 0) return;
+
+  const damage = Math.max(1, Math.round(enemy.attackDamage * enemyDamageOutputMult(enemy, now)));
+  run.candleHealth = Math.max(0, run.candleHealth - damage);
+
+  broadcastArena(run, {
+    type: 'arenaCandleDamage',
+    damage,
+    health: run.candleHealth,
+    maxHealth: arena.ARENA_CONFIG.candleHealth,
+    attackerId: enemy.id,
+  });
+}
+
+function nearestArenaTarget(run, enemy, cfg) {
+  let best = null;
+  let bestDistance = Infinity;
+
+  for (const member of arenaMembersInPlay(run)) {
+    if (!member.alive || run.downIds.has(member.id)) continue;
+
+    const dx = member.position[0] - enemy.position[0];
+    const dz = member.position[2] - enemy.position[2];
+    const distance = Math.sqrt(dx * dx + dz * dz);
+    if (distance > cfg.aggroRadius || distance >= bestDistance) continue;
+
+    best = member;
+    bestDistance = distance;
+  }
+
+  return best ? { player: best, distance: bestDistance } : null;
+}
+
+function moveArenaEnemy(run, enemy, cfg, now) {
+  const target = nearestArenaTarget(run, enemy, cfg);
+  const step = (dx, dz, dist, speed) => {
+    const len = dist || 1;
+    const move = speed * (CANYON_CONFIG.tickRate / 1000) * enemySpeedMult(enemy, now);
+    enemy.position[0] += (dx / len) * move;
+    enemy.position[2] += (dz / len) * move;
+    clampToArena(enemy.position, { x: 0, z: 0, radius: arena.ARENA_CONFIG.arenaRadius });
+  };
+
+  if (target) {
+    enemy.targetId = target.player.id;
+    const dx = target.player.position[0] - enemy.position[0];
+    const dz = target.player.position[2] - enemy.position[2];
+
+    if (target.distance > cfg.attackRange) {
+      step(dx, dz, target.distance, target.distance > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear);
+    } else if (now - enemy.lastAttackTime >= cfg.attackCooldown && !abilities.isStunned(enemy, now)) {
+      enemy.lastAttackTime = now;
+      damagePlayerByCanyonEnemy(target.player, enemy);
+    }
+    return;
+  }
+
+  enemy.targetId = null;
+
+  const candle = arena.ARENA_CONFIG.candlePosition;
+  const dx = candle[0] - enemy.position[0];
+  const dz = candle[2] - enemy.position[2];
+  const distance = Math.sqrt(dx * dx + dz * dz);
+
+  if (distance > cfg.attackRange + 1) {
+    step(dx, dz, distance, cfg.chaseSpeedNear);
+  } else if (now - enemy.lastAttackTime >= cfg.attackCooldown && !abilities.isStunned(enemy, now)) {
+    enemy.lastAttackTime = now;
+    damageCandle(run, enemy, now);
+  }
+}
+
+function tickArenaRun(run, now) {
+  for (const id of arena.activeMembers(run)) {
+    if (!isArenaMemberPresent(run, players.get(id))) arena.dropMember(run, id);
+  }
+
+  if (arena.isOver(run)) {
+    finishArenaRun(run, run.candleHealth <= 0 ? 'candle_lost' : 'wiped', now);
+    return;
+  }
+
+  if (run.phase === 'prep') {
+    if (now >= run.phaseUntil) startArenaWave(run, now);
+    return;
+  }
+
+  if (run.phase === 'pause') {
+    if (now >= run.phaseUntil) startArenaWave(run, now);
+    return;
+  }
+
+  let living = 0;
+  for (const enemy of run.enemies.values()) {
+    if (!enemy.alive) continue;
+    living += 1;
+
+    moveArenaEnemy(run, enemy, ENEMY_TYPES[enemy.type], now);
+    enemy.positionHistory.push({ position: [...enemy.position], time: now });
+    enemy.positionHistory = enemy.positionHistory.filter((p) => now - p.time < 1000);
+  }
+
+  if (living === 0) {
+    run.enemies.clear();
+    run.wavesCleared = run.wave;
+    run.phase = 'pause';
+    run.phaseUntil = now + arena.ARENA_CONFIG.pauseMs;
+
+    broadcastArena(run, { type: 'arenaWaveEnd', wave: run.wave, pauseUntil: run.phaseUntil });
+    broadcastArenaState(run);
+    sendArenaEnemies(run);
+    return;
+  }
+
+  sendArenaEnemies(run);
+}
+
+function arenaTick() {
+  const now = Date.now();
+  for (const run of arena.allRuns()) tickArenaRun(run, now);
+}
+
+safeInterval(arenaTick, CANYON_CONFIG.tickRate);
+
 const SHOP_ITEMS = {
   'sign-on-a-stick': { id: 'sign-on-a-stick', name: 'Sign on a Stick', price: 100, maxOwned: 10 },
   'sphere': { id: 'sphere', name: 'Sphere', price: 100, maxOwned: 50, tradeable: true },
   'wall-poster': { id: 'wall-poster', name: 'Wall Poster', price: 100, maxOwned: 4 },
+  'home-teleport': { id: 'home-teleport', name: 'Homeward Charge', price: 250, maxOwned: 10 },
+  'storage-crate': { id: 'storage-crate', name: 'Storage Crate', price: 200, maxOwned: null },
+  'run-insurance': { id: 'run-insurance', name: 'Run Insurance', price: 1000, maxOwned: 1, blockedInCombat: true },
 };
 
 const shopPriceOverrides = new Map();
@@ -3057,6 +3609,138 @@ function addTokensToInventory(player, tokens) {
   }
 }
 
+const STORAGE_SLOTS = 50;
+const STORAGE_REACH = 4;
+
+function sanitizeStorageEntry(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  if (typeof raw.address !== 'string' || raw.address.length === 0) return null;
+
+  const quantity = Math.floor(Number(raw.quantity));
+  if (!Number.isFinite(quantity) || quantity <= 0) return null;
+
+  return {
+    address: raw.address,
+    name: typeof raw.name === 'string' ? raw.name : '',
+    symbol: typeof raw.symbol === 'string' ? raw.symbol : '',
+    image: typeof raw.image === 'string' ? raw.image : null,
+    quantity,
+  };
+}
+
+function storageBucket(player, key) {
+  if (!Array.isArray(player.storage[key])) player.storage[key] = [];
+  return player.storage[key];
+}
+
+function stackIntoStorage(bucket, entry) {
+  const existing = bucket.find((e) => e.address === entry.address);
+  if (existing) {
+    existing.quantity += entry.quantity;
+    return entry.quantity;
+  }
+
+  if (bucket.length >= STORAGE_SLOTS) return 0;
+  bucket.push({ ...entry });
+  return entry.quantity;
+}
+
+function filledStorageKeys(player) {
+  return Object.keys(player.storage).filter((key) => (player.storage[key] || []).length > 0);
+}
+
+function sendStorageState(player, key = null) {
+  safeSend(player.ws, {
+    type: 'storageState',
+    key,
+    slots: STORAGE_SLOTS,
+    entries: key ? (player.storage[key] || []) : [],
+    filled: filledStorageKeys(player),
+  });
+}
+
+function isOwnRoom(player) {
+  return player.locationId === `${PLAYER_ROOM_PREFIX}${player.userId}`;
+}
+
+function storageInReach(player, key) {
+  const spot = player.storages.get(key);
+  if (!spot) return false;
+
+  const [px, , pz] = player.position;
+  return Math.sqrt((spot[0] - px) ** 2 + (spot[2] - pz) ** 2) <= STORAGE_REACH;
+}
+
+function reconcileStorage(player) {
+  let changed = false;
+  let recovered = 0;
+
+  for (const key of Object.keys(player.storage)) {
+    if (player.storages.has(key)) continue;
+
+    const entries = player.storage[key] || [];
+    delete player.storage[key];
+    if (entries.length > 0) {
+      player.storageOrphan.push(...entries);
+      changed = true;
+    }
+  }
+
+  while (player.storageOrphan.length > 0) {
+    const entry = player.storageOrphan[0];
+    let placed = false;
+
+    for (const key of player.storages.keys()) {
+      if (stackIntoStorage(storageBucket(player, key), entry) > 0) {
+        placed = true;
+        break;
+      }
+    }
+
+    if (!placed) break;
+
+    player.storageOrphan.shift();
+    recovered += 1;
+    changed = true;
+  }
+
+  if (!changed) return;
+
+  if (recovered > 0) {
+    safeSend(player.ws, {
+      type: 'error',
+      message: `📦 ${recovered} stack${recovered === 1 ? '' : 's'} from a removed crate moved into your storage`,
+    });
+  } else if (player.storageOrphan.length > 0) {
+    safeSend(player.ws, {
+      type: 'error',
+      message: '📦 Your crate is gone — its tokens are held safe until you build another one',
+    });
+  }
+
+  persistPlayer(player);
+  sendStorageState(player);
+}
+
+function applyHomeFixtures(player, status) {
+  if (status.fixtures !== true) return;
+
+  const spawn = status.homeSpawn;
+  player.homeSpawn = spawn && [spawn.x, spawn.y, spawn.z].every((v) => Number.isFinite(v))
+    ? [spawn.x, spawn.y, spawn.z]
+    : null;
+
+  const next = new Map();
+  for (const entry of Array.isArray(status.storages) ? status.storages : []) {
+    if (typeof entry?.key !== 'string') continue;
+    if (![entry.x, entry.y, entry.z].every((v) => Number.isFinite(v))) continue;
+    next.set(entry.key, [entry.x, entry.y, entry.z]);
+  }
+
+  player.storages = next;
+  reconcileStorage(player);
+}
+
 function ashForMarketCap(mc) {
   if (mc < 10000) return 1;
   if (mc < 50000) return 2;
@@ -3065,9 +3749,17 @@ function ashForMarketCap(mc) {
   return 20;
 }
 
-function rollLootTokens(minCount, maxCount) {
+function scaleLootCount(count, mult) {
+  if (mult >= 1) return count;
+  const scaled = Math.max(0, count * mult);
+  const whole = Math.floor(scaled);
+  return whole + (Math.random() < scaled - whole ? 1 : 0);
+}
+
+function rollLootTokens(minCount, maxCount, mult = 1) {
   if (tokenPool.length === 0) return [];
-  const count = minCount + Math.floor(Math.random() * (maxCount - minCount + 1));
+  const rolled = minCount + Math.floor(Math.random() * (maxCount - minCount + 1));
+  const count = scaleLootCount(rolled, mult);
   const tokens = [];
   for (let i = 0; i < count; i++) {
     const t = tokenPool[Math.floor(Math.random() * tokenPool.length)];
@@ -3109,8 +3801,8 @@ function clearCanyonLoot(player) {
   }
 }
 
-function dropCanyonLoot(player, position, minCount, maxCount) {
-  const tokens = rollLootTokens(minCount, maxCount);
+function dropCanyonLoot(player, position, minCount, maxCount, mult = 1) {
+  const tokens = rollLootTokens(minCount, maxCount, mult);
   if (tokens.length === 0) return;
 
   const id = `loot-${nextLootId++}`;
@@ -3139,6 +3831,147 @@ safeInterval(() => {
     }
   }
 }, 30000);
+
+const CRATE_CONFIG = {
+  despawnMs: 5 * 60 * 1000,
+  pickupRadius: 3,
+};
+
+const CRATE_BLOCKED_LOCATIONS = new Set([ARENA_LOCATION_ID]);
+
+const deathCrates = new Map();
+let nextCrateId = 0;
+
+function isPrivateCrateLocation(locationId) {
+  return locationId === 'tower-first-floor';
+}
+
+function crateVisibleTo(crate, viewer) {
+  if (viewer.locationId !== crate.locationId) return false;
+  if (isShardedLocation(crate.locationId) && viewer.instance !== crate.instance) return false;
+  if (!isPrivateCrateLocation(crate.locationId)) return true;
+
+  const viewerSegment = viewer.canyon && !viewer.canyon.inHub ? viewer.canyon.segment : null;
+  if (viewerSegment !== crate.segment) return false;
+  if (crate.segment === null) return true;
+  return crate.ownerId === viewer.id;
+}
+
+function serializeCrate(crate) {
+  return {
+    id: crate.id,
+    position: crate.position,
+    stacks: crate.entries.length,
+    ownerNickname: crate.ownerNickname,
+  };
+}
+
+function broadcastCrate(crate, message) {
+  players.forEach((viewer) => {
+    if (!viewer.authenticated || viewer.ws.readyState !== WebSocket.OPEN) return;
+    if (!crateVisibleTo(crate, viewer)) return;
+    safeSend(viewer.ws, message);
+  });
+}
+
+function sendCrateState(player) {
+  const crates = [];
+  for (const crate of deathCrates.values()) {
+    if (crateVisibleTo(crate, player)) crates.push(serializeCrate(crate));
+  }
+  safeSend(player.ws, { type: 'crateState', crates });
+}
+
+function spawnDeathCrate(player, position) {
+  if (CRATE_BLOCKED_LOCATIONS.has(player.locationId)) return null;
+  if (!Array.isArray(player.inventory) || player.inventory.length === 0) return null;
+
+  const segment = isPrivateCrateLocation(player.locationId) && player.canyon && !player.canyon.inHub
+    ? player.canyon.segment
+    : null;
+
+  const id = `crate-${nextCrateId++}`;
+  const crate = {
+    id,
+    locationId: player.locationId,
+    instance: player.instance,
+    segment,
+    ownerId: player.id,
+    ownerNickname: player.nickname,
+    position: [...position],
+    entries: player.inventory,
+    createdAt: Date.now(),
+  };
+
+  player.inventory = [];
+  deathCrates.set(id, crate);
+
+  broadcastCrate(crate, { type: 'crateSpawn', crate: serializeCrate(crate) });
+  return crate;
+}
+
+function despawnCrate(crate) {
+  deathCrates.delete(crate.id);
+  broadcastCrate(crate, { type: 'crateDespawn', id: crate.id });
+}
+
+function moveCrateEntriesToInventory(player, crate) {
+  let moved = 0;
+  const leftover = [];
+
+  for (const entry of crate.entries) {
+    const slot = player.inventory.find((e) => e.address === entry.address);
+    if (slot) {
+      slot.quantity += entry.quantity;
+      moved += 1;
+    } else if (player.inventory.length < LOOT_CONFIG.maxInventory) {
+      player.inventory.push({ ...entry });
+      moved += 1;
+    } else {
+      leftover.push(entry);
+    }
+  }
+
+  crate.entries = leftover;
+  return moved;
+}
+
+safeInterval(() => {
+  const now = Date.now();
+  for (const crate of Array.from(deathCrates.values())) {
+    if (now - crate.createdAt > CRATE_CONFIG.despawnMs) despawnCrate(crate);
+  }
+}, 15000);
+
+safeInterval(() => {
+  for (const record of party.pruneInvites()) {
+    const target = players.get(record.targetId);
+    if (target) safeSend(target.ws, { type: 'partyInviteExpired', fromId: record.fromId });
+  }
+}, 10000);
+
+safeInterval(() => {
+  for (const group of party.activeParties()) {
+    const vitals = {
+      type: 'partyVitals',
+      members: group.memberIds.map((id) => {
+        const member = players.get(id);
+        return {
+          id,
+          health: member?.health ?? 0,
+          maxHealth: member?.maxHealth ?? BASE_MAX_HEALTH,
+          alive: member?.alive !== false,
+          locationId: member?.locationId || null,
+        };
+      }),
+    };
+
+    for (const id of group.memberIds) {
+      const member = players.get(id);
+      if (member) safeSend(member.ws, vitals);
+    }
+  }
+}, 500);
 
 function cachedInternalCall(key, ttlMs, factory) {
   const now = Date.now();
@@ -3666,11 +4499,14 @@ function applyKillRewards(player) {
 function applyEnemyDamage(player, enemy, amount, options = {}) {
   if (!enemy.alive) return false;
 
+  markInCombat(player);
+
   const now = Date.now();
   const damage = Math.max(1, Math.round(amount * abilities.damageTakenMultFromEffects(enemy, now)));
   enemy.health = Math.max(0, enemy.health - damage);
 
   const shared = player.locationId === 'main-world';
+  const arenaRun = player.locationId === ARENA_LOCATION_ID ? arena.runForPlayer(player.id) : null;
   const damagedMessage = {
     type: 'enemyDamaged',
     id: enemy.id,
@@ -3680,7 +4516,8 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
     abilityId: options.abilityId || null,
   };
 
-  if (shared) broadcastToLocation('main-world', damagedMessage, null, player.instance);
+  if (arenaRun) broadcastArena(arenaRun, damagedMessage);
+  else if (shared) broadcastToLocation('main-world', damagedMessage, null, player.instance);
   else safeSend(player.ws, damagedMessage);
 
   if (enemy.health > 0) {
@@ -3693,15 +4530,20 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
   abilities.clearEffects(enemy);
 
   const deathMessage = { type: 'enemyDeath', id: enemy.id, killerId: player.id };
-  if (shared) broadcastToLocation('main-world', deathMessage, null, player.instance);
+  if (arenaRun) broadcastArena(arenaRun, deathMessage);
+  else if (shared) broadcastToLocation('main-world', deathMessage, null, player.instance);
   else safeSend(player.ws, deathMessage);
 
   incrementKillQuests(player);
-  grantEnemyKillXp(player, enemy.type);
   applyKillRewards(player);
 
+  if (arenaRun) return true;
+
+  grantEnemyKillXp(player, enemy.type);
+
+  const cfg = ENEMY_TYPES[enemy.type];
+
   if (shared) {
-    const cfg = ENEMY_TYPES[enemy.type];
     enemy.cast = null;
     enemy.pendingImpacts = [];
     enemy.pools = [];
@@ -3721,18 +4563,17 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
   }
 
   const alreadyCleared = player.canyon.clearedSegments.has(player.canyon.segment);
-  if (!alreadyCleared) {
-    const cfg = ENEMY_TYPES[enemy.type];
-    dropCanyonLoot(
-      player,
-      enemy.position,
-      cfg.lootMin,
-      Math.round(cfg.lootMax * player.combat.lootMult * memeLootMult(player, now))
-    );
-  }
+  dropCanyonLoot(
+    player,
+    enemy.position,
+    cfg.lootMin,
+    Math.round(cfg.lootMax * player.combat.lootMult * memeLootMult(player, now)),
+    alreadyCleared ? CANYON_REPEAT_LOOT_MULT : 1
+  );
 
-  if (enemy.type === 'slime_boss') {
+  if (enemy.id === player.canyon.bossId) {
     const clearedSegment = player.canyon.segment;
+    player.canyon.runCleared = true;
     if (!alreadyCleared) {
       player.canyon.clearedSegments.add(clearedSegment);
     }
@@ -3791,9 +4632,16 @@ function sendAbilityMeter(player) {
 function applyPlayerDamage(target, amount, options = {}) {
   if (!target.alive) return 0;
 
+  const attacker = options.attacker || null;
+  if (attacker && attacker !== target) markInCombat(attacker);
+
   const now = Date.now();
   if (isSpawnProtected(target)) return 0;
   if (abilities.isInvulnerable(target, target.ability, now)) return 0;
+
+  cancelHomeTeleport(target, 'damaged');
+  cancelArenaRevive(target, 'damaged');
+  markInCombat(target);
 
   const raw = Math.max(1, Math.round(amount * incomingDamageMultiplier(target, now)));
   const penetration = Math.min(0.9, Math.max(0, options.penetration || 0));
@@ -3829,7 +4677,6 @@ function applyPlayerDamage(target, amount, options = {}) {
   safeSend(target.ws, damageMessage);
   if (options.broadcast !== false) broadcast(damageMessage, target.id, true, target);
 
-  const attacker = options.attacker || null;
   if (attacker && applied > 0) reflectDamage(target, attacker, applied, now);
 
   if (target.health <= 0) {
@@ -3951,6 +4798,7 @@ function enemySpeedMult(enemy, now) {
 function canAbilityHitPlayer(caster, target) {
   if (!target.authenticated || !target.alive) return false;
   if (target.id === caster.id) return false;
+  if (party.areAllies(caster.id, target.id)) return false;
   if (!sameShard(caster, target)) return false;
   if (isInProtectedZone(caster) || isInProtectedZone(target)) return false;
   if (isSpawnProtected(target)) return false;
@@ -4543,6 +5391,14 @@ function abilityTick() {
     }
 
     syncShieldVisibility(player, now);
+
+    if (player.homeTeleportCastUntil > 0 && now >= player.homeTeleportCastUntil) {
+      completeHomeTeleport(player, now);
+    }
+
+    if (player.arenaReviveUntil > 0 && now >= player.arenaReviveUntil) {
+      completeArenaRevive(player, now);
+    }
 
     if (player.alive) tickPlayerEffects(player, now, deltaSeconds);
   });
@@ -5423,6 +6279,12 @@ function buildSavePayload(player) {
         },
         skinTextureUrl: player.skinTextureUrl || null,
         caveChests: player.caveChests || {},
+        stuckUsedAt: player.stuckUsedAt || 0,
+        arenaCooldownUntil: player.arenaCooldownUntil || 0,
+        arenaBestWave: player.arenaBestWave || 0,
+        homeTeleportUsedAt: player.homeTeleportUsedAt || 0,
+        storage: player.storage || {},
+        storageOrphan: player.storageOrphan || [],
       },
     },
     nickname: player.nickname,
@@ -5539,55 +6401,69 @@ safeInterval(() => {
   });
 }, 20000);
 
+function applyPlayerStatus(p, status, now) {
+  p.mutedUntil = status.mutedUntil || null;
+
+  if (status.isBanned) {
+    safeSend(p.ws, { type: 'auth_error', error: 'banned' });
+    try { p.ws.close(4008, 'banned'); } catch (e) { }
+    return;
+  }
+
+  if (now - (p.skinTextureUrlChangedAt || 0) >= 5000) {
+    const nextUrl = status.skinTextureUrl || null;
+    if (nextUrl !== p.skinTextureUrl) {
+      p.skinTextureUrl = nextUrl;
+      broadcast({ type: 'skinUpdate', playerId: p.id, url: p.skinTextureUrl }, null, true, p);
+      safeSend(p.ws, { type: 'skinUpdate', playerId: p.id, url: p.skinTextureUrl });
+    }
+  }
+
+  if (now - (p.economyChangedAt || 0) >= 5000) {
+    const sameAsh = status.ash === p.ash;
+    const samePlaceables = JSON.stringify(status.placeables) === JSON.stringify(p.placeables);
+    if (!sameAsh || !samePlaceables) {
+      p.ash = status.ash;
+      p.placeables = status.placeables;
+      safeSend(p.ws, { type: 'inventoryUpdate', inventory: p.inventory, ash: p.ash, placeables: p.placeables });
+    }
+  }
+
+  applyHomeFixtures(p, status);
+}
+
 safeInterval(async () => {
   if (!CONFIG.internalSecret) return;
 
   const authedPlayers = Array.from(players.values()).filter((p) => p.authenticated && p.userId);
   if (authedPlayers.length === 0) return;
 
-  const result = await callInternalApi('/api/internal/game/player-status', {
-    userIds: authedPlayers.map((p) => p.userId),
-  }).catch((err) => {
-    console.error('[PlayerStatus] refresh error:', err.message);
-    return null;
-  });
-
-  if (!result?.statuses) return;
-
-  const now = Date.now();
-  const statusByUserId = new Map(result.statuses.map((s) => [s.id, s]));
-
+  const byGameId = new Map();
   authedPlayers.forEach((p) => {
-    const status = statusByUserId.get(p.userId);
-    if (!status) return;
-
-    p.mutedUntil = status.mutedUntil || null;
-
-    if (status.isBanned) {
-      safeSend(p.ws, { type: 'auth_error', error: 'banned' });
-      try { p.ws.close(4008, 'banned'); } catch (e) { }
-      return;
-    }
-
-    if (now - (p.skinTextureUrlChangedAt || 0) >= 5000) {
-      const nextUrl = status.skinTextureUrl || null;
-      if (nextUrl !== p.skinTextureUrl) {
-        p.skinTextureUrl = nextUrl;
-        broadcast({ type: 'skinUpdate', playerId: p.id, url: p.skinTextureUrl }, null, true, p);
-        safeSend(p.ws, { type: 'skinUpdate', playerId: p.id, url: p.skinTextureUrl });
-      }
-    }
-
-    if (now - (p.economyChangedAt || 0) >= 5000) {
-      const sameAsh = status.ash === p.ash;
-      const samePlaceables = JSON.stringify(status.placeables) === JSON.stringify(p.placeables);
-      if (!sameAsh || !samePlaceables) {
-        p.ash = status.ash;
-        p.placeables = status.placeables;
-        safeSend(p.ws, { type: 'inventoryUpdate', inventory: p.inventory, ash: p.ash, placeables: p.placeables });
-      }
-    }
+    const key = p.gameId || null;
+    if (!byGameId.has(key)) byGameId.set(key, []);
+    byGameId.get(key).push(p);
   });
+
+  for (const [gameId, playersForGame] of byGameId) {
+    const result = await callInternalApi('/api/internal/game/player-status', {
+      userIds: playersForGame.map((p) => p.userId),
+      gameId,
+    }).catch((err) => {
+      console.error('[PlayerStatus] refresh error:', err.message);
+      return null;
+    });
+
+    if (!result?.statuses) continue;
+
+    const now = Date.now();
+    const statusByUserId = new Map(result.statuses.map((s) => [s.id, s]));
+
+    playersForGame.forEach((p) => {
+      const status = statusByUserId.get(p.userId);
+      if (status) applyPlayerStatus(p, status, now);
+    });
+  }
 }, 8000);
 
 safeInterval(async () => {
@@ -5682,6 +6558,9 @@ wss.on('connection', (ws) => {
     maxHealth: 100,
     alive: true,
     lastDamageTime: 0,
+    combatUntil: 0,
+    combatStateSentAt: 0,
+    stuckUsedAt: 0,
     positionHistory: [],
     recentShots: [],
     weaponEquipped: true,
@@ -5693,6 +6572,16 @@ wss.on('connection', (ws) => {
     skinTextureUrlChangedAt: 0,
     blockedUserIds: new Set(),
     inventory: [],
+    storage: {},
+    storageOrphan: [],
+    storages: new Map(),
+    homeSpawn: null,
+    homeTeleportUsedAt: 0,
+    homeTeleportCastUntil: 0,
+    arenaCooldownUntil: 0,
+    arenaBestWave: 0,
+    arenaReviveUntil: 0,
+    arenaReviveTargetId: null,
     ash: 0,
     progression: createProgressionState(),
     combat: null,
@@ -5720,6 +6609,8 @@ wss.on('connection', (ws) => {
       enemies: new Map(),
       nextEnemySeq: 0,
       pendingSegment: null,
+      runCleared: false,
+      bossId: null,
     },
     stats: {
       kills: 0,
@@ -5859,6 +6750,16 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'mailRead', CONFIG.network.mailReadRateLimit)) return;
       } else if (data.type === 'respawnRequest') {
         if (!checkRateLimit(playerId, 'respawn', CONFIG.network.respawnRateLimit)) return;
+      } else if (data.type === 'crateLoot') {
+        if (!checkRateLimit(playerId, 'crate', CONFIG.network.crateRateLimit)) return;
+      } else if (data.type === 'partyInvite' || data.type === 'partyAccept' || data.type === 'partyDecline' || data.type === 'partyLeave' || data.type === 'partyKick') {
+        if (!checkRateLimit(playerId, 'party', CONFIG.network.partyRateLimit)) return;
+      } else if (data.type === 'arenaStart' || data.type === 'arenaJoin' || data.type === 'arenaLeave' || data.type === 'arenaRevive') {
+        if (!checkRateLimit(playerId, 'arena', CONFIG.network.arenaRateLimit)) return;
+      } else if (data.type === 'stuckTeleport' || data.type === 'homeTeleport') {
+        if (!checkRateLimit(playerId, 'stuck', CONFIG.network.stuckRateLimit)) return;
+      } else if (data.type === 'storageOpen' || data.type === 'storageDeposit' || data.type === 'storageWithdraw') {
+        if (!checkRateLimit(playerId, 'storage', CONFIG.network.storageRateLimit)) return;
       } else if (data.type === 'tokenInfoRequest') {
         if (!checkRateLimit(playerId, 'tokenLookup', CONFIG.network.tokenLookupRateLimit)) {
           safeSend(ws, { type: 'error', message: 'Token lookup rate limit exceeded' });
@@ -5899,6 +6800,16 @@ wss.on('connection', (ws) => {
         case 'hit': handleHit(player, data); break;
         case 'enemyHit': handleEnemyHit(player, data); break;
         case 'lootPickup': handleLootPickup(player, data); break;
+        case 'crateLoot': handleCrateLoot(player, data); break;
+        case 'partyInvite': handlePartyInvite(player, data); break;
+        case 'partyAccept': handlePartyAccept(player, data); break;
+        case 'partyDecline': handlePartyDecline(player, data); break;
+        case 'partyLeave': handlePartyLeave(player); break;
+        case 'partyKick': handlePartyKick(player, data); break;
+        case 'arenaStart': handleArenaStart(player); break;
+        case 'arenaJoin': handleArenaJoin(player); break;
+        case 'arenaLeave': handleArenaLeave(player); break;
+        case 'arenaRevive': handleArenaRevive(player, data); break;
         case 'sellToken': handleSellToken(player, data); break;
         case 'shopBuyItem': handleShopBuyItem(player, data); break;
         case 'signPlace': handleSignPlace(player, data); break;
@@ -5964,7 +6875,12 @@ wss.on('connection', (ws) => {
         case 'mailSend': handleMailSend(player, data); break;
         case 'mailInboxRequest': handleMailInboxRequest(player); break;
         case 'mailMarkRead': handleMailMarkRead(player, data); break;
-        case 'respawnRequest': handleRespawnRequest(player); break;
+        case 'respawnRequest': handleRespawnRequest(player, data); break;
+        case 'stuckTeleport': handleStuckTeleport(player); break;
+        case 'homeTeleport': handleHomeTeleport(player); break;
+        case 'storageOpen': handleStorageOpen(player, data); break;
+        case 'storageDeposit': handleStorageDeposit(player, data); break;
+        case 'storageWithdraw': handleStorageWithdraw(player, data); break;
         case 'tokenInfoRequest': handleTokenInfoRequest(player, data); break;
         case 'supportTicketSend': handleSupportTicketSend(player, data); break;
         case 'blockUser': handleBlockUser(player, data); break;
@@ -5999,6 +6915,14 @@ wss.on('connection', (ws) => {
 
     removePlayerZone(player);
     clearPlayerAbilityWorld(player.id);
+    applyPartyDeparture(party.forgetPlayer(player.id), 'disbanded');
+
+    const leavingRun = arena.runForPlayer(player.id);
+    if (leavingRun) {
+      arena.dropMember(leavingRun, player.id);
+      player.arenaCooldownUntil = Date.now() + arena.ARENA_CONFIG.cooldownMs;
+      broadcastArenaState(leavingRun);
+    }
 
     if (player.cave?.portalDoomed) {
       player.cave = null;
@@ -6006,6 +6930,7 @@ wss.on('connection', (ws) => {
     }
 
     if (player.authenticated) {
+      if (isCombatLogout(player)) dropRunLoot(player);
       persistPlayer(player);
       callInternalApi('/api/internal/game/presence', { userId: player.userId, online: false }).catch((err) => {
         console.error('[Presence] offline update error:', err.message);
@@ -6212,6 +7137,40 @@ wss.on('connection', (ws) => {
         }
       }
 
+      const savedStuckUsedAt = Math.floor(Number(savedProgress.progress?.data?.stuckUsedAt));
+      if (Number.isFinite(savedStuckUsedAt) && savedStuckUsedAt > 0) {
+        player.stuckUsedAt = savedStuckUsedAt;
+      }
+
+      const savedHomeUsedAt = Math.floor(Number(savedProgress.progress?.data?.homeTeleportUsedAt));
+      if (Number.isFinite(savedHomeUsedAt) && savedHomeUsedAt > 0) {
+        player.homeTeleportUsedAt = savedHomeUsedAt;
+      }
+
+      const savedStorage = savedProgress.progress?.data?.storage;
+      if (savedStorage && typeof savedStorage === 'object') {
+        for (const [key, entries] of Object.entries(savedStorage)) {
+          if (typeof key !== 'string' || !Array.isArray(entries)) continue;
+          const bucket = entries.map(sanitizeStorageEntry).filter(Boolean).slice(0, STORAGE_SLOTS);
+          if (bucket.length > 0) player.storage[key] = bucket;
+        }
+      }
+
+      const savedOrphan = savedProgress.progress?.data?.storageOrphan;
+      if (Array.isArray(savedOrphan)) {
+        player.storageOrphan = savedOrphan.map(sanitizeStorageEntry).filter(Boolean);
+      }
+
+      const savedArenaCooldown = Math.floor(Number(savedProgress.progress?.data?.arenaCooldownUntil));
+      if (Number.isFinite(savedArenaCooldown) && savedArenaCooldown > 0) {
+        player.arenaCooldownUntil = savedArenaCooldown;
+      }
+
+      const savedArenaBest = Math.floor(Number(savedProgress.progress?.data?.arenaBestWave));
+      if (Number.isFinite(savedArenaBest) && savedArenaBest > 0) {
+        player.arenaBestWave = savedArenaBest;
+      }
+
       const savedCanyon = savedProgress.progress?.data?.canyonProgress;
       if (savedCanyon && typeof savedCanyon === 'object') {
         const maxReached = Math.floor(Number(savedCanyon.maxSegmentReached));
@@ -6302,6 +7261,7 @@ wss.on('connection', (ws) => {
       dayDurationMs: DAY_NIGHT_CONFIG.dayDurationMs,
       nightDurationMs: DAY_NIGHT_CONFIG.nightDurationMs,
       skinTextureUrl: player.skinTextureUrl || null,
+      stuckCooldownUntil: (player.stuckUsedAt || 0) + STUCK_COOLDOWN_MS,
     });
 
     safeSend(ws, {
@@ -6317,6 +7277,8 @@ wss.on('connection', (ws) => {
     sendCosmeticState(player);
     sendMetNpcs(player);
     sendActiveZones(player);
+    sendStorageState(player);
+    sendCrateState(player);
 
     if (player.locationId === 'main-world') {
       safeSend(ws, { type: 'lootState', loot: serializeLoot(player.instance) });
@@ -6736,6 +7698,7 @@ wss.on('connection', (ws) => {
     const target = players.get(data.target);
     if (!target || !target.authenticated || !target.alive) return;
     if (data.target === playerId) return;
+    if (party.areAllies(playerId, data.target)) return;
 
     if (player.locationId !== target.locationId) {
       console.log(`[!] Hit hack: different locations ${player.locationId} vs ${target.locationId}`);
@@ -6884,7 +7847,205 @@ wss.on('connection', (ws) => {
     if (player.locationId !== 'tower-first-floor' || !player.canyon) return;
     if (player.canyon.inHub) return;
 
+    if (!player.canyon.runCleared) {
+      safeSend(player.ws, { type: 'error', message: 'The evacuation pad stays dark until the segment boss is down.' });
+      return;
+    }
+
+    const pad = canyonReturnPadPosition(player.canyon.segment);
+    const [px, , pz] = player.position;
+    const distance = Math.sqrt((pad[0] - px) ** 2 + (pad[2] - pz) ** 2);
+    if (distance > CANYON_RETURN_PAD_REACH) {
+      safeSend(player.ws, { type: 'error', message: 'Stand on the evacuation pad to leave.' });
+      return;
+    }
+
     enterCanyonHub(player);
+  }
+
+  function handleStuckTeleport(player) {
+    const now = Date.now();
+    const cooldownUntil = (player.stuckUsedAt || 0) + STUCK_COOLDOWN_MS;
+
+    if (!player.alive) {
+      safeSend(player.ws, { type: 'stuckResult', ok: false, reason: 'dead', cooldownUntil });
+      return;
+    }
+
+    if (now < cooldownUntil) {
+      safeSend(player.ws, { type: 'stuckResult', ok: false, reason: 'cooldown', cooldownUntil });
+      return;
+    }
+
+    if (isInCombat(player)) {
+      safeSend(player.ws, { type: 'stuckResult', ok: false, reason: 'in_combat', cooldownUntil });
+      return;
+    }
+
+    player.stuckUsedAt = now;
+    const nextCooldownUntil = now + STUCK_COOLDOWN_MS;
+
+    if (isInCanyonSegment(player)) {
+      safeSend(player.ws, {
+        type: 'stuckResult',
+        ok: true,
+        reason: 'canyon_death',
+        cooldownUntil: nextCooldownUntil,
+        locationId: player.locationId,
+      });
+      markPlayerDead(player, 'bail-out', player.position);
+      persistPlayer(player);
+      return;
+    }
+
+    if (player.locationId === STUCK_DESTINATION_ID) {
+      spawnInSafeZone(player, STUCK_DESTINATION_ID);
+      player.justTeleported = true;
+      player.teleportSettleUntil = now + TELEPORT_SETTLE_MS;
+      player.positionHistory = [];
+      player.recentShots = [];
+      grantSpawnProtection(player);
+    }
+
+    persistPlayer(player);
+
+    safeSend(player.ws, {
+      type: 'stuckResult',
+      ok: true,
+      reason: null,
+      cooldownUntil: nextCooldownUntil,
+      locationId: STUCK_DESTINATION_ID,
+    });
+  }
+
+  function handleHomeTeleport(player) {
+    const now = Date.now();
+    const cooldownUntil = (player.homeTeleportUsedAt || 0) + HOME_TELEPORT_COOLDOWN_MS;
+
+    const refuse = (reason) => safeSend(player.ws, {
+      type: 'homeTeleportResult',
+      casting: false,
+      cancelled: true,
+      reason,
+      cooldownUntil,
+      charges: player.placeables['home-teleport'] || 0,
+    });
+
+    if (!player.alive) return refuse('dead');
+    if (player.homeTeleportCastUntil > now) return refuse('casting');
+    if (!player.homeSpawn) return refuse('no_beacon');
+    if (isInCombat(player)) return refuse('in_combat');
+    if (isInCanyonSegment(player)) return refuse('canyon');
+    if (now < cooldownUntil) return refuse('cooldown');
+    if (!(player.placeables['home-teleport'] > 0)) return refuse('no_charge');
+
+    player.homeTeleportCastUntil = now + HOME_TELEPORT_CAST_MS;
+    safeSend(player.ws, {
+      type: 'homeTeleportResult',
+      casting: true,
+      castMs: HOME_TELEPORT_CAST_MS,
+      cooldownUntil,
+      charges: player.placeables['home-teleport'] || 0,
+    });
+  }
+
+  function storageTargetKey(player, data) {
+    if (typeof data.key !== 'string' || data.key.length === 0) return null;
+
+    if (!isOwnRoom(player)) {
+      safeSend(player.ws, { type: 'error', message: 'Storage crates only open in your own room' });
+      return null;
+    }
+    if (!player.storages.has(data.key)) {
+      safeSend(player.ws, { type: 'error', message: 'That crate is no longer there' });
+      return null;
+    }
+    if (!storageInReach(player, data.key)) {
+      safeSend(player.ws, { type: 'error', message: 'Step closer to the crate' });
+      return null;
+    }
+
+    return data.key;
+  }
+
+  function handleStorageOpen(player, data) {
+    const key = storageTargetKey(player, data);
+    if (!key) return;
+    sendStorageState(player, key);
+  }
+
+  function handleStorageDeposit(player, data) {
+    const key = storageTargetKey(player, data);
+    if (!key) return;
+
+    const address = typeof data.address === 'string' ? data.address : null;
+    if (!address) return;
+
+    const slot = player.inventory.find((entry) => entry.address === address);
+    if (!slot) return;
+
+    const requested = Math.floor(Number(data.quantity));
+    const amount = Math.max(1, Math.min(Number.isFinite(requested) ? requested : slot.quantity, slot.quantity));
+
+    const moved = stackIntoStorage(storageBucket(player, key), {
+      address,
+      name: slot.name,
+      symbol: slot.symbol,
+      image: slot.image,
+      quantity: amount,
+    });
+
+    if (moved <= 0) {
+      safeSend(player.ws, { type: 'error', message: `This crate is full — ${STORAGE_SLOTS} stacks is the limit` });
+      return;
+    }
+
+    slot.quantity -= moved;
+    if (slot.quantity <= 0) player.inventory = player.inventory.filter((entry) => entry !== slot);
+
+    persistPlayer(player);
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+    sendStorageState(player, key);
+  }
+
+  function handleStorageWithdraw(player, data) {
+    const key = storageTargetKey(player, data);
+    if (!key) return;
+
+    const address = typeof data.address === 'string' ? data.address : null;
+    if (!address) return;
+
+    const bucket = storageBucket(player, key);
+    const stored = bucket.find((entry) => entry.address === address);
+    if (!stored) return;
+
+    const requested = Math.floor(Number(data.quantity));
+    const amount = Math.max(1, Math.min(Number.isFinite(requested) ? requested : stored.quantity, stored.quantity));
+
+    const slot = player.inventory.find((entry) => entry.address === address);
+    if (!slot && player.inventory.length >= LOOT_CONFIG.maxInventory) {
+      safeSend(player.ws, { type: 'error', message: 'Your inventory is full' });
+      return;
+    }
+
+    if (slot) {
+      slot.quantity += amount;
+    } else {
+      player.inventory.push({
+        address: stored.address,
+        name: stored.name,
+        symbol: stored.symbol,
+        image: stored.image,
+        quantity: amount,
+      });
+    }
+
+    stored.quantity -= amount;
+    if (stored.quantity <= 0) player.storage[key] = bucket.filter((entry) => entry !== stored);
+
+    persistPlayer(player);
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+    sendStorageState(player, key);
   }
 
   function handleCanyonMapRequest(player) {
@@ -8333,6 +9494,214 @@ wss.on('connection', (ws) => {
     }
   }
 
+  function arenaRefusal(player, reason) {
+    safeSend(player.ws, { type: 'arenaStartResult', ok: false, reason, cooldownUntil: player.arenaCooldownUntil || 0 });
+  }
+
+  function handleArenaStart(player) {
+    const now = Date.now();
+
+    if (!player.alive) return arenaRefusal(player, 'dead');
+    if (player.locationId !== ARENA_LOCATION_ID) return arenaRefusal(player, 'wrong_place');
+    if (arena.runForPlayer(player.id)) return arenaRefusal(player, 'already_running');
+    if (arena.runForInstance(player.instance)) return arenaRefusal(player, 'instance_busy');
+    if (now < (player.arenaCooldownUntil || 0)) return arenaRefusal(player, 'cooldown');
+
+    const group = party.partyOf(player.id);
+    const memberIds = [player.id];
+
+    if (group) {
+      for (const id of group.memberIds) {
+        if (id === player.id) continue;
+        const member = players.get(id);
+        if (!member || !member.alive) continue;
+        if (member.locationId !== ARENA_LOCATION_ID || member.instance !== player.instance) continue;
+        if (now < (member.arenaCooldownUntil || 0)) continue;
+        memberIds.push(id);
+      }
+    }
+
+    const created = arena.createRun(player.instance, memberIds, now);
+    if (!created.ok) return arenaRefusal(player, created.error);
+
+    safeSend(player.ws, { type: 'arenaStartResult', ok: true, reason: null, cooldownUntil: player.arenaCooldownUntil || 0 });
+    broadcastArenaState(created.run);
+  }
+
+  function handleArenaJoin(player) {
+    const run = arena.runForInstance(player.instance);
+    if (!run || run.phase !== 'prep') return arenaRefusal(player, 'no_run');
+    if (player.locationId !== ARENA_LOCATION_ID) return arenaRefusal(player, 'wrong_place');
+    if (arena.runForPlayer(player.id)) return arenaRefusal(player, 'already_running');
+    if (Date.now() < (player.arenaCooldownUntil || 0)) return arenaRefusal(player, 'cooldown');
+    if (arena.activeMembers(run).length >= party.MAX_PARTY_SIZE) return arenaRefusal(player, 'full');
+    if (!run.memberIds.some((id) => party.areAllies(player.id, id))) return arenaRefusal(player, 'not_invited');
+
+    run.memberIds.push(player.id);
+    arena.bindMember(run, player.id);
+
+    safeSend(player.ws, { type: 'arenaStartResult', ok: true, reason: null, cooldownUntil: player.arenaCooldownUntil || 0 });
+    broadcastArenaState(run);
+  }
+
+  function handleArenaLeave(player) {
+    const run = arena.runForPlayer(player.id);
+    if (!run) return;
+
+    arena.dropMember(run, player.id);
+    player.arenaCooldownUntil = Date.now() + arena.ARENA_CONFIG.cooldownMs;
+    persistPlayer(player);
+
+    safeSend(player.ws, {
+      type: 'arenaEnded',
+      reason: 'left',
+      wavesCleared: 0,
+      ash: 0,
+      xp: 0,
+      bestWave: player.arenaBestWave || 0,
+      cooldownUntil: player.arenaCooldownUntil,
+    });
+    safeSend(player.ws, { type: 'enemyState', enemies: [] });
+    broadcastArenaState(run);
+  }
+
+  function handleArenaRevive(player, data) {
+    if (typeof data.targetId !== 'string') return;
+    if (!player.alive) return;
+
+    const run = arena.runForPlayer(player.id);
+    const refuse = (reason) => safeSend(player.ws, { type: 'arenaReviveResult', channelling: false, cancelled: true, reason });
+
+    if (!run) return refuse('no_run');
+    if (run.phase !== 'pause') return refuse('not_paused');
+    if (player.arenaReviveUntil > 0) return refuse('busy');
+    if (!run.downIds.has(data.targetId)) return refuse('not_down');
+
+    const target = players.get(data.targetId);
+    if (!target) return refuse('gone');
+
+    const [px, , pz] = player.position;
+    const [tx, , tz] = target.position;
+    if (Math.sqrt((tx - px) ** 2 + (tz - pz) ** 2) > arena.ARENA_CONFIG.reviveReach) return refuse('too_far');
+
+    player.arenaReviveUntil = Date.now() + arena.ARENA_CONFIG.reviveMs;
+    player.arenaReviveTargetId = data.targetId;
+
+    safeSend(player.ws, {
+      type: 'arenaReviveResult',
+      channelling: true,
+      targetId: data.targetId,
+      channelMs: arena.ARENA_CONFIG.reviveMs,
+    });
+  }
+
+  function handlePartyInvite(player, data) {
+    const toWallet = typeof data.toWallet === 'string' && data.toWallet.trim() ? data.toWallet.trim() : null;
+    if (!toWallet) return;
+
+    const target = walletToPlayer.get(toWallet);
+    if (!target || !target.authenticated) {
+      safeSend(player.ws, { type: 'error', message: 'That player is not online' });
+      return;
+    }
+
+    if (target.blockedUserIds?.has(player.userId) || player.blockedUserIds?.has(target.userId)) {
+      safeSend(player.ws, { type: 'error', message: 'That player is not online' });
+      return;
+    }
+
+    const result = party.invite(player.id, target.id);
+    if (!result.ok) {
+      safeSend(player.ws, { type: 'error', message: partyErrorMessage(result.error) });
+      return;
+    }
+
+    safeSend(target.ws, {
+      type: 'partyInviteReceived',
+      fromId: player.id,
+      fromNickname: player.nickname,
+      expiresAt: result.invite.expiresAt,
+    });
+    safeSend(player.ws, { type: 'error', message: `Party invite sent to ${target.nickname}` });
+  }
+
+  function handlePartyAccept(player, data) {
+    if (typeof data.fromId !== 'string') return;
+
+    const result = party.accept(player.id, data.fromId);
+    if (!result.ok) {
+      safeSend(player.ws, { type: 'error', message: partyErrorMessage(result.error) });
+      return;
+    }
+
+    broadcastPartyState(result.party);
+  }
+
+  function handlePartyDecline(player, data) {
+    if (typeof data.fromId !== 'string') return;
+
+    const result = party.decline(player.id, data.fromId);
+    if (!result.ok) return;
+
+    const inviter = players.get(result.invite.fromId);
+    if (inviter) safeSend(inviter.ws, { type: 'error', message: `${player.nickname} declined your party invite` });
+  }
+
+  function handlePartyLeave(player) {
+    const result = party.leave(player.id);
+    if (!result.removed) return;
+
+    safeSend(player.ws, EMPTY_PARTY_PAYLOAD);
+    applyPartyDeparture(result, 'disbanded');
+  }
+
+  function handlePartyKick(player, data) {
+    if (typeof data.targetId !== 'string') return;
+
+    const result = party.kick(player.id, data.targetId);
+    if (!result.ok) {
+      safeSend(player.ws, { type: 'error', message: partyErrorMessage(result.error) });
+      return;
+    }
+
+    const kicked = players.get(data.targetId);
+    if (kicked) {
+      safeSend(kicked.ws, EMPTY_PARTY_PAYLOAD);
+      safeSend(kicked.ws, { type: 'partyDisbanded', reason: 'kicked' });
+    }
+
+    applyPartyDeparture(result, 'disbanded');
+  }
+
+  function handleCrateLoot(player, data) {
+    if (!player.alive) return;
+    if (typeof data.id !== 'string') return;
+
+    const crate = deathCrates.get(data.id);
+    if (!crate) return;
+    if (!crateVisibleTo(crate, player)) return;
+
+    const [px, , pz] = player.position;
+    const dist = Math.sqrt((crate.position[0] - px) ** 2 + (crate.position[2] - pz) ** 2);
+    if (dist > CRATE_CONFIG.pickupRadius) return;
+
+    const moved = moveCrateEntriesToInventory(player, crate);
+    const remaining = crate.entries.length;
+
+    if (remaining === 0) despawnCrate(crate);
+    else broadcastCrate(crate, { type: 'crateSpawn', crate: serializeCrate(crate) });
+
+    safeSend(ws, { type: 'crateLootResult', id: crate.id, moved, remaining });
+
+    if (moved === 0) {
+      safeSend(ws, { type: 'error', message: 'Your inventory is full' });
+      return;
+    }
+
+    persistPlayer(player);
+    safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+  }
+
   function handleSellToken(player, data) {
     if (!player.alive) return;
     if (typeof data.address !== 'string') return;
@@ -8425,8 +9794,13 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (item.blockedInCombat && isInCombat(player)) {
+      safeSend(player.ws, { type: 'error', message: 'Not while you are in combat' });
+      return;
+    }
+
     const owned = player.placeables[item.id] || 0;
-    const capRemaining = item.maxOwned - owned;
+    const capRemaining = item.maxOwned === null ? Number.MAX_SAFE_INTEGER : item.maxOwned - owned;
     if (capRemaining <= 0) {
       safeSend(player.ws, { type: 'error', message: `You already own the maximum of ${item.maxOwned}` });
       return;
@@ -8749,6 +10123,14 @@ wss.on('connection', (ws) => {
 
     if (data.locationId === GALAXY_LOCATION_ID) {
       safeSend(ws, { type: 'factionGatesState', gates: displayedFactionGatesList, accountCount });
+    }
+
+    if (isOwnRoom(player)) sendStorageState(player);
+    sendCrateState(player);
+
+    if (data.locationId === ARENA_LOCATION_ID) {
+      const activeRun = arena.runForInstance(player.instance);
+      if (activeRun) safeSend(ws, arenaStatePayload(activeRun));
     }
 
     await refreshRoomEditRights(player);
