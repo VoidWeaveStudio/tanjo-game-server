@@ -137,12 +137,12 @@
       "id": "gun_full_auto",
       "column": "ordnance",
       "row": 6,
-      "name": "Full Auto",
-      "description": "Trades damage for a much faster cadence.",
+      "name": "Suppressing Fire",
+      "description": "Dumps the magazine far faster for less damage a shot — burst it down or run dry.",
       "kind": "mode",
       "maxRank": 1,
       "requires": { "level": 24, "columnPoints": 11 },
-      "mode": { "id": "auto", "name": "Full Auto", "fireRateMs": 100, "damageMult": 0.92, "spreadMult": 1.35 }
+      "mode": { "id": "auto", "name": "Suppressing Fire", "fireRateMs": 75, "damageMult": 0.78 }
     },
     {
       "id": "gun_overpressure",

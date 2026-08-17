@@ -3,7 +3,7 @@ const ARENA_CONFIG = {
   locationId: 'tower-events',
   candleHealth: 3000,
   candlePosition: [0, 0, 0],
-  arenaRadius: 30,
+  arenaRadius: 52,
   prepMs: 5000,
   pauseMs: 15000,
   reviveMs: 3000,
@@ -18,10 +18,10 @@ const ARENA_CONFIG = {
   xpCap: 3000,
   cooldownMs: 60 * 60 * 1000,
   spawnGates: [
-    [0, 0, -26],
-    [26, 0, 0],
-    [0, 0, 26],
-    [-26, 0, 0],
+    [0, 0, -46],
+    [46, 0, 0],
+    [0, 0, 46],
+    [-46, 0, 0],
   ],
 };
 

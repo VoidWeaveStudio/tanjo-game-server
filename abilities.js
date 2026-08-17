@@ -27,9 +27,9 @@ const ABILITY_META = {
   cataclysm: { school: 'spell', offensive: true, zone: true, cooldownStat: 'controlCooldown' },
 };
 
-const MAX_CAST_RANGE = 60;
-const MAX_GROUND_RANGE = 40;
-const MAX_TARGET_RANGE = 45;
+const MAX_CAST_RANGE = 85;
+const MAX_GROUND_RANGE = 60;
+const MAX_TARGET_RANGE = 68;
 
 for (const node of skills.SKILL_NODES) {
   if (node.ability && !ABILITY_META[node.ability.id]) {

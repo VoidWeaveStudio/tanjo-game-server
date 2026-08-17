@@ -378,13 +378,16 @@ const GALAXY_MIN_Y = -1400;
 const GALAXY_MAX_Y = 500;
 const GALAXY_MAX_SPEED = 110;
 const GALAXY_SPAWN = [0, 0, 14];
+const TOKEN_GATES_LOCATION_ID = 'tower-token-gates';
+const FLIGHT_LOCATION_IDS = new Set([GALAXY_LOCATION_ID, TOKEN_GATES_LOCATION_ID]);
+const MOVE_VIOLATION_TOLERANCE = 2;
 const PLAYER_ROOM_PREFIX = 'player-room-';
 
 const LOCATION_MAX_RADIUS = {
   'tower-main-hall': 140,
   'tower-token-gates': 80,
   'tower-basement': GALAXY_MAX_RADIUS,
-  'tower-events': 40,
+  'tower-events': 62,
   cave: 360,
   'open-world-canyon': 150,
 };
@@ -743,7 +746,7 @@ function isValidPosition(pos, locationId) {
     return false;
   }
 
-  if (locationId === GALAXY_LOCATION_ID) {
+  if (FLIGHT_LOCATION_IDS.has(locationId)) {
     return y >= GALAXY_MIN_Y && y <= GALAXY_MAX_Y &&
       Math.abs(x) <= GALAXY_MAX_RADIUS && Math.abs(z) <= GALAXY_MAX_RADIUS;
   }
@@ -763,7 +766,7 @@ function isValidPosition(pos, locationId) {
   return Math.abs(x) <= halfSize && Math.abs(z) <= halfSize;
 }
 
-function isValidMovement(player, newPosition, deltaTimeMs) {
+function checkMovement(player, newPosition, deltaTimeMs) {
   const [ox, , oz] = player.position;
   const [nx, , nz] = newPosition;
   const dx = nx - ox;
@@ -775,16 +778,17 @@ function isValidMovement(player, newPosition, deltaTimeMs) {
   if (player.justSpawned || player.justTeleported || now < (player.teleportSettleUntil || 0)) {
     player.justSpawned = false;
     player.justTeleported = false;
-    return true;
+    return { ok: true };
   }
 
-  if (now < (player.abilityMoveGraceUntil || 0)) return true;
+  if (now < (player.abilityMoveGraceUntil || 0)) return { ok: true };
 
   const seconds = deltaTimeMs / 1000;
   const speed = distance / seconds;
-  const base = player.locationId === GALAXY_LOCATION_ID ? GALAXY_MAX_SPEED : CONFIG.world.maxSpeed;
-  const limit = base * (player.combat ? player.combat.moveSpeedMult : 1) * abilityMoveSpeedMult(player, now);
-  return speed <= limit * 1.5;
+  const base = FLIGHT_LOCATION_IDS.has(player.locationId) ? GALAXY_MAX_SPEED : CONFIG.world.maxSpeed;
+  const limit = base * (player.combat ? player.combat.moveSpeedMult : 1) * abilityMoveSpeedMult(player, now) * 1.5;
+
+  return { ok: speed <= limit, speed, limit };
 }
 
 function getHistoricalPosition(player, targetTime) {
@@ -1538,11 +1542,29 @@ async function fetchTokenMarketCap(address) {
   return Number(json?.mc) || 0;
 }
 
+let marketCapWarned = false;
+
 async function pollMarketCap() {
-  if (!TNJ_MINT) return;
+  if (!TNJ_MINT) {
+    if (!marketCapWarned) {
+      marketCapWarned = true;
+      console.error('[World] TNJ_MINT is not configured — market cap stays at its last saved value');
+    }
+    return;
+  }
 
   try {
-    applyMarketCap(await fetchTokenMarketCap(TNJ_MINT));
+    const mc = await fetchTokenMarketCap(TNJ_MINT);
+    if (!Number.isFinite(mc) || mc <= 0) {
+      if (!marketCapWarned) {
+        marketCapWarned = true;
+        console.error(`[World] token-by-ca returned no usable market cap for ${TNJ_MINT} — keeping ${Math.round(worldState.mc)}`);
+      }
+      return;
+    }
+
+    marketCapWarned = false;
+    applyMarketCap(mc);
   } catch (err) {
     console.error('[World] Market cap poll failed:', err.message);
   }
@@ -6535,6 +6557,8 @@ wss.on('connection', (ws) => {
     rtt: 50,
     rttSamples: [],
     lastUpdate: 0,
+    moveViolations: 0,
+    moveViolationLoggedAt: 0,
     justSpawned: false,
     justTeleported: false,
     teleportSettleUntil: 0,
@@ -7331,10 +7355,20 @@ wss.on('connection', (ws) => {
     const delta = now - player.lastUpdate;
     if (delta < CONFIG.world.maxPositionUpdateRate) return;
 
-    if (!isValidMovement(player, data.position, delta)) {
+    const movement = checkMovement(player, data.position, delta);
+    if (!movement.ok) {
+      player.moveViolations = (player.moveViolations || 0) + 1;
+      if (player.moveViolations <= MOVE_VIOLATION_TOLERANCE) return;
+
+      if (now - (player.moveViolationLoggedAt || 0) > 1000) {
+        player.moveViolationLoggedAt = now;
+        console.log(`[!] Move hack: ${player.nickname || player.id} at ${movement.speed.toFixed(1)} m/s, limit ${movement.limit.toFixed(1)} in ${player.locationId}`);
+      }
+
       safeSend(ws, { type: 'positionCorrection', position: player.position });
       return;
     }
+    player.moveViolations = 0;
 
     if (data.jumping && !player.jumping) {
       if (now - player.lastJump < 400) {
@@ -10101,6 +10135,7 @@ wss.on('connection', (ws) => {
     }
 
     sendActiveZones(player);
+    safeSend(ws, { type: 'enemyState', enemies: [] });
 
     if (data.locationId === 'main-world') {
       safeSend(ws, { type: 'lootState', loot: serializeLoot(player.instance) });
