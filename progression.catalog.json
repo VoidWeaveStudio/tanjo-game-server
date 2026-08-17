@@ -13,6 +13,30 @@
     "base": 100,
     "regenPerSecond": 8
   },
+  "weapons": {
+    "rifle": {
+      "fireRateMs": 120,
+      "fireRateToleranceMs": 20,
+      "maxRange": 200
+    },
+    "staff": {
+      "fireRateMs": 300,
+      "fireRateToleranceMs": 60,
+      "boltEnergyCost": 3,
+      "projectileSpeed": 55,
+      "maxRange": 120,
+      "boltDamageMult": 2.4
+    },
+    "singleMode": {
+      "id": "single",
+      "name": "Single",
+      "damageMult": 1,
+      "spreadMult": 1,
+      "projectiles": 1,
+      "pierceCount": 0,
+      "manaCostMult": 1
+    }
+  },
   "respec": {
     "freeBelowLevel": 10,
     "baseCostAsh": 250,

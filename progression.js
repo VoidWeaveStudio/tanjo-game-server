@@ -20,6 +20,8 @@ const BRANCHES = catalog.branches;
 const TIERS = catalog.tiers;
 const MEME_ABILITIES = catalog.memeAbilities;
 const WEAPON_TIERS = catalog.weaponTiers;
+const WEAPONS = catalog.weapons;
+const SINGLE_FIRE_MODE = catalog.weapons.singleMode;
 
 const MEME_ABILITIES_BY_ID = new Map(MEME_ABILITIES.map((m) => [m.id, m]));
 const BRANCH_IDS = new Set(BRANCHES.map((b) => b.id));
@@ -140,6 +142,8 @@ module.exports = {
   TIERS,
   MEME_ABILITIES,
   WEAPON_TIERS,
+  WEAPONS,
+  SINGLE_FIRE_MODE,
   xpToNext,
   totalXpForLevel,
   levelFromTotalXp,

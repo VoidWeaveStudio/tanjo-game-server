@@ -18,6 +18,7 @@ const {
 } = require('./factionQuests');
 const progression = require('./progression');
 const skills = require('./skills');
+const abilities = require('./abilities');
 
 const PORT = process.env.PORT || 3001;
 const MAX_CONNECTIONS = 2000;
@@ -57,6 +58,7 @@ const CONFIG = {
     hitRateLimit: 15,
     sellRateLimit: 20,
     buildRateLimit: 10,
+    roomBuildRateLimit: 30,
     voiceRateLimit: 40,
     locationChangeRateLimit: 10,
     nicknameChangeRateLimit: 3,
@@ -64,6 +66,8 @@ const CONFIG = {
     saveProgressRateLimit: 5,
     questRateLimit: 10,
     progressionRateLimit: 10,
+    abilityRateLimit: 8,
+    memeRateLimit: 3,
     canyonRateLimit: 10,
     factionRateLimit: 10,
     factionSearchRateLimit: 15,
@@ -108,7 +112,11 @@ const BASE_PVP_DAMAGE = 5;
 const BASE_MAX_HEALTH = 100;
 
 const BRANCH_UNLOCK_LEVEL = 2;
-const ABILITY_SLOTS = ['q', 'f', 'c', 'v', 'x'];
+const ABILITY_SLOTS = ['s1', 's2', 's3', 's4', 's5', 's6'];
+const LEGACY_ABILITY_SLOTS = { q: 's1', f: 's2', c: 's3', v: 's4', x: 's5' };
+const ABILITY_TICK_MS = 200;
+const ABILITY_ORIGIN_TOLERANCE = 3;
+const SHOT_SPREAD_TOLERANCE_DEG = 6;
 const CANYON_LEVELS_PER_SEGMENT = 5;
 const CAVE_CONTENT_LEVEL = 15;
 const MAIN_WORLD_CONTENT_LEVEL = 10;
@@ -255,7 +263,6 @@ const QUESTS = {
     targets: ORIENTATION_TARGETS,
     targetCount: ORIENTATION_TARGETS.length,
     rewardAsh: 25,
-    autoStart: true,
   },
   sola_kill_10: {
     id: 'sola_kill_10',
@@ -744,16 +751,20 @@ function isValidMovement(player, newPosition, deltaTimeMs) {
   const dz = nz - oz;
   const distance = Math.sqrt(dx * dx + dz * dz);
 
-  if (player.justSpawned || player.justTeleported || Date.now() < (player.teleportSettleUntil || 0)) {
+  const now = Date.now();
+
+  if (player.justSpawned || player.justTeleported || now < (player.teleportSettleUntil || 0)) {
     player.justSpawned = false;
     player.justTeleported = false;
     return true;
   }
 
+  if (now < (player.abilityMoveGraceUntil || 0)) return true;
+
   const seconds = deltaTimeMs / 1000;
   const speed = distance / seconds;
   const base = player.locationId === GALAXY_LOCATION_ID ? GALAXY_MAX_SPEED : CONFIG.world.maxSpeed;
-  const limit = base * (player.combat ? player.combat.moveSpeedMult : 1);
+  const limit = base * (player.combat ? player.combat.moveSpeedMult : 1) * abilityMoveSpeedMult(player, now);
   return speed <= limit * 1.5;
 }
 
@@ -840,13 +851,18 @@ function findMatchingShot(player, targetHistoricalPos, now, tolerance = CONFIG.c
   const shots = player.recentShots || [];
   for (let i = shots.length - 1; i >= 0; i--) {
     const shot = shots[i];
-    if (now - shot.time > CONFIG.combat.shotMatchWindowMs) continue;
+    const age = now - shot.time;
+    if (age > shotLifetimeMs(shot)) continue;
 
-    const dist = distanceFromRay(shot.origin, shot.direction, targetHistoricalPos, CONFIG.combat.maxShotRange);
-    if (dist <= tolerance) {
-      shots.splice(i, 1);
-      return shot;
-    }
+    const range = shot.maxRange || CONFIG.combat.maxShotRange;
+    const dist = distanceFromRay(shot.origin, shot.direction, targetHistoricalPos, range);
+    if (dist > tolerance) continue;
+
+    if (shot.speed > 0 && !projectileTimingPlausible(shot, targetHistoricalPos, age)) continue;
+
+    shot.hitsLeft -= 1;
+    if (shot.hitsLeft <= 0) shots.splice(i, 1);
+    return shot;
   }
   return null;
 }
@@ -978,6 +994,7 @@ function buildPlayerStatePayload(p) {
     alive: p.alive,
     weaponEquipped: p.weaponEquipped,
     isShooting: p.isShooting,
+    shielded: !!p.shieldVisible,
   };
 }
 
@@ -998,6 +1015,7 @@ function buildPlayerJoinPayload(p) {
     alive: p.alive,
     weaponEquipped: p.weaponEquipped,
     isShooting: p.isShooting,
+    shielded: !!p.shieldVisible,
     locationId: p.locationId,
     isAdmin: !!p.isAdmin,
     isFactionCreator: !!p.isFactionCreator,
@@ -1055,6 +1073,8 @@ function notifyAOILeave(player) {
 }
 
 function notifyLocationTransition(player, oldLocationId, newLocationId) {
+  clearPlayerAbilityBuffs(player, false);
+
   const oldNeighbors = player.aoiNeighbors;
   player.aoiNeighbors = new Set();
   for (const id of oldNeighbors) {
@@ -1307,6 +1327,7 @@ const WALL_TIER_ENV = process.env.WORLD_WALL_TIER && Number.isFinite(Number(proc
   : null;
 const WORLD_MC_POLL_MS = 60000;
 const WORLD_COMMAND_POLL_MS = 15000;
+const ADMIN_COMMAND_POLL_MS = 5000;
 const WORLD_PERSIST_DEBOUNCE_MS = 2000;
 const WALL_STAND_CLEARANCE = 2.2;
 
@@ -1507,6 +1528,70 @@ function applyWorldCommand(command) {
   broadcastWorldStatus();
 }
 
+function playerByUserId(userId) {
+  for (const player of players.values()) {
+    if (player.authenticated && player.userId === userId) return player;
+  }
+  return null;
+}
+
+function applyAdminLevel(player, level, totalXp) {
+  const state = player.progression;
+  const previousLevel = state.level;
+
+  state.totalXp = Math.max(0, Math.floor(totalXp));
+  state.level = progression.levelFromTotalXp(state.totalXp).level;
+
+  const validated = skills.validateBuild(state.skills, state.level, state.branch, progression.skillPointsForLevel(state.level));
+  state.skills = validated.ranks;
+
+  refreshCombatStats(player);
+  sendProgressionState(player);
+
+  if (state.level !== previousLevel) broadcastPlayerLevel(player);
+  persistPlayer(player);
+
+  console.log(`[Admin] ${player.nickname} level ${previousLevel} -> ${state.level} by admin command`);
+}
+
+function applyAdminInventoryRemoval(player, slot) {
+  if (slot < 0 || slot >= player.inventory.length) return;
+
+  const [removed] = player.inventory.splice(slot, 1);
+  safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+  persistPlayer(player);
+
+  console.log(`[Admin] ${player.nickname} lost ${removed?.symbol || 'item'} from slot ${slot} by admin command`);
+}
+
+function applyAdminCommand(command) {
+  const player = playerByUserId(command.userId);
+  if (!player) return;
+
+  if (command.type === 'setLevel') applyAdminLevel(player, command.level, command.totalXp);
+  else if (command.type === 'removeInventorySlot') applyAdminInventoryRemoval(player, command.slot);
+}
+
+async function pollAdminCommands() {
+  if (!CONFIG.internalSecret) return;
+  if (players.size === 0) return;
+
+  const result = await callInternalApi('/api/internal/game/admin-commands', {}).catch((err) => {
+    console.error('[Admin] Command poll failed:', err.message);
+    return null;
+  });
+
+  if (!Array.isArray(result?.commands)) return;
+
+  for (const command of result.commands) {
+    try {
+      applyAdminCommand(command);
+    } catch (err) {
+      console.error('[Admin] Command failed:', err.message);
+    }
+  }
+}
+
 async function pollWorldCommands() {
   if (!CONFIG.internalSecret) return;
 
@@ -1661,6 +1746,7 @@ loadWorldState().then(() => {
 safeInterval(pollMarketCap, WORLD_MC_POLL_MS);
 safeInterval(pollWorldCommands, WORLD_COMMAND_POLL_MS);
 safeInterval(updatePortalState, WORLD_COMMAND_POLL_MS);
+safeInterval(pollAdminCommands, ADMIN_COMMAND_POLL_MS);
 
 function getSegmentDifficulty(segment) {
   const beyond = Math.max(0, segment - CANYON_BIOMES.length);
@@ -1745,6 +1831,7 @@ function preparePlayerEnemiesForSegment(player, segment) {
 
 function populateCanyonSegment(player, segment) {
   player.canyon.inHub = false;
+  clearPlayerAbilityBuffs(player, true);
   preparePlayerEnemiesForSegment(player, segment);
   player.position = canyonSegmentEntrancePosition(segment);
   player.justTeleported = true;
@@ -1764,6 +1851,7 @@ function populateCanyonSegment(player, segment) {
 
 function enterCanyonHub(player) {
   player.canyon.inHub = true;
+  clearPlayerAbilityBuffs(player, true);
   player.canyon.enemies.clear();
   clearCanyonLoot(player);
   player.position = [...CANYON_HUB_POSITION];
@@ -1909,7 +1997,7 @@ function updateCanyonPatrol(enemy, cfg, now, constrained = false) {
     return;
   }
 
-  const step = cfg.patrolSpeed * (CANYON_CONFIG.tickRate / 1000);
+  const step = cfg.patrolSpeed * (CANYON_CONFIG.tickRate / 1000) * enemySpeedMult(enemy, now);
   if (!stepEnemy(enemy, dx, dz, step, constrained)) {
     enemy.patrolTarget = null;
     enemy.patrolWaitUntil = now + 800;
@@ -1919,6 +2007,7 @@ function updateCanyonPatrol(enemy, cfg, now, constrained = false) {
 function markPlayerDead(target, killerId, position) {
   target.alive = false;
   target.stats.deaths++;
+  clearPlayerAbilityBuffs(target, false);
 
   const deathMessage = {
     type: 'playerDeath',
@@ -1937,6 +2026,7 @@ function respawnPlayer(target) {
 
   target.health = target.maxHealth;
   target.alive = true;
+  clearPlayerAbilityBuffs(target, true);
   if (target.locationId === 'tower-first-floor' && target.canyon) {
     enterCanyonHub(target);
   } else {
@@ -1977,49 +2067,17 @@ function handleRespawnRequest(player) {
 }
 
 function damagePlayerByCanyonEnemy(player, enemy) {
-  if (!player.alive) return;
-  if (isSpawnProtected(player)) return;
-
-  const damage = Math.max(1, Math.round(enemy.attackDamage * player.combat.damageTakenMult));
-  player.health = Math.max(0, player.health - damage);
-  player.lastDamageTime = Date.now();
-
-  safeSend(player.ws, {
-    type: 'playerDamaged',
-    targetId: player.id,
+  applyPlayerDamage(player, enemy.attackDamage * enemyDamageOutputMult(enemy, Date.now()), {
     attackerId: enemy.id,
-    damage,
-    health: player.health,
-    point: player.position,
-    historicalPosition: player.position,
+    broadcast: false,
   });
-
-  if (player.health <= 0) {
-    markPlayerDead(player, enemy.id, player.position);
-  }
 }
 
 function damagePlayerFromZone(player, enemy, damage) {
-  if (!player.alive) return;
-  if (isSpawnProtected(player)) return;
-
-  const mitigated = Math.max(1, Math.round(damage * player.combat.damageTakenMult));
-  player.health = Math.max(0, player.health - mitigated);
-  player.lastDamageTime = Date.now();
-
-  safeSend(player.ws, {
-    type: 'playerDamaged',
-    targetId: player.id,
+  applyPlayerDamage(player, damage * enemyDamageOutputMult(enemy, Date.now()), {
     attackerId: enemy.id,
-    damage: mitigated,
-    health: player.health,
-    point: player.position,
-    historicalPosition: player.position,
+    broadcast: false,
   });
-
-  if (player.health <= 0) {
-    markPlayerDead(player, enemy.id, player.position);
-  }
 }
 
 function clampToArena(position, arena) {
@@ -2189,7 +2247,7 @@ function updateRangedBoss(player, enemy, cfg, now) {
   const drift = dist - cfg.preferredRange;
   if (Math.abs(drift) > 3) {
     const speed = Math.abs(drift) > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear;
-    const step = speed * (CANYON_CONFIG.tickRate / 1000) * Math.sign(drift);
+    const step = speed * (CANYON_CONFIG.tickRate / 1000) * Math.sign(drift) * enemySpeedMult(enemy, now);
     const len = dist || 1;
     enemy.position[0] += (dx / len) * step;
     enemy.position[2] += (dz / len) * step;
@@ -2198,6 +2256,7 @@ function updateRangedBoss(player, enemy, cfg, now) {
   clampToArena(enemy.position, arena);
 
   if (now - enemy.lastAttackTime < cfg.attackCooldown) return;
+  if (abilities.isStunned(enemy, now)) return;
 
   const attack = pickBossAttack(enemy, cfg, dist, now);
   if (!attack) return;
@@ -2496,7 +2555,7 @@ function updateWardenPatrol(enemy, cfg, radius, now) {
     return;
   }
 
-  const step = cfg.patrolSpeed * (WORLD_ENEMY_TICK_MS / 1000);
+  const step = cfg.patrolSpeed * (WORLD_ENEMY_TICK_MS / 1000) * enemySpeedMult(enemy, now);
   enemy.position[0] += (dx / distance) * step;
   enemy.position[2] += (dz / distance) * step;
 }
@@ -2533,7 +2592,7 @@ function updateWarden(enemy, cfg, radius, now) {
 
   if (Math.abs(drift) > 3) {
     const speed = Math.abs(drift) > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear;
-    const step = speed * (WORLD_ENEMY_TICK_MS / 1000) * Math.sign(drift);
+    const step = speed * (WORLD_ENEMY_TICK_MS / 1000) * Math.sign(drift) * enemySpeedMult(enemy, now);
     const length = distance || 1;
     enemy.position[0] += (dx / length) * step;
     enemy.position[2] += (dz / length) * step;
@@ -2542,6 +2601,7 @@ function updateWarden(enemy, cfg, radius, now) {
   clampWardenToBand(enemy, radius);
 
   if (now - enemy.lastAttackTime < cfg.attackCooldown) return;
+  if (abilities.isStunned(enemy, now)) return;
 
   const attack = pickBossAttack(enemy, cfg, distance, now);
   if (!attack) return;
@@ -2674,12 +2734,12 @@ function canyonTick() {
 
         if (dist > cfg.attackRange) {
           const speed = dist > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear;
-          const step = speed * (CANYON_CONFIG.tickRate / 1000);
+          const step = speed * (CANYON_CONFIG.tickRate / 1000) * enemySpeedMult(enemy, now);
           const [steerX, steerZ] = inCave
             ? caveChaseDirection(enemy, player.position[0], player.position[2], now)
             : [dx, dz];
           stepEnemy(enemy, steerX, steerZ, step, inCave);
-        } else if (now - enemy.lastAttackTime >= cfg.attackCooldown) {
+        } else if (now - enemy.lastAttackTime >= cfg.attackCooldown && !abilities.isStunned(enemy, now)) {
           enemy.lastAttackTime = now;
           damagePlayerByCanyonEnemy(player, enemy);
         }
@@ -2703,13 +2763,6 @@ const SHOP_ITEMS = {
   'sign-on-a-stick': { id: 'sign-on-a-stick', name: 'Sign on a Stick', price: 100, maxOwned: 10 },
   'sphere': { id: 'sphere', name: 'Sphere', price: 100, maxOwned: 50, tradeable: true },
   'wall-poster': { id: 'wall-poster', name: 'Wall Poster', price: 100, maxOwned: 4 },
-};
-
-const FURNITURE_ITEMS = {
-  'chair': { id: 'chair', price: 0, maxOwned: 6 },
-  'table': { id: 'table', price: 0, maxOwned: 2 },
-  'wardrobe': { id: 'wardrobe', price: 0, maxOwned: 1 },
-  'wall-poster': { id: 'wall-poster', price: 100, maxOwned: 4 },
 };
 
 const shopPriceOverrides = new Map();
@@ -2918,37 +2971,71 @@ safeInterval(() => {
 
 const FACTION_ROOM_PREFIX = 'faction-gate-';
 
-function roomFactionIdFor(player) {
-  return typeof player.locationId === 'string' && player.locationId.startsWith(FACTION_ROOM_PREFIX)
-    ? player.locationId.slice(FACTION_ROOM_PREFIX.length)
-    : null;
+const ROOM_BUILD_TYPE_MAX = 40;
+const ROOM_BUILD_KEY_MAX = 64;
+const ROOM_BUILD_ENV_MAX = 24;
+const ROOM_BUILD_PAINT_URL_MAX = 300;
+const ROOM_BUILD_CELL_MAX = 1024;
+const ROOM_BUILD_LEVEL_MAX = 15;
+
+function isRoomLocationId(locationId) {
+  return typeof locationId === 'string' && PRIVATE_LOCATION_PREFIXES.some((prefix) => locationId.startsWith(prefix));
 }
 
-const worldFurniture = new Map();
-const furnitureLoadPromises = new Map();
-
-function serializeFurnitureForRoom(factionId) {
-  const room = worldFurniture.get(factionId);
-  return room ? Array.from(room.values()) : [];
+function isBuildIndex(value, max) {
+  return Number.isInteger(value) && value >= 0 && value <= max;
 }
 
-async function ensureFurnitureLoaded(factionId) {
-  if (worldFurniture.has(factionId)) return;
-  if (furnitureLoadPromises.has(factionId)) return furnitureLoadPromises.get(factionId);
+function sanitizeRoomBuildOp(op) {
+  if (!op || typeof op !== 'object') return null;
 
-  const promise = (async () => {
-    const result = await callInternalApi('/api/internal/game/furniture/list', { factionId }).catch((err) => {
-      console.error('[Furniture] load error:', err.message);
-      return null;
-    });
-    const room = new Map();
-    for (const item of result?.items || []) {
-      room.set(item.id, item);
+  if (op.kind === 'place') {
+    const raw = op.piece;
+    if (!raw || typeof raw !== 'object') return null;
+    if (typeof raw.t !== 'string' || raw.t.length === 0 || raw.t.length > ROOM_BUILD_TYPE_MAX) return null;
+    if (!isBuildIndex(raw.x, ROOM_BUILD_CELL_MAX) || !isBuildIndex(raw.z, ROOM_BUILD_CELL_MAX)) return null;
+    if (!isBuildIndex(raw.l, ROOM_BUILD_LEVEL_MAX) || !isBuildIndex(raw.r, 3)) return null;
+
+    const piece = { t: raw.t, x: raw.x, z: raw.z, l: raw.l, r: raw.r };
+    if (raw.d !== undefined && raw.d !== null) {
+      if (typeof raw.d !== 'string' || !raw.d.startsWith('https://') || raw.d.length > ROOM_BUILD_PAINT_URL_MAX) return null;
+      piece.d = raw.d;
     }
-    worldFurniture.set(factionId, room);
-  })();
-  furnitureLoadPromises.set(factionId, promise);
-  return promise;
+    return { kind: 'place', piece };
+  }
+
+  if (op.kind === 'erase') {
+    if (typeof op.key !== 'string' || op.key.length === 0 || op.key.length > ROOM_BUILD_KEY_MAX) return null;
+    return { kind: 'erase', key: op.key };
+  }
+
+  if (op.kind === 'env') {
+    if (typeof op.sky !== 'string' || op.sky.length === 0 || op.sky.length > ROOM_BUILD_ENV_MAX) return null;
+    if (typeof op.light !== 'string' || op.light.length === 0 || op.light.length > ROOM_BUILD_ENV_MAX) return null;
+    return { kind: 'env', sky: op.sky, light: op.light };
+  }
+
+  if (op.kind === 'clear') return { kind: 'clear' };
+
+  return null;
+}
+
+async function refreshRoomEditRights(player) {
+  player.roomCanEdit = false;
+
+  const locationId = player.locationId;
+  if (!isRoomLocationId(locationId)) return;
+
+  const result = await callInternalApi('/api/internal/game/room/can-edit', {
+    userId: player.userId,
+    locationId,
+  }).catch((err) => {
+    console.error('[RoomBuild] edit rights error:', err.message);
+    return null;
+  });
+
+  if (player.locationId !== locationId) return;
+  player.roomCanEdit = result?.canEdit === true;
 }
 
 function addTokensToInventory(player, tokens) {
@@ -3183,14 +3270,29 @@ function progressionPoints(player) {
   return { total, spent, available: Math.max(0, total - spent) };
 }
 
+function weaponIdFor(player) {
+  const branch = progression.BRANCHES.find((b) => b.id === player.progression.branch);
+  return branch ? branch.weapon : 'rifle';
+}
+
+function weaponConfigFor(player) {
+  return progression.WEAPONS[weaponIdFor(player)];
+}
+
 function computeCombatStats(player) {
   const stats = skills.computeBuildStats(player.progression.skills);
   const percent = (key) => (stats.percent[key] || 0) / 100;
 
+  const isStaff = weaponIdFor(player) === 'staff';
+  const damageStat = isStaff ? 'spellDamage' : 'weaponDamage';
+  const weaponMult = isStaff ? progression.WEAPONS.staff.boltDamageMult : 1;
+
   return {
+    stats,
+    weapon: isStaff ? 'staff' : 'rifle',
     maxHealth: Math.round(skills.statValue(stats, 'maxHealth', BASE_MAX_HEALTH)),
-    enemyDamage: skills.statValue(stats, 'weaponDamage', PLAYER_WEAPON_DAMAGE_TO_ENEMY),
-    pvpDamage: skills.statValue(stats, 'weaponDamage', BASE_PVP_DAMAGE),
+    enemyDamage: skills.statValue(stats, damageStat, PLAYER_WEAPON_DAMAGE_TO_ENEMY) * weaponMult,
+    pvpDamage: skills.statValue(stats, damageStat, BASE_PVP_DAMAGE) * weaponMult,
     damageTakenMult: Math.max(0.2, 1 + percent('damageTaken')),
     armorPen: Math.min(0.9, Math.max(0, percent('armorPen'))),
     damageVsUnshielded: Math.max(0, percent('damageVsUnshielded')),
@@ -3203,11 +3305,36 @@ function computeCombatStats(player) {
     energyOnKill: stats.add.energyOnKill || 0,
     lootMult: Math.max(1, 1 + percent('lootBonus')),
     shieldStrength: stats.add.shieldStrength || 0,
+    lowHealthDamageTakenMult: Math.max(0.2, 1 + percent('lowHealthDamageTaken')),
+    lowHealthThreshold: stats.set.lowHealthThreshold || 0,
+    postShieldRegen: stats.add.postShieldRegen || 0,
+    postShieldRegenMs: stats.set.postShieldRegenMs || 0,
+    postDashSpeed: percent('postDashSpeed'),
+    postDashDamageTaken: percent('postDashDamageTaken'),
+    reloadWhileDashing: !!stats.set.reloadWhileDashing,
+    allyDamageInZone: percent('allyDamageInZone'),
+    markedAllyFireRate: percent('markedAllyFireRate'),
+    bleedDamage: stats.add.bleedDamage || 0,
+    bleedDurationMs: stats.set.bleedDurationMs || 0,
+    clusterCount: stats.add.clusterCount || 0,
+    clusterDamage: percent('clusterDamage'),
+    manaCostMult: Math.max(0.2, 1 + percent('manaCost')),
+    projectileSpeedMult: Math.max(0.5, 1 + percent('projectileSpeed')),
+    ricochetChance: Math.min(1, Math.max(0, percent('ricochetChance'))),
+    ricochetDamage: Math.max(0, percent('ricochetDamage')),
+    explosiveEveryNthShot: Math.max(0, Math.round(stats.set.explosiveEveryNthShot || 0)),
+    explosiveDamage: Math.max(0, percent('explosiveDamage')),
+    explosiveRadius: Math.max(0, stats.set.explosiveRadius || 0),
+    burnDamage: stats.add.burnDamage || 0,
+    burnDurationMs: stats.set.burnDurationMs || 0,
   };
 }
 
 function refreshCombatStats(player) {
   player.combat = computeCombatStats(player);
+
+  if (!player.ability) player.ability = abilities.createAbilityState(player.combat.maxEnergy);
+  else player.ability.energy = Math.min(player.ability.energy, player.combat.maxEnergy);
 
   const previousMax = player.maxHealth;
   player.maxHealth = player.combat.maxHealth;
@@ -3229,7 +3356,14 @@ function buildCombatStatsPayload(player) {
     moveSpeedMult: player.combat.moveSpeedMult,
     maxEnergy: player.combat.maxEnergy,
     energyRegen: player.combat.energyRegen,
+    boltSpeed: boltSpeedFor(player, progression.WEAPONS.staff),
+    boltRange: progression.WEAPONS.staff.maxRange,
+    boltEnergyCost: boltEnergyCost(player, progression.WEAPONS.staff, progression.SINGLE_FIRE_MODE),
   };
+}
+
+function abilityCooldownPayload(player, now) {
+  return abilities.cooldownPayload(player.ability, player.progression.loadout, player.combat.stats, now);
 }
 
 function buildProgressionPayload(player) {
@@ -3250,6 +3384,8 @@ function buildProgressionPayload(player) {
     skills: state.skills,
     loadout: state.loadout,
     fireMode: state.fireMode,
+    fireModes: skills.unlockedModeIds(state.skills),
+    weapon: player.combat.weapon,
     respecCount: state.respecCount,
     respecCostAsh: progression.respecCostAsh(state.level, state.respecCount),
     skillPoints: points.available,
@@ -3258,8 +3394,15 @@ function buildProgressionPayload(player) {
     tierIndex: tier.index,
     weaponTier: weaponTier.tier,
     memeAbilities: progression.memeAbilityIdsForLevel(state.level),
+    memeCooldowns: abilities.memeCooldownPayload(
+      player.ability,
+      progression.memeAbilityIdsForLevel(state.level),
+      Date.now()
+    ),
     stats: buildCombatStatsPayload(player),
     health: player.health,
+    energy: Math.floor(player.ability.energy),
+    cooldowns: abilityCooldownPayload(player, Date.now()),
   };
 }
 
@@ -3273,6 +3416,7 @@ function broadcastPlayerLevel(player) {
     playerId: player.id,
     level: player.progression.level,
     tier: progression.tierForLevel(player.progression.level).id,
+    branch: player.progression.branch,
     weaponTier: progression.weaponTierForLevel(player.progression.level).tier,
   }, player.id, player.instance);
 }
@@ -3349,6 +3493,1905 @@ function grantEnemyKillXp(player, enemyType) {
   const base = progression.enemyXp(cfg.maxHealth, isBossType(enemyType));
   const multiplier = progression.levelGapMultiplier(player.progression.level, contentLevelFor(player));
   return grantXp(player, base * multiplier, `enemy:${enemyType}`);
+}
+
+function broadcastToFaction(factionId, message, excludePlayerId, senderUserId = null) {
+  players.forEach((p) => {
+    if (p.authenticated && p.id !== excludePlayerId && p.factions?.some((f) => f.id === factionId)) {
+      if (senderUserId && p.blockedUserIds?.has(senderUserId)) return;
+      safeSend(p.ws, message);
+    }
+  });
+}
+
+async function hydrateFactionTaskState(factionId, gameId) {
+  const myGen = nextFactionTaskGeneration(factionId);
+
+  const result = await callInternalApi('/api/internal/game/faction/get-by-id', {
+    gameId, factionId,
+  }).catch((err) => {
+    console.error('[FactionTask] hydrate error:', err.message);
+    return null;
+  });
+
+  if (factionTaskGeneration.get(factionId) !== myGen) {
+    return factionTaskState.get(factionId) || null;
+  }
+
+  const faction = result?.faction;
+  if (!faction || !faction.activeTask) {
+    factionTaskState.delete(factionId);
+    return null;
+  }
+
+  const def = FACTION_TASKS_BY_KEY.get(faction.activeTask.key);
+  const state = {
+    taskKey: faction.activeTask.key,
+    metric: def ? def.metric : null,
+    target: faction.activeTask.target,
+    progress: faction.activeTask.progress,
+    dirty: false,
+    contributions: new Map(),
+  };
+  factionTaskState.set(factionId, state);
+  return state;
+}
+
+async function completeFactionTask(factionId, taskKey, gameId, contributions) {
+  factionTaskState.delete(factionId);
+
+  const contributionsPayload = contributions
+    ? Array.from(contributions.entries()).map(([userId, amount]) => ({ userId, amount }))
+    : [];
+
+  const result = await callInternalApi('/api/internal/game/faction/complete-task', {
+    factionId, taskKey, contributions: contributionsPayload,
+  }).catch((err) => {
+    console.error('[FactionTask] complete error:', err.message);
+    return null;
+  });
+
+  if (!result || !result.success) return;
+
+  const recipient = userIdToPlayer.get(result.rewardUserId);
+  if (recipient) {
+    recipient.ash += result.rewardAsh;
+    safeSend(recipient.ws, { type: 'inventoryUpdate', inventory: recipient.inventory, ash: recipient.ash });
+  }
+
+  const def = FACTION_TASKS_BY_KEY.get(taskKey);
+  broadcastToFaction(factionId, {
+    type: 'factionTaskCompleted',
+    taskKey,
+    label: def ? def.label : taskKey,
+    rewardAsh: result.rewardAsh,
+    rewardNickname: result.rewardNickname,
+  });
+
+  const fresh = await callInternalApi('/api/internal/game/faction/get-by-id', {
+    gameId, factionId,
+  }).catch((err) => {
+    console.error('[FactionTask] refresh error:', err.message);
+    return null;
+  });
+  if (fresh?.faction) {
+    broadcastToFaction(factionId, { type: 'factionInfo', faction: fresh.faction });
+  }
+}
+
+async function getOrHydrateFactionTaskState(factionId, gameId) {
+  const cached = factionTaskState.get(factionId);
+  if (cached) return cached;
+
+  let inflight = factionTaskHydrating.get(factionId);
+  if (!inflight) {
+    inflight = hydrateFactionTaskState(factionId, gameId).finally(() => {
+      factionTaskHydrating.delete(factionId);
+    });
+    factionTaskHydrating.set(factionId, inflight);
+  }
+  return inflight;
+}
+
+async function bumpSingleFactionTask(factionId, gameId, metric, amount, userId) {
+  const state = await getOrHydrateFactionTaskState(factionId, gameId);
+  if (!state || !state.taskKey || state.metric !== metric) return;
+  if (factionTaskState.get(factionId) !== state) return;
+
+  state.progress += amount;
+  state.dirty = true;
+
+  if (userId) {
+    if (!state.contributions) state.contributions = new Map();
+    state.contributions.set(userId, (state.contributions.get(userId) || 0) + amount);
+  }
+
+  if (state.progress >= state.target) {
+    await completeFactionTask(factionId, state.taskKey, gameId, state.contributions);
+  }
+}
+
+async function bumpFactionTaskProgress(player, metric, amount) {
+  if (!player.factions?.length || amount <= 0) return;
+  await Promise.all(player.factions.map((f) => bumpSingleFactionTask(f.id, player.gameId, metric, amount, player.userId)));
+}
+
+function getQuestState(player, questId) {
+  return player.quests[questId] || { status: 'not_started', progress: 0, visited: [] };
+}
+
+function incrementKillQuests(player) {
+  for (const quest of Object.values(QUESTS)) {
+    if (quest.type !== 'kill_enemies') continue;
+    if (quest.locationId && player.locationId !== quest.locationId) continue;
+
+    const state = getQuestState(player, quest.id);
+    if (state.status !== 'active') continue;
+
+    state.progress = Math.min(quest.targetCount, state.progress + 1);
+    if (state.progress >= quest.targetCount) {
+      state.status = 'ready_to_turn_in';
+    }
+    player.quests[quest.id] = state;
+    persistPlayer(player);
+
+    safeSend(player.ws, {
+      type: 'questUpdate',
+      questId: quest.id,
+      status: state.status,
+      progress: state.progress,
+      targetCount: quest.targetCount,
+    });
+  }
+}
+
+function applyKillRewards(player) {
+  if (!player.alive) return;
+
+  if (player.combat.healOnKill > 0) {
+    const healed = Math.min(player.maxHealth, player.health + player.combat.healOnKill);
+    if (healed !== player.health) {
+      player.health = healed;
+      safeSend(player.ws, { type: 'playerHealed', health: player.health, maxHealth: player.maxHealth });
+    }
+  }
+
+  if (player.combat.energyOnKill > 0) {
+    player.ability.energy = Math.min(player.combat.maxEnergy, player.ability.energy + player.combat.energyOnKill);
+  }
+}
+
+function applyEnemyDamage(player, enemy, amount, options = {}) {
+  if (!enemy.alive) return false;
+
+  const now = Date.now();
+  const damage = Math.max(1, Math.round(amount * abilities.damageTakenMultFromEffects(enemy, now)));
+  enemy.health = Math.max(0, enemy.health - damage);
+
+  const shared = player.locationId === 'main-world';
+  const damagedMessage = {
+    type: 'enemyDamaged',
+    id: enemy.id,
+    health: enemy.health,
+    attackerId: player.id,
+    point: options.point || enemy.position,
+    abilityId: options.abilityId || null,
+  };
+
+  if (shared) broadcastToLocation('main-world', damagedMessage, null, player.instance);
+  else safeSend(player.ws, damagedMessage);
+
+  if (enemy.health > 0) {
+    if (options.keepTarget !== false) enemy.targetId = player.id;
+    return false;
+  }
+
+  enemy.alive = false;
+  enemy.targetId = null;
+  abilities.clearEffects(enemy);
+
+  const deathMessage = { type: 'enemyDeath', id: enemy.id, killerId: player.id };
+  if (shared) broadcastToLocation('main-world', deathMessage, null, player.instance);
+  else safeSend(player.ws, deathMessage);
+
+  incrementKillQuests(player);
+  grantEnemyKillXp(player, enemy.type);
+  applyKillRewards(player);
+
+  if (shared) {
+    const cfg = ENEMY_TYPES[enemy.type];
+    enemy.cast = null;
+    enemy.pendingImpacts = [];
+    enemy.pools = [];
+    enemy.respawnAt = Date.now() + WARDEN_RESPAWN_MS;
+    dropLoot(enemy.position, player.instance, cfg.lootMin, cfg.lootMax);
+    return true;
+  }
+
+  if (player.locationId === CAVE_LOCATION_ID) {
+    if (player.cave && enemy.id === player.cave.bossId) {
+      player.cave.bossDefeated = true;
+      player.cave.portalDoomed = true;
+      grantXp(player, progression.XP_SOURCES.caveBossXp, 'cave_boss');
+      safeSend(player.ws, { type: 'caveBossState', defeated: true });
+    }
+    return true;
+  }
+
+  const alreadyCleared = player.canyon.clearedSegments.has(player.canyon.segment);
+  if (!alreadyCleared) {
+    const cfg = ENEMY_TYPES[enemy.type];
+    dropCanyonLoot(
+      player,
+      enemy.position,
+      cfg.lootMin,
+      Math.round(cfg.lootMax * player.combat.lootMult * memeLootMult(player, now))
+    );
+  }
+
+  if (enemy.type === 'slime_boss') {
+    const clearedSegment = player.canyon.segment;
+    if (!alreadyCleared) {
+      player.canyon.clearedSegments.add(clearedSegment);
+    }
+    grantXp(player, progression.canyonSegmentXp(clearedSegment, alreadyCleared), `canyon:${clearedSegment}`);
+    const nextSegment = Math.min(clearedSegment + 1, CANYON_MAX_SEGMENT_CAP);
+    if (nextSegment > player.canyon.maxSegmentReached) {
+      player.canyon.maxSegmentReached = nextSegment;
+    }
+    persistPlayer(player);
+
+    player.canyon.pendingSegment = nextSegment;
+
+    safeSend(player.ws, {
+      type: 'canyonCleared',
+      clearedSegment,
+      segment: nextSegment,
+      maxSegmentReached: player.canyon.maxSegmentReached,
+      name: canyonSegmentName(nextSegment),
+      biome: canyonBiomeFor(nextSegment).key,
+    });
+  }
+
+  return true;
+}
+
+function incomingDamageMultiplier(target, now) {
+  let mult = target.combat.damageTakenMult * abilities.damageTakenMultFromEffects(target, now);
+
+  const threshold = target.combat.lowHealthThreshold;
+  if (threshold > 0 && target.health <= target.maxHealth * threshold) {
+    mult *= target.combat.lowHealthDamageTakenMult;
+  }
+
+  return Math.max(0, mult);
+}
+
+function syncShieldVisibility(player, now) {
+  const active = abilities.shieldRemaining(player.ability, now) > 0;
+  if (active === !!player.shieldVisible) return;
+
+  player.shieldVisible = active;
+  broadcast({ type: 'playerShield', playerId: player.id, active }, player.id, true, player);
+}
+
+function sendAbilityMeter(player) {
+  const now = Date.now();
+  safeSend(player.ws, {
+    type: 'abilityMeter',
+    energy: Math.floor(player.ability.energy),
+    maxEnergy: player.combat.maxEnergy,
+    shield: abilities.shieldRemaining(player.ability, now),
+    shieldMax: player.ability.shieldMax,
+  });
+}
+
+function applyPlayerDamage(target, amount, options = {}) {
+  if (!target.alive) return 0;
+
+  const now = Date.now();
+  if (isSpawnProtected(target)) return 0;
+  if (abilities.isInvulnerable(target, target.ability, now)) return 0;
+
+  const raw = Math.max(1, Math.round(amount * incomingDamageMultiplier(target, now)));
+  const penetration = Math.min(0.9, Math.max(0, options.penetration || 0));
+  const throughShield = Math.round(raw * penetration);
+
+  const absorb = options.ignoreShield
+    ? { absorbed: 0, remaining: raw - throughShield, broke: false }
+    : abilities.absorbWithShield(target.ability, raw - throughShield, now);
+
+  const applied = absorb.remaining + throughShield;
+  if (absorb.absorbed > 0) {
+    sendAbilityMeter(target);
+    if (absorb.broke) startPostShieldRegen(target, now);
+  }
+
+  if (applied > 0) {
+    target.health = Math.max(0, target.health - applied);
+    target.lastDamageTime = now;
+  }
+
+  const damageMessage = {
+    type: 'playerDamaged',
+    targetId: target.id,
+    attackerId: options.attackerId || null,
+    damage: applied,
+    absorbed: absorb.absorbed,
+    health: target.health,
+    point: options.point || target.position,
+    historicalPosition: options.point || target.position,
+    abilityId: options.abilityId || null,
+  };
+
+  safeSend(target.ws, damageMessage);
+  if (options.broadcast !== false) broadcast(damageMessage, target.id, true, target);
+
+  const attacker = options.attacker || null;
+  if (attacker && applied > 0) reflectDamage(target, attacker, applied, now);
+
+  if (target.health <= 0) {
+    if (attemptDeathTrigger(target, !!attacker, now)) return applied;
+
+    if (attacker) {
+      attacker.stats.kills++;
+      bumpFactionTaskProgress(attacker, 'kills', 1).catch((err) => console.error('[FactionTask] bump error:', err.message));
+      applyKillRewards(attacker);
+    }
+    markPlayerDead(target, options.attackerId || null, options.point || target.position);
+  }
+
+  return applied;
+}
+
+function reflectDamage(target, attacker, applied, now) {
+  const reflect = abilities.findEffect(target, 'reflect_ward', now);
+  if (!reflect || !attacker.alive) return;
+
+  const share = applied * (reflect.reflectPercent || 0) / 100;
+  const scaled = progression.scalePvpDamage(share, reflect.damageClass || 'singleHit', attacker.maxHealth);
+  if (scaled < 1) return;
+
+  applyPlayerDamage(attacker, scaled, {
+    attackerId: target.id,
+    abilityId: 'reflect_ward',
+    point: attacker.position,
+  });
+}
+
+function startPostShieldRegen(player, now) {
+  if (player.combat.postShieldRegen <= 0 || player.combat.postShieldRegenMs <= 0) return;
+
+  abilities.addEffect(player, {
+    id: 'post_shield_regen',
+    expiresAt: now + player.combat.postShieldRegenMs,
+    healPerSecond: player.combat.postShieldRegen,
+  });
+}
+
+function attemptDeathTrigger(player, inPvp, now) {
+  const triggers = skills.unlockedTriggers(player.progression.skills);
+  if (triggers.length === 0) return false;
+
+  const trigger = triggers[0];
+  const cooldownMs = inPvp ? trigger.pvpCooldownMs : trigger.cooldownMs;
+  if (!abilities.triggerReady(player.ability, trigger.id, now)) return false;
+
+  abilities.startTriggerCooldown(player.ability, trigger.id, cooldownMs, now);
+
+  player.health = Math.min(player.maxHealth, trigger.params.reviveHealth);
+  player.ability.iframesUntil = now + trigger.params.invulnerabilityMs;
+
+  safeSend(player.ws, {
+    type: 'abilityTrigger',
+    triggerId: trigger.id,
+    health: player.health,
+    invulnerabilityMs: trigger.params.invulnerabilityMs,
+    readyAt: player.ability.triggerReadyAt[trigger.id],
+  });
+
+  broadcast({
+    type: 'abilityEffect',
+    casterId: player.id,
+    abilityId: trigger.id,
+    kind: 'revive',
+    position: player.position,
+  }, player.id, true, player);
+
+  return true;
+}
+
+const abilityZones = new Map();
+const abilityImpacts = [];
+let nextAbilityEntitySeq = 0;
+
+function abilityEntityId(prefix) {
+  nextAbilityEntitySeq += 1;
+  return `${prefix}-${nextAbilityEntitySeq}`;
+}
+
+function sameShard(a, b) {
+  if (a.locationId !== b.locationId) return false;
+  if (!isShardedLocation(a.locationId)) return true;
+  return a.instance === b.instance;
+}
+
+function zoneCoversPlayer(zone, player) {
+  if (zone.locationId !== player.locationId) return false;
+  if (isShardedLocation(zone.locationId) && zone.instance !== player.instance) return false;
+  return abilities.withinRadius(player.position, zone.x, zone.z, zone.radius);
+}
+
+function allyDamageBonus(player) {
+  let bonus = 0;
+  for (const zone of abilityZones.values()) {
+    if (zone.allyDamagePercent <= 0) continue;
+    if (!zoneCoversPlayer(zone, player)) continue;
+    bonus += zone.allyDamagePercent;
+  }
+  return 1 + bonus / 100;
+}
+
+function enemyDamageOutputMult(enemy, now) {
+  let mult = 1;
+  for (const effect of enemy.effects || []) {
+    if (effect.expiresAt <= now) continue;
+    if (typeof effect.damageOutputPercent === 'number') mult *= 1 + effect.damageOutputPercent / 100;
+  }
+  return Math.max(0, mult);
+}
+
+function enemySpeedMult(enemy, now) {
+  if (abilities.isStunned(enemy, now)) return 0;
+  return abilities.speedMultFromEffects(enemy, now);
+}
+
+function canAbilityHitPlayer(caster, target) {
+  if (!target.authenticated || !target.alive) return false;
+  if (target.id === caster.id) return false;
+  if (!sameShard(caster, target)) return false;
+  if (isInProtectedZone(caster) || isInProtectedZone(target)) return false;
+  if (isSpawnProtected(target)) return false;
+  return true;
+}
+
+function forEachAbilityTargetPlayer(caster, fn) {
+  players.forEach((other) => {
+    if (!canAbilityHitPlayer(caster, other)) return;
+    fn(other);
+  });
+}
+
+function forEachAbilityAlly(caster, fn) {
+  players.forEach((other) => {
+    if (!other.authenticated || !other.alive) return;
+    if (!sameShard(caster, other)) return;
+    fn(other);
+  });
+}
+
+function damageEnemiesInRadius(player, x, z, radius, damage, options = {}) {
+  const enemies = activeEnemiesFor(player);
+  if (!enemies) return 0;
+
+  let hits = 0;
+  for (const enemy of Array.from(enemies.values())) {
+    if (!enemy.alive) continue;
+    if (!abilities.withinRadius(enemy.position, x, z, radius)) continue;
+
+    applyEnemyDamage(player, enemy, damage, options);
+    hits += 1;
+  }
+  return hits;
+}
+
+function damagePlayersInRadius(caster, x, z, radius, damage, damageClass, options = {}) {
+  let hits = 0;
+  forEachAbilityTargetPlayer(caster, (target) => {
+    if (!abilities.withinRadius(target.position, x, z, radius)) return;
+
+    const scaled = progression.scalePvpDamage(damage, damageClass, target.maxHealth);
+    if (scaled < 1) return;
+
+    applyPlayerDamage(target, scaled, {
+      attacker: caster,
+      attackerId: caster.id,
+      abilityId: options.abilityId || null,
+      point: target.position,
+    });
+    hits += 1;
+  });
+  return hits;
+}
+
+function applyEnemyEffectsInRadius(player, x, z, radius, effect) {
+  const enemies = activeEnemiesFor(player);
+  if (!enemies) return;
+
+  for (const enemy of enemies.values()) {
+    if (!enemy.alive) continue;
+    if (!abilities.withinRadius(enemy.position, x, z, radius)) continue;
+    abilities.addEffect(enemy, { ...effect });
+  }
+}
+
+const RICOCHET_RANGE = 14;
+
+function shotPassiveDamage(player, shot, targetKind) {
+  const base = targetKind === 'enemy' ? player.combat.enemyDamage : player.combat.pvpDamage;
+  return base * shot.damageMult * allyDamageBonus(player);
+}
+
+function applyBulletDamage(player, target, damage, options = {}) {
+  const shielded = abilities.shieldRemaining(target.ability, Date.now()) > 0;
+  const scaled = shielded ? damage : damage * (1 + player.combat.damageVsUnshielded);
+
+  return applyPlayerDamage(target, scaled, {
+    ...options,
+    attacker: player,
+    attackerId: player.id,
+    penetration: player.combat.armorPen,
+  });
+}
+
+function advanceExplosiveRound(player) {
+  if (player.combat.explosiveEveryNthShot <= 0) return false;
+
+  player.explosiveShotCount = (player.explosiveShotCount || 0) + 1;
+  if (player.explosiveShotCount < player.combat.explosiveEveryNthShot) return false;
+
+  player.explosiveShotCount = 0;
+  return true;
+}
+
+function detonateExplosiveShot(player, shot, point) {
+  const radius = player.combat.explosiveRadius;
+  if (radius <= 0 || player.combat.explosiveDamage <= 0) return;
+
+  broadcastToLocation(player.locationId, {
+    type: 'abilityEffect',
+    casterId: player.id,
+    abilityId: 'explosive_rounds',
+    kind: 'impact',
+    position: point,
+    radius,
+  }, null, player.instance);
+
+  damageEnemiesInRadius(
+    player,
+    point[0],
+    point[2],
+    radius,
+    shotPassiveDamage(player, shot, 'enemy') * player.combat.explosiveDamage,
+    { abilityId: 'explosive_rounds', point }
+  );
+
+  const pvpDamage = shotPassiveDamage(player, shot, 'player') * player.combat.explosiveDamage;
+  forEachAbilityTargetPlayer(player, (target) => {
+    if (!abilities.withinRadius(target.position, point[0], point[2], radius)) return;
+
+    applyBulletDamage(player, target, pvpDamage, {
+      abilityId: 'explosive_rounds',
+      point: target.position,
+    });
+  });
+}
+
+function ricochetTarget(player, from, excludeId) {
+  let best = null;
+  let bestDistance = RICOCHET_RANGE;
+
+  const enemies = activeEnemiesFor(player);
+  if (enemies) {
+    for (const enemy of enemies.values()) {
+      if (!enemy.alive || enemy.id === excludeId) continue;
+
+      const distance = abilities.distance2D(from, enemy.position);
+      if (distance >= bestDistance) continue;
+
+      best = { kind: 'enemy', entity: enemy };
+      bestDistance = distance;
+    }
+  }
+
+  forEachAbilityTargetPlayer(player, (other) => {
+    if (other.id === excludeId) return;
+
+    const distance = abilities.distance2D(from, other.position);
+    if (distance >= bestDistance) return;
+
+    best = { kind: 'player', entity: other };
+    bestDistance = distance;
+  });
+
+  return best;
+}
+
+function applyRicochet(player, shot, from, excludeId) {
+  if (player.combat.ricochetChance <= 0 || player.combat.ricochetDamage <= 0) return;
+  if (Math.random() >= player.combat.ricochetChance) return;
+
+  const target = ricochetTarget(player, from, excludeId);
+  if (!target) return;
+
+  const damage = shotPassiveDamage(player, shot, target.kind) * player.combat.ricochetDamage;
+
+  if (target.kind === 'enemy') {
+    applyEnemyDamage(player, target.entity, damage, {
+      abilityId: 'ricochet',
+      point: target.entity.position,
+    });
+  } else {
+    applyBulletDamage(player, target.entity, damage, {
+      abilityId: 'ricochet',
+      point: target.entity.position,
+    });
+  }
+
+  broadcastToLocation(player.locationId, {
+    type: 'abilityEffect',
+    casterId: player.id,
+    abilityId: 'ricochet',
+    kind: 'chain',
+    position: target.entity.position,
+    radius: 0,
+    chain: [from, target.entity.position],
+  }, null, player.instance);
+}
+
+function applyBoltBurn(player, shot, hit, now) {
+  if (shot.mode !== 'charged') return;
+  if (player.combat.burnDamage <= 0 || player.combat.burnDurationMs <= 0) return;
+
+  const perSecond = player.combat.burnDamage / (player.combat.burnDurationMs / 1000);
+
+  abilities.addEffect(hit.entity, {
+    id: 'burning',
+    expiresAt: now + player.combat.burnDurationMs,
+    damagePerSecond: hit.kind === 'enemy'
+      ? perSecond
+      : progression.scalePvpDamage(perSecond, 'zoneTick', hit.entity.maxHealth),
+    casterId: player.id,
+  });
+}
+
+function applyShotPassives(player, shot, hit, point) {
+  if (shot.explosive) detonateExplosiveShot(player, shot, point);
+  if (hit.entity.alive) applyBoltBurn(player, shot, hit, Date.now());
+  applyRicochet(player, shot, point, hit.entity.id);
+}
+
+function pickAimTarget(player, origin, direction, maxRange) {
+  let best = null;
+
+  const consider = (kind, entity, position) => {
+    const dx = position[0] - origin[0];
+    const dy = position[1] + 1 - origin[1];
+    const dz = position[2] - origin[2];
+
+    const along = dx * direction[0] + dy * direction[1] + dz * direction[2];
+    if (along < 0 || along > maxRange) return;
+
+    const offX = dx - direction[0] * along;
+    const offY = dy - direction[1] * along;
+    const offZ = dz - direction[2] * along;
+    if (Math.hypot(offX, offY, offZ) > 2.5) return;
+
+    if (!best || along < best.along) best = { kind, entity, along };
+  };
+
+  const enemies = activeEnemiesFor(player);
+  if (enemies) {
+    for (const enemy of enemies.values()) {
+      if (enemy.alive) consider('enemy', enemy, enemy.position);
+    }
+  }
+
+  forEachAbilityTargetPlayer(player, (other) => consider('player', other, other.position));
+
+  return best;
+}
+
+function spawnAbilityZone(player, abilityId, config, silent = false) {
+  const now = Date.now();
+  const zone = {
+    id: abilityEntityId('zone'),
+    casterId: player.id,
+    abilityId,
+    locationId: player.locationId,
+    instance: player.instance,
+    x: config.x,
+    y: config.y || 0,
+    z: config.z,
+    radius: config.radius,
+    expiresAt: now + config.durationMs,
+    nextTickAt: now,
+    silent,
+    damagePerSecond: config.damagePerSecond || 0,
+    damageClass: config.damageClass || 'zoneTick',
+    healPerSecond: config.healPerSecond || 0,
+    enemySlowPercent: config.enemySlowPercent || 0,
+    allySpeedPercent: config.allySpeedPercent || 0,
+    enemyDamagePercent: config.enemyDamagePercent || 0,
+    allyDamagePercent: config.allyDamagePercent || 0,
+    pullStrength: config.pullStrength || 0,
+    hostile: config.hostile !== false,
+  };
+
+  abilityZones.set(zone.id, zone);
+  if (silent) return zone;
+
+  broadcastToLocation(player.locationId, zoneAnnouncement(zone, config.durationMs), null, player.instance);
+
+  return zone;
+}
+
+function zoneAnnouncement(zone, durationMs) {
+  return {
+    type: 'abilityZone',
+    zoneId: zone.id,
+    casterId: zone.casterId,
+    abilityId: zone.abilityId,
+    position: [zone.x, zone.y, zone.z],
+    radius: zone.radius,
+    durationMs,
+    slowPercent: zone.hostile ? zone.enemySlowPercent : 0,
+  };
+}
+
+function sendActiveZones(player) {
+  const now = Date.now();
+
+  for (const zone of abilityZones.values()) {
+    if (zone.silent || zone.expiresAt <= now) continue;
+    if (zone.locationId !== player.locationId) continue;
+    if (isShardedLocation(zone.locationId) && zone.instance !== player.instance) continue;
+
+    safeSend(player.ws, zoneAnnouncement(zone, zone.expiresAt - now));
+  }
+}
+
+function scheduleAbilityImpact(player, abilityId, config) {
+  const impact = {
+    casterId: player.id,
+    abilityId,
+    locationId: player.locationId,
+    instance: player.instance,
+    x: config.x,
+    y: config.y || 0,
+    z: config.z,
+    radius: config.radius,
+    damage: config.damage,
+    damageClass: config.damageClass || 'singleHit',
+    resolveAt: config.resolveAt,
+    knockback: config.knockback || 0,
+    stunMs: config.stunMs || 0,
+    groundFire: config.groundFire || null,
+    cluster: config.cluster || null,
+    bleed: config.bleed || null,
+  };
+
+  const now = Date.now();
+  if (impact.resolveAt > now) {
+    abilityImpacts.push(impact);
+    broadcastToLocation(player.locationId, {
+      type: 'abilityImpactPending',
+      casterId: player.id,
+      abilityId,
+      position: [impact.x, impact.y, impact.z],
+      radius: impact.radius,
+      resolveInMs: impact.resolveAt - now,
+    }, null, player.instance);
+    return;
+  }
+
+  resolveAbilityImpact(impact, now);
+}
+
+function resolveAbilityImpact(impact, now) {
+  const caster = players.get(impact.casterId);
+  if (!caster || !caster.authenticated) return;
+  if (caster.locationId !== impact.locationId) return;
+
+  broadcastToLocation(impact.locationId, {
+    type: 'abilityEffect',
+    casterId: caster.id,
+    abilityId: impact.abilityId,
+    kind: 'impact',
+    position: [impact.x, impact.y, impact.z],
+    radius: impact.radius,
+  }, null, impact.instance);
+
+  damageEnemiesInRadius(caster, impact.x, impact.z, impact.radius, impact.damage, {
+    abilityId: impact.abilityId,
+    point: [impact.x, impact.y, impact.z],
+  });
+  damagePlayersInRadius(caster, impact.x, impact.z, impact.radius, impact.damage, impact.damageClass, {
+    abilityId: impact.abilityId,
+  });
+
+  if (impact.knockback > 0 || impact.stunMs > 0) {
+    const enemies = activeEnemiesFor(caster);
+    if (enemies) {
+      for (const enemy of enemies.values()) {
+        if (!enemy.alive) continue;
+        if (!abilities.withinRadius(enemy.position, impact.x, impact.z, impact.radius)) continue;
+
+        if (impact.knockback > 0) pushEnemyAway(enemy, impact.x, impact.z, impact.knockback);
+        if (impact.stunMs > 0) {
+          abilities.addEffect(enemy, { id: 'stunned', expiresAt: now + impact.stunMs });
+        }
+      }
+    }
+  }
+
+  if (impact.bleed && impact.bleed.damage > 0) {
+    applyEnemyEffectsInRadius(caster, impact.x, impact.z, impact.radius, {
+      id: 'bleeding',
+      expiresAt: now + impact.bleed.durationMs,
+      damagePerSecond: impact.bleed.damage / (impact.bleed.durationMs / 1000),
+      casterId: caster.id,
+    });
+  }
+
+  if (impact.groundFire) {
+    spawnAbilityZone(caster, impact.abilityId, {
+      x: impact.x,
+      y: impact.y,
+      z: impact.z,
+      radius: impact.radius,
+      durationMs: impact.groundFire.durationMs,
+      damagePerSecond: impact.groundFire.damagePerSecond,
+      damageClass: 'zoneTick',
+    });
+  }
+
+  if (impact.cluster && impact.cluster.count > 0) {
+    for (let i = 0; i < impact.cluster.count; i++) {
+      const angle = (Math.PI * 2 * i) / impact.cluster.count;
+      const spread = impact.radius * 0.7;
+      scheduleAbilityImpact(caster, impact.abilityId, {
+        x: impact.x + Math.cos(angle) * spread,
+        y: impact.y,
+        z: impact.z + Math.sin(angle) * spread,
+        radius: impact.radius * 0.6,
+        damage: impact.cluster.damage,
+        damageClass: impact.damageClass,
+        resolveAt: now + 500,
+      });
+    }
+  }
+}
+
+function pushEnemyAway(enemy, x, z, distance) {
+  const dx = enemy.position[0] - x;
+  const dz = enemy.position[2] - z;
+  const length = Math.hypot(dx, dz) || 1;
+
+  enemy.position[0] += (dx / length) * distance;
+  enemy.position[2] += (dz / length) * distance;
+}
+
+function pullEnemyToward(enemy, x, z, distance) {
+  const dx = x - enemy.position[0];
+  const dz = z - enemy.position[2];
+  const length = Math.hypot(dx, dz);
+  if (length < 0.4) return;
+
+  const step = Math.min(distance, length);
+  enemy.position[0] += (dx / length) * step;
+  enemy.position[2] += (dz / length) * step;
+}
+
+function tickAbilityZone(zone, now, deltaSeconds) {
+  const caster = players.get(zone.casterId);
+  if (!caster || !caster.authenticated) return false;
+
+  const enemies = activeEnemiesFor(caster);
+  const lapse = ABILITY_TICK_MS * 2;
+
+  if (enemies && caster.locationId === zone.locationId) {
+    for (const enemy of Array.from(enemies.values())) {
+      if (!enemy.alive) continue;
+      if (!abilities.withinRadius(enemy.position, zone.x, zone.z, zone.radius)) continue;
+
+      if (zone.enemySlowPercent > 0) {
+        abilities.addEffect(enemy, {
+          id: `zone_slow_${zone.id}`,
+          expiresAt: now + lapse,
+          slowPercent: zone.enemySlowPercent,
+        });
+      }
+
+      if (zone.enemyDamagePercent !== 0) {
+        abilities.addEffect(enemy, {
+          id: `zone_suppress_${zone.id}`,
+          expiresAt: now + lapse,
+          damageOutputPercent: zone.enemyDamagePercent,
+        });
+      }
+
+      if (zone.pullStrength > 0) pullEnemyToward(enemy, zone.x, zone.z, zone.pullStrength * deltaSeconds);
+
+      if (zone.damagePerSecond > 0) {
+        applyEnemyDamage(caster, enemy, zone.damagePerSecond * deltaSeconds, {
+          abilityId: zone.abilityId,
+          point: enemy.position,
+          keepTarget: false,
+        });
+      }
+    }
+  }
+
+  if (zone.hostile && zone.damagePerSecond > 0) {
+    damagePlayersInRadius(
+      caster,
+      zone.x,
+      zone.z,
+      zone.radius,
+      zone.damagePerSecond * deltaSeconds,
+      zone.damageClass,
+      { abilityId: zone.abilityId }
+    );
+  }
+
+  if (zone.hostile && zone.enemySlowPercent > 0) {
+    forEachAbilityTargetPlayer(caster, (target) => {
+      if (!abilities.withinRadius(target.position, zone.x, zone.z, zone.radius)) return;
+      abilities.addEffect(target, {
+        id: `zone_slow_${zone.id}`,
+        expiresAt: now + lapse,
+        slowPercent: zone.enemySlowPercent,
+      });
+    });
+  }
+
+  if (zone.healPerSecond > 0 || zone.allySpeedPercent > 0) {
+    forEachAbilityAlly(caster, (ally) => {
+      if (!zoneCoversPlayer(zone, ally)) return;
+
+      if (zone.allySpeedPercent > 0) {
+        abilities.addEffect(ally, {
+          id: `zone_haste_${zone.id}`,
+          expiresAt: now + lapse,
+          speedPercent: zone.allySpeedPercent,
+        });
+      }
+
+      if (zone.healPerSecond > 0) healPlayer(ally, zone.healPerSecond * deltaSeconds);
+    });
+  }
+
+  return true;
+}
+
+function healPlayer(player, amount) {
+  if (!player.alive) return;
+
+  const healed = Math.min(player.maxHealth, player.health + amount);
+  if (Math.floor(healed) === Math.floor(player.health)) {
+    player.health = healed;
+    return;
+  }
+
+  player.health = healed;
+  safeSend(player.ws, { type: 'playerHealed', health: Math.floor(player.health), maxHealth: player.maxHealth });
+}
+
+function tickPlayerEffects(player, now, deltaSeconds) {
+  const regen = abilities.findEffect(player, 'post_shield_regen', now);
+  if (regen) healPlayer(player, regen.healPerSecond * deltaSeconds);
+
+  for (const effect of player.effects || []) {
+    if (effect.expiresAt <= now) continue;
+    if (typeof effect.damagePerSecond === 'number' && effect.damagePerSecond > 0) {
+      applyPlayerDamage(player, effect.damagePerSecond * deltaSeconds, {
+        attackerId: effect.casterId || null,
+        abilityId: effect.id,
+        ignoreShield: true,
+        broadcast: false,
+      });
+    }
+  }
+}
+
+function tickEnemyDots(now, deltaSeconds) {
+  players.forEach((player) => {
+    if (!player.authenticated) return;
+
+    const enemies = activeEnemiesFor(player);
+    if (!enemies) return;
+
+    for (const enemy of Array.from(enemies.values())) {
+      if (!enemy.alive) continue;
+
+      abilities.pruneEffects(enemy, now);
+      if (!enemy.effects || enemy.effects.length === 0) continue;
+
+      for (const effect of enemy.effects) {
+        if (effect.expiresAt <= now) continue;
+        if (typeof effect.damagePerSecond !== 'number' || effect.damagePerSecond <= 0) continue;
+        if (effect.casterId && effect.casterId !== player.id) continue;
+
+        applyEnemyDamage(player, enemy, effect.damagePerSecond * deltaSeconds, {
+          abilityId: effect.id,
+          point: enemy.position,
+          keepTarget: false,
+        });
+      }
+    }
+  });
+}
+
+function abilityTick() {
+  const now = Date.now();
+  const deltaSeconds = ABILITY_TICK_MS / 1000;
+
+  players.forEach((player) => {
+    if (!player.authenticated || !player.combat) return;
+
+    abilities.regenEnergy(player.ability, player.combat, now);
+    abilities.tickCharges(player.ability, player.combat.stats, now);
+    abilities.pruneEffects(player, now);
+
+    if (player.ability.shield > 0 && player.ability.shieldExpiresAt <= now) {
+      abilities.breakShield(player.ability);
+      startPostShieldRegen(player, now);
+      sendAbilityMeter(player);
+    }
+
+    syncShieldVisibility(player, now);
+
+    if (player.alive) tickPlayerEffects(player, now, deltaSeconds);
+  });
+
+  tickEnemyDots(now, deltaSeconds);
+
+  for (const [zoneId, zone] of abilityZones) {
+    if (now >= zone.expiresAt) {
+      abilityZones.delete(zoneId);
+      broadcastToLocation(zone.locationId, { type: 'abilityZoneEnded', zoneId }, null, zone.instance);
+      continue;
+    }
+
+    if (!tickAbilityZone(zone, now, deltaSeconds)) {
+      abilityZones.delete(zoneId);
+      broadcastToLocation(zone.locationId, { type: 'abilityZoneEnded', zoneId }, null, zone.instance);
+    }
+  }
+
+  for (let i = abilityImpacts.length - 1; i >= 0; i--) {
+    if (now < abilityImpacts[i].resolveAt) continue;
+    const [impact] = abilityImpacts.splice(i, 1);
+    resolveAbilityImpact(impact, now);
+  }
+}
+
+safeInterval(abilityTick, ABILITY_TICK_MS);
+
+function clearPlayerAbilityWorld(playerId) {
+  for (const [zoneId, zone] of abilityZones) {
+    if (zone.casterId !== playerId) continue;
+    abilityZones.delete(zoneId);
+    broadcastToLocation(zone.locationId, { type: 'abilityZoneEnded', zoneId }, null, zone.instance);
+  }
+
+  for (let i = abilityImpacts.length - 1; i >= 0; i--) {
+    if (abilityImpacts[i].casterId === playerId) abilityImpacts.splice(i, 1);
+  }
+}
+
+function resetPlayerAbilities(player) {
+  abilities.resetAbilityState(player.ability, player.combat.maxEnergy);
+  abilities.clearEffects(player);
+  clearPlayerAbilityWorld(player.id);
+}
+
+function clearPlayerAbilityBuffs(player, restoreEnergy) {
+  if (!player.ability) return;
+
+  abilities.clearEffects(player);
+  abilities.breakShield(player.ability);
+  player.ability.iframesUntil = 0;
+  if (restoreEnergy) player.ability.energy = player.combat.maxEnergy;
+  clearPlayerAbilityWorld(player.id);
+}
+
+function abilityFireRateMult(player, now) {
+  let mult = 1;
+
+  const overdrive = abilities.findEffect(player, 'overdrive', now);
+  if (overdrive) mult *= overdrive.fireRateMult;
+
+  const haste = abilities.findEffect(player, 'marked_ally_haste', now);
+  if (haste) mult *= 1 / (1 + haste.fireRatePercent / 100);
+
+  return Math.max(0.4, mult);
+}
+
+function abilityMoveSpeedMult(player, now) {
+  return Math.max(1, abilities.speedMultFromEffects(player, now));
+}
+
+function fireModeFor(player) {
+  const modeId = player.progression.fireMode || 'single';
+  if (modeId === 'single') return progression.SINGLE_FIRE_MODE;
+  if (!skills.hasMode(player.progression.skills, modeId)) return progression.SINGLE_FIRE_MODE;
+  if (skills.modeBranch(modeId) !== player.progression.branch) return progression.SINGLE_FIRE_MODE;
+
+  return skills.modeDefinition(modeId) || progression.SINGLE_FIRE_MODE;
+}
+
+function shotProjectileCount(mode) {
+  return Math.max(1, Math.floor(mode.projectiles || 1));
+}
+
+function shotIntervalFor(player, weapon, mode, now) {
+  const base = mode.fireRateMs || weapon.fireRateMs;
+  const interval = mode.chargeMs ? Math.max(base, mode.chargeMs) : base;
+
+  return interval * abilityFireRateMult(player, now);
+}
+
+function boltEnergyCost(player, weapon, mode) {
+  const raw = weapon.boltEnergyCost * (mode.manaCostMult || 1) * player.combat.manaCostMult;
+  return Math.max(0, Math.round(raw));
+}
+
+function boltSpeedFor(player, weapon) {
+  return weapon.projectileSpeed * player.combat.projectileSpeedMult;
+}
+
+function shotLifetimeMs(shot) {
+  if (!shot.speed) return CONFIG.combat.shotMatchWindowMs;
+  return CONFIG.combat.shotMatchWindowMs + (shot.maxRange / shot.speed) * 1000;
+}
+
+function alongRay(origin, direction, point) {
+  return (point[0] - origin[0]) * direction[0]
+    + (point[1] - origin[1]) * direction[1]
+    + (point[2] - origin[2]) * direction[2];
+}
+
+function projectileTimingPlausible(shot, point, age) {
+  const travel = Math.max(0, alongRay(shot.origin, shot.direction, point));
+  const expected = (travel / shot.speed) * 1000;
+  return Math.abs(age - expected) <= CONFIG.combat.shotMatchWindowMs;
+}
+
+function readShotDirections(data, limit, spreadDegrees) {
+  const raw = Array.isArray(data.directions) && data.directions.length > 0
+    ? data.directions
+    : [data.direction];
+
+  if (raw.length > limit) return null;
+
+  const normalized = [];
+  for (const entry of raw) {
+    if (!Array.isArray(entry) || entry.length !== 3) return null;
+    if (!entry.every(Number.isFinite)) return null;
+
+    const direction = abilities.normalizeDirection(entry);
+    if (!direction) return null;
+    normalized.push(direction);
+  }
+
+  if (normalized.length > 1) {
+    const maxAngle = Math.cos(((spreadDegrees + SHOT_SPREAD_TOLERANCE_DEG) * Math.PI) / 180);
+    const [first] = normalized;
+
+    for (let i = 1; i < normalized.length; i++) {
+      const dot = first[0] * normalized[i][0] + first[1] * normalized[i][1] + first[2] * normalized[i][2];
+      if (dot < maxAngle) return null;
+    }
+  }
+
+  return normalized;
+}
+
+function grantDashGrace(player, now) {
+  player.abilityMoveGraceUntil = now + 700;
+  player.positionHistory = [];
+}
+
+function dashPlayer(player, direction, distance, now) {
+  const flat = Math.hypot(direction[0], direction[2]);
+  if (flat < 0.001) return null;
+
+  const target = [
+    player.position[0] + (direction[0] / flat) * distance,
+    player.position[1],
+    player.position[2] + (direction[2] / flat) * distance,
+  ];
+
+  const maxRadius = getLocationMaxRadius(player.locationId);
+  if (maxRadius != null) {
+    const reach = Math.hypot(target[0], target[2]);
+    if (reach > maxRadius - 1) {
+      const scale = (maxRadius - 1) / reach;
+      target[0] *= scale;
+      target[2] *= scale;
+    }
+  }
+
+  player.position = target;
+  grantDashGrace(player, now);
+
+  if (player.combat.postDashSpeed !== 0 || player.combat.postDashDamageTaken !== 0) {
+    abilities.addEffect(player, {
+      id: 'post_dash',
+      expiresAt: now + 2000,
+      speedPercent: player.combat.postDashSpeed * 100,
+      damageTakenPercent: player.combat.postDashDamageTaken * 100,
+    });
+  }
+
+  return target;
+}
+
+function abilityScaledDamage(player, abilityId, base, now) {
+  return base * abilities.damageMultiplier(abilityId, player.combat.stats, player, now);
+}
+
+function abilityScaledRadius(player, abilityId, base) {
+  return base * abilities.radiusMultiplier(abilityId, player.combat.stats);
+}
+
+function abilityScaledDuration(player, abilityId, base) {
+  return Math.round(base * abilities.durationMultiplier(abilityId, player.combat.stats));
+}
+
+function zoneBaseConfig(player, abilityId, point, params, durationMs) {
+  return {
+    x: point[0],
+    y: point[1],
+    z: point[2],
+    radius: abilityScaledRadius(player, abilityId, params.radius),
+    durationMs: abilityScaledDuration(player, abilityId, durationMs),
+    damagePerSecond: abilities.zoneTickBonus(player.combat.stats),
+    allyDamagePercent: player.combat.allyDamageInZone * 100,
+  };
+}
+
+function bleedConfig(player) {
+  if (player.combat.bleedDamage <= 0 || player.combat.bleedDurationMs <= 0) return null;
+  return { damage: player.combat.bleedDamage, durationMs: player.combat.bleedDurationMs };
+}
+
+function clusterConfig(player, damage) {
+  if (player.combat.clusterCount <= 0) return null;
+  return {
+    count: player.combat.clusterCount,
+    damage: damage * player.combat.clusterDamage,
+  };
+}
+
+function isControlImmune(carrier, now) {
+  const bulwark = abilities.findEffect(carrier, 'bulwark', now);
+  return !!bulwark && !!bulwark.ccImmune;
+}
+
+function controlAimTarget(player, target, effect, durationMs, now) {
+  const slowPercent = effect.slowPercent || 0;
+  const immune = slowPercent > 0 && target.kind === 'player' && isControlImmune(target.entity, now);
+
+  markAimTarget(target, immune ? { ...effect, slowPercent: 0 } : effect);
+  if (immune || slowPercent <= 0 || target.kind !== 'player') return;
+
+  safeSend(target.entity.ws, {
+    type: 'playerControl',
+    casterId: player.id,
+    abilityId: effect.id,
+    slowPercent,
+    durationMs,
+  });
+}
+
+function damageAimTarget(player, target, damage, damageClass, abilityId) {
+  if (target.kind === 'enemy') {
+    applyEnemyDamage(player, target.entity, damage, { abilityId, point: target.entity.position });
+    return;
+  }
+
+  const scaled = progression.scalePvpDamage(damage, damageClass, target.entity.maxHealth);
+  if (scaled < 1) return;
+
+  applyPlayerDamage(target.entity, scaled, {
+    attacker: player,
+    attackerId: player.id,
+    abilityId,
+    point: target.entity.position,
+  });
+}
+
+function markAimTarget(target, effect) {
+  abilities.addEffect(target.entity, effect);
+}
+
+function chainLightningTargets(player, first, params, now) {
+  const visited = new Set([first.entity.id]);
+  const chain = [first];
+
+  const candidates = [];
+  const enemies = activeEnemiesFor(player);
+  if (enemies) {
+    for (const enemy of enemies.values()) {
+      if (enemy.alive) candidates.push({ kind: 'enemy', entity: enemy });
+    }
+  }
+  forEachAbilityTargetPlayer(player, (other) => candidates.push({ kind: 'player', entity: other }));
+
+  let current = first;
+  for (let jump = 0; jump < params.jumps; jump++) {
+    let next = null;
+    let nextDistance = Infinity;
+
+    for (const candidate of candidates) {
+      if (visited.has(candidate.entity.id)) continue;
+
+      const distance = abilities.distance2D(current.entity.position, candidate.entity.position);
+      if (distance > params.jumpRange || distance >= nextDistance) continue;
+
+      next = candidate;
+      nextDistance = distance;
+    }
+
+    if (!next) break;
+
+    visited.add(next.entity.id);
+    chain.push(next);
+    current = next;
+  }
+
+  return chain;
+}
+
+function executeAbility(player, abilityId, definition, origin, direction, now) {
+  const params = definition.params || {};
+  const stats = player.combat.stats;
+  const groundPoint = () => abilities.groundPointFromAim(origin, direction, player.position[1], abilities.MAX_GROUND_RANGE);
+
+  switch (abilityId) {
+    case 'overdrive': {
+      abilities.addEffect(player, {
+        id: 'overdrive',
+        expiresAt: now + definition.durationMs,
+        noReload: !!params.noReload,
+        fireRateMult: params.fireRateMult,
+      });
+      return { kind: 'self' };
+    }
+
+    case 'bulwark': {
+      abilities.addEffect(player, {
+        id: 'bulwark',
+        expiresAt: now + definition.durationMs,
+        damageTakenMult: params.damageTakenMult,
+        ccImmune: !!params.ccImmune,
+      });
+      return { kind: 'self' };
+    }
+
+    case 'ascendance': {
+      abilities.addEffect(player, {
+        id: 'ascendance',
+        expiresAt: now + definition.durationMs,
+        spellDamagePercent: params.spellDamagePercent,
+      });
+      return { kind: 'self' };
+    }
+
+    case 'phase_step': {
+      abilities.addEffect(player, {
+        id: 'phase_step',
+        expiresAt: now + definition.durationMs,
+      });
+      return { kind: 'self' };
+    }
+
+    case 'reflect_ward': {
+      abilities.addEffect(player, {
+        id: 'reflect_ward',
+        expiresAt: now + definition.durationMs,
+        reflectPercent: params.reflectPercent,
+        damageClass: params.damageClass,
+      });
+      return { kind: 'self' };
+    }
+
+    case 'kinetic_barrier':
+    case 'mana_shield': {
+      abilities.grantShield(
+        player.ability,
+        params.shield + player.combat.shieldStrength,
+        definition.durationMs,
+        params.manaPerDamage || 0,
+        now
+      );
+      sendAbilityMeter(player);
+      return { kind: 'shield' };
+    }
+
+    case 'combat_roll':
+    case 'blink': {
+      const landed = dashPlayer(player, direction, params.distance, now);
+      if (!landed) return null;
+
+      if (params.iframesMs) player.ability.iframesUntil = now + params.iframesMs;
+      if (abilityId === 'combat_roll' && player.combat.reloadWhileDashing) {
+        player.weaponAmmo = player.combat.magSize;
+      }
+
+      return { kind: 'dash', position: landed };
+    }
+
+    case 'shockwave': {
+      const radius = abilityScaledRadius(player, abilityId, params.radius);
+      scheduleAbilityImpact(player, abilityId, {
+        x: player.position[0],
+        y: player.position[1],
+        z: player.position[2],
+        radius,
+        damage: abilityScaledDamage(player, abilityId, params.damage, now),
+        damageClass: params.damageClass,
+        resolveAt: now,
+        knockback: params.knockback,
+        stunMs: params.stunMs,
+        bleed: bleedConfig(player),
+      });
+      return { kind: 'burst', position: player.position, radius };
+    }
+
+    case 'frag_grenade': {
+      const point = groundPoint();
+      const radius = abilityScaledRadius(player, abilityId, params.radius);
+      const damage = abilityScaledDamage(player, abilityId, params.damage, now);
+
+      scheduleAbilityImpact(player, abilityId, {
+        x: point[0],
+        y: point[1],
+        z: point[2],
+        radius,
+        damage,
+        damageClass: params.damageClass,
+        resolveAt: now + params.fuseMs,
+        bleed: bleedConfig(player),
+        cluster: clusterConfig(player, damage),
+      });
+      return { kind: 'projectile', position: point, radius };
+    }
+
+    case 'meteor': {
+      const point = groundPoint();
+      const radius = abilityScaledRadius(player, abilityId, params.radius);
+
+      scheduleAbilityImpact(player, abilityId, {
+        x: point[0],
+        y: point[1],
+        z: point[2],
+        radius,
+        damage: abilityScaledDamage(player, abilityId, params.damage, now),
+        damageClass: params.damageClass,
+        resolveAt: now + params.impactDelayMs,
+        groundFire: {
+          durationMs: abilityScaledDuration(player, abilityId, params.groundFireMs),
+          damagePerSecond: abilityScaledDamage(player, abilityId, params.groundFireTick, now)
+            + abilities.zoneTickBonus(stats),
+        },
+      });
+      return { kind: 'projectile', position: point, radius };
+    }
+
+    case 'barrage': {
+      const point = groundPoint();
+      const radius = abilityScaledRadius(player, abilityId, params.radius);
+      const damage = abilityScaledDamage(player, abilityId, params.damage, now);
+      const gap = definition.durationMs / params.salvos;
+
+      for (let salvo = 0; salvo < params.salvos; salvo++) {
+        const angle = Math.random() * Math.PI * 2;
+        const spread = radius * 0.4 * Math.random();
+        scheduleAbilityImpact(player, abilityId, {
+          x: point[0] + Math.cos(angle) * spread,
+          y: point[1],
+          z: point[2] + Math.sin(angle) * spread,
+          radius: radius * 0.7,
+          damage,
+          damageClass: params.damageClass,
+          resolveAt: now + gap * salvo,
+          bleed: bleedConfig(player),
+        });
+      }
+      return { kind: 'ground', position: point, radius };
+    }
+
+    case 'suppression_field': {
+      const point = groundPoint();
+      const zone = spawnAbilityZone(player, abilityId, {
+        ...zoneBaseConfig(player, abilityId, point, params, definition.durationMs),
+        enemySlowPercent: params.slowPercent,
+        enemyDamagePercent: params.enemyDamagePercent,
+      });
+      return { kind: 'ground', position: point, radius: zone.radius };
+    }
+
+    case 'slow_field': {
+      const point = groundPoint();
+      const zone = spawnAbilityZone(player, abilityId, {
+        ...zoneBaseConfig(player, abilityId, point, params, definition.durationMs),
+        enemySlowPercent: params.slowPercent,
+      });
+      return { kind: 'ground', position: point, radius: zone.radius };
+    }
+
+    case 'gravity_well': {
+      const point = groundPoint();
+      const zone = spawnAbilityZone(player, abilityId, {
+        ...zoneBaseConfig(player, abilityId, point, params, definition.durationMs),
+        pullStrength: params.pullStrength,
+      });
+      return { kind: 'ground', position: point, radius: zone.radius };
+    }
+
+    case 'time_dilation': {
+      const point = groundPoint();
+      const zone = spawnAbilityZone(player, abilityId, {
+        ...zoneBaseConfig(player, abilityId, point, params, definition.durationMs),
+        enemySlowPercent: params.enemySlowPercent,
+        allySpeedPercent: params.allySpeedPercent,
+      });
+      return { kind: 'ground', position: point, radius: zone.radius };
+    }
+
+    case 'cataclysm': {
+      const point = groundPoint();
+      const base = zoneBaseConfig(player, abilityId, point, params, definition.durationMs);
+      const zone = spawnAbilityZone(player, abilityId, {
+        ...base,
+        damagePerSecond: base.damagePerSecond + abilityScaledDamage(player, abilityId, params.damagePerSecond, now),
+        damageClass: params.damageClass,
+        enemySlowPercent: params.slowPercent,
+      });
+      return { kind: 'ground', position: point, radius: zone.radius };
+    }
+
+    case 'healing_rune': {
+      const point = groundPoint();
+      const base = zoneBaseConfig(player, abilityId, point, params, definition.durationMs);
+      const zone = spawnAbilityZone(player, abilityId, {
+        ...base,
+        damagePerSecond: 0,
+        healPerSecond: params.healPerSecond * abilities.healMultiplier(stats),
+        hostile: false,
+      });
+      return { kind: 'ground', position: point, radius: zone.radius };
+    }
+
+    case 'marked_target': {
+      const target = pickAimTarget(player, origin, direction, abilities.MAX_TARGET_RANGE);
+      if (!target) return null;
+
+      markAimTarget(target, {
+        id: 'marked',
+        expiresAt: now + definition.durationMs,
+        damageTakenPercent: params.damageTakenPercent,
+      });
+
+      if (player.combat.markedAllyFireRate > 0) {
+        forEachAbilityAlly(player, (ally) => {
+          abilities.addEffect(ally, {
+            id: 'marked_ally_haste',
+            expiresAt: now + definition.durationMs,
+            fireRatePercent: player.combat.markedAllyFireRate * 100,
+          });
+        });
+      }
+
+      return { kind: 'target', targetId: target.entity.id, position: target.entity.position };
+    }
+
+    case 'hex': {
+      const target = pickAimTarget(player, origin, direction, abilities.MAX_TARGET_RANGE);
+      if (!target) return null;
+
+      controlAimTarget(player, target, {
+        id: 'hexed',
+        expiresAt: now + definition.durationMs,
+        damageTakenPercent: params.damageTakenPercent,
+        slowPercent: params.slowPercent,
+      }, definition.durationMs, now);
+
+      return { kind: 'target', targetId: target.entity.id, position: target.entity.position };
+    }
+
+    case 'shatter_ward': {
+      const target = pickAimTarget(player, origin, direction, abilities.MAX_TARGET_RANGE);
+      if (!target) return null;
+
+      damageAimTarget(player, target, abilityScaledDamage(player, abilityId, params.damage, now), params.damageClass, abilityId);
+
+      if (params.shieldStrip && target.kind === 'player') {
+        abilities.breakShield(target.entity.ability);
+        sendAbilityMeter(target.entity);
+      }
+
+      markAimTarget(target, {
+        id: 'sundered',
+        expiresAt: now + params.armorStripMs,
+        damageTakenPercent: params.armorStripPercent,
+      });
+
+      return { kind: 'target', targetId: target.entity.id, position: target.entity.position };
+    }
+
+    case 'chain_lightning': {
+      const first = pickAimTarget(player, origin, direction, abilities.MAX_TARGET_RANGE);
+      if (!first) return null;
+
+      const chain = chainLightningTargets(player, first, params, now);
+      const base = abilityScaledDamage(player, abilityId, params.damage, now);
+
+      chain.forEach((link, index) => {
+        const falloff = Math.pow(1 - params.jumpFalloffPercent / 100, index);
+        damageAimTarget(player, link, base * falloff, params.damageClass, abilityId);
+      });
+
+      return {
+        kind: 'chain',
+        targetId: first.entity.id,
+        position: first.entity.position,
+        chain: chain.map((link) => link.entity.position),
+      };
+    }
+
+    default:
+      return null;
+  }
+}
+
+function memeLootMult(player, now) {
+  const bag = abilities.findEffect(player, 'bag_holder', now);
+  return bag ? 1 + (bag.lootPercent || 0) / 100 : 1;
+}
+
+function grantMemeMoveGrace(player, now, durationMs) {
+  player.abilityMoveGraceUntil = Math.max(player.abilityMoveGraceUntil || 0, now + durationMs + 400);
+  player.positionHistory = [];
+}
+
+function nearestEnemyTo(player, maxDistance) {
+  const enemies = activeEnemiesFor(player);
+  if (!enemies) return null;
+
+  let best = null;
+  let bestDistance = maxDistance;
+
+  for (const enemy of enemies.values()) {
+    if (!enemy.alive) continue;
+
+    const distance = abilities.distance2D(player.position, enemy.position);
+    if (distance > bestDistance) continue;
+
+    best = enemy;
+    bestDistance = distance;
+  }
+
+  return best;
+}
+
+function dropRugPullLoot(player, params) {
+  if (Math.random() > (params.minorLootChance || 0)) return;
+
+  const enemy = nearestEnemyTo(player, 18);
+  if (!enemy) return;
+
+  if (player.locationId === 'main-world') dropLoot(enemy.position, player.instance, 1, 1);
+  else if (player.locationId === 'tower-first-floor') dropCanyonLoot(player, enemy.position, 1, 1);
+}
+
+function executeMeme(player, meme, now) {
+  const params = meme.params || {};
+
+  switch (meme.id) {
+    case 'crab_walk': {
+      abilities.addEffect(player, {
+        id: 'crab_walk',
+        expiresAt: now + meme.durationMs,
+        speedPercent: ((params.moveSpeedMult || 1) - 1) * 100,
+      });
+      return { kind: 'self' };
+    }
+
+    case 'bag_holder': {
+      abilities.addEffect(player, {
+        id: 'bag_holder',
+        expiresAt: now + meme.durationMs,
+        lootPercent: ((params.lootMult || 1) - 1) * 100,
+      });
+      return { kind: 'self' };
+    }
+
+    case 'pump_it': {
+      abilities.addEffect(player, {
+        id: 'pump_it',
+        expiresAt: now + meme.durationMs,
+        jumpMult: params.jumpMult || 1,
+      });
+      return { kind: 'self' };
+    }
+
+    case 'shrimp_squeak':
+    case 'moon_launch': {
+      grantMemeMoveGrace(player, now, meme.durationMs);
+      return { kind: 'self' };
+    }
+
+    case 'rug_pull': {
+      grantMemeMoveGrace(player, now, meme.durationMs);
+      dropRugPullLoot(player, params);
+      return { kind: 'self' };
+    }
+
+    case 'whale_splash': {
+      const enemies = activeEnemiesFor(player);
+      if (enemies) {
+        for (const enemy of enemies.values()) {
+          if (!enemy.alive) continue;
+          if (!abilities.withinRadius(enemy.position, player.position[0], player.position[2], params.radius)) continue;
+          pushEnemyAway(enemy, player.position[0], player.position[2], params.knockback);
+        }
+      }
+      return { kind: 'burst', radius: params.radius };
+    }
+
+    case 'airdrop': {
+      spawnAbilityZone(player, meme.id, {
+        x: player.position[0],
+        y: player.position[1],
+        z: player.position[2],
+        radius: params.radius,
+        durationMs: meme.durationMs,
+        damagePerSecond: 0,
+        healPerSecond: (params.allyHeal || 0) / (meme.durationMs / 1000),
+        hostile: false,
+      }, true);
+      return { kind: 'zone', radius: params.radius };
+    }
+
+    case 'ink_dump':
+    case 'copium_cloud':
+      return { kind: 'zone', radius: params.radius };
+
+    default:
+      return null;
+  }
+}
+
+function handleMemeCast(player, data) {
+  if (typeof data.memeId !== 'string') return;
+
+  const now = Date.now();
+  const unlocked = progression.memeAbilityIdsForLevel(player.progression.level);
+  if (!unlocked.includes(data.memeId)) {
+    safeSend(player.ws, { type: 'memeResult', memeId: data.memeId, ok: false, reason: 'locked' });
+    return;
+  }
+
+  const meme = progression.memeAbilityById(data.memeId);
+  if (!meme) return;
+
+  if (abilities.memeReadyAt(player.ability, meme.id, now) > now) {
+    safeSend(player.ws, { type: 'memeResult', memeId: meme.id, ok: false, reason: 'cooldown' });
+    return;
+  }
+
+  if (!player.alive) {
+    safeSend(player.ws, { type: 'memeResult', memeId: meme.id, ok: false, reason: 'dead' });
+    return;
+  }
+
+  const result = executeMeme(player, meme, now);
+  if (!result) return;
+
+  const readyAt = abilities.startMemeCooldown(player.ability, meme.id, meme.cooldownMs, now);
+
+  safeSend(player.ws, {
+    type: 'memeResult',
+    memeId: meme.id,
+    ok: true,
+    readyAt,
+    durationMs: meme.durationMs,
+    cooldowns: abilities.memeCooldownPayload(player.ability, unlocked, now),
+  });
+
+  broadcastToLocation(player.locationId, {
+    type: 'memeEffect',
+    casterId: player.id,
+    memeId: meme.id,
+    kind: result.kind,
+    position: player.position,
+    radius: result.radius || 0,
+    durationMs: meme.durationMs,
+  }, player.id, player.instance);
+}
+
+function rejectAbility(player, abilityId, reason) {
+  safeSend(player.ws, { type: 'abilityResult', abilityId, ok: false, reason });
+}
+
+function handleAbilityCast(player, data) {
+  if (typeof data.abilityId !== 'string') return;
+  if (!player.alive) return rejectAbility(player, data.abilityId, 'dead');
+
+  const state = player.progression;
+  if (!skills.hasAbility(state.skills, data.abilityId)) return rejectAbility(player, data.abilityId, 'not_learned');
+  if (!ABILITY_SLOTS.some((slot) => state.loadout[slot] === data.abilityId)) {
+    return rejectAbility(player, data.abilityId, 'not_bound');
+  }
+
+  const definition = abilities.definitionFor(data.abilityId);
+  const meta = abilities.metaFor(data.abilityId);
+  if (!definition || !meta) return;
+
+  const now = Date.now();
+  const stats = player.combat.stats;
+
+  if (abilities.readyAtFor(player.ability, data.abilityId, stats, now) > now) {
+    return rejectAbility(player, data.abilityId, 'cooldown');
+  }
+
+  if (meta.offensive && isInProtectedZone(player)) {
+    return rejectAbility(player, data.abilityId, 'safe_zone');
+  }
+
+  const cost = abilities.energyCostFor(data.abilityId, definition, stats, player, now);
+  if (player.ability.energy < cost) return rejectAbility(player, data.abilityId, 'energy');
+
+  if (!abilities.isValidAim(data.aim)) return rejectAbility(player, data.abilityId, 'bad_aim');
+
+  const direction = abilities.normalizeDirection(data.aim.direction);
+  if (!direction) return rejectAbility(player, data.abilityId, 'bad_aim');
+
+  const origin = data.aim.origin;
+  if (abilities.distance2D(origin, player.position) > ABILITY_ORIGIN_TOLERANCE) {
+    console.log(`[!] Ability hack: ${player.id} cast ${data.abilityId} from off-body origin`);
+    return rejectAbility(player, data.abilityId, 'bad_aim');
+  }
+
+  if (meta.offensive) clearSpawnProtection(player);
+
+  const result = executeAbility(player, data.abilityId, definition, origin, direction, now);
+  if (!result) return rejectAbility(player, data.abilityId, 'no_target');
+
+  player.ability.energy = Math.max(0, player.ability.energy - cost);
+  player.ability.lastCastAt = now;
+  const readyAt = abilities.consumeCooldown(player.ability, data.abilityId, stats, now);
+
+  safeSend(player.ws, {
+    type: 'abilityResult',
+    abilityId: data.abilityId,
+    ok: true,
+    readyAt,
+    energy: Math.floor(player.ability.energy),
+    maxEnergy: player.combat.maxEnergy,
+    kind: result.kind,
+    position: result.position || player.position,
+    radius: result.radius || 0,
+    targetId: result.targetId || null,
+    chain: result.chain || null,
+    cooldowns: abilityCooldownPayload(player, now),
+  });
+
+  broadcast({
+    type: 'abilityEffect',
+    casterId: player.id,
+    abilityId: data.abilityId,
+    kind: result.kind,
+    position: result.position || player.position,
+    radius: result.radius || 0,
+    targetId: result.targetId || null,
+    chain: result.chain || null,
+  }, player.id, true, player);
 }
 
 function buildSavePayload(player) {
@@ -3616,6 +5659,7 @@ wss.on('connection', (ws) => {
     justSpawned: false,
     justTeleported: false,
     teleportSettleUntil: 0,
+    abilityMoveGraceUntil: 0,
     lastLocationChangeAt: 0,
     pendingLocationChange: null,
     invulnerableUntil: 0,
@@ -3649,8 +5693,11 @@ wss.on('connection', (ws) => {
     ash: 0,
     progression: createProgressionState(),
     combat: null,
+    ability: null,
+    effects: [],
     economyChangedAt: 0,
     placeables: {},
+    roomCanEdit: false,
     activeTradeId: null,
     quests: {},
     factions: [],
@@ -3754,11 +5801,13 @@ wss.on('connection', (ws) => {
           safeSend(ws, { type: 'error', message: 'Sell rate limit exceeded' });
           return;
         }
-      } else if (data.type === 'shopBuyItem' || data.type === 'signPlace' || data.type === 'signRemove' || data.type === 'signSetText' || data.type === 'signSetDrawingUrl' || data.type === 'itemPlace' || data.type === 'itemRemove' || data.type === 'itemSetText' || data.type === 'itemSetDrawingUrl') {
+      } else if (data.type === 'shopBuyItem' || data.type === 'signPlace' || data.type === 'signRemove' || data.type === 'signSetText' || data.type === 'signSetDrawingUrl') {
         if (!checkRateLimit(playerId, 'build', CONFIG.network.buildRateLimit)) {
           safeSend(ws, { type: 'error', message: 'Build rate limit exceeded' });
           return;
         }
+      } else if (data.type === 'roomBuildOp') {
+        if (!checkRateLimit(playerId, 'roomBuild', CONFIG.network.roomBuildRateLimit)) return;
       } else if (data.type === 'voiceOffer' || data.type === 'voiceAnswer' || data.type === 'voiceIceCandidate') {
         if (!checkRateLimit(playerId, 'voice', CONFIG.network.voiceRateLimit)) return;
       } else if (data.type === 'locationChange') {
@@ -3775,8 +5824,12 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'emote', CONFIG.network.emoteRateLimit)) return;
       } else if (data.type === 'questInteract' || data.type === 'questAccept' || data.type === 'questTurnIn' || data.type === 'npcVisit') {
         if (!checkRateLimit(playerId, 'quest', CONFIG.network.questRateLimit)) return;
-      } else if (data.type === 'branchSelect' || data.type === 'skillRespec' || data.type === 'skillLearn' || data.type === 'abilityBind') {
+      } else if (data.type === 'branchSelect' || data.type === 'skillRespec' || data.type === 'skillLearn' || data.type === 'abilityBind' || data.type === 'fireModeSet') {
         if (!checkRateLimit(playerId, 'progression', CONFIG.network.progressionRateLimit)) return;
+      } else if (data.type === 'abilityCast') {
+        if (!checkRateLimit(playerId, 'ability', CONFIG.network.abilityRateLimit)) return;
+      } else if (data.type === 'memeCast') {
+        if (!checkRateLimit(playerId, 'meme', CONFIG.network.memeRateLimit)) return;
       } else if (data.type === 'canyonWarp' || data.type === 'canyonMapRequest' || data.type === 'canyonEnterDungeon' || data.type === 'canyonReturnToHub' || data.type === 'canyonCrossThreshold') {
         if (!checkRateLimit(playerId, 'canyon', CONFIG.network.canyonRateLimit)) return;
       } else if (data.type === 'factionCreate' || data.type === 'factionJoin' || data.type === 'factionLeave' || data.type === 'factionList' || data.type === 'factionInfo' || data.type === 'factionTaskListRequest' || data.type === 'factionAcceptTask' || data.type === 'factionClaimCreator' || data.type === 'factionSetDisplayed' || data.type === 'factionMyListRequest') {
@@ -3848,10 +5901,7 @@ wss.on('connection', (ws) => {
         case 'signRemove': handleSignRemove(player, data); break;
         case 'signSetText': handleSignSetText(player, data); break;
         case 'signSetDrawingUrl': handleSignSetDrawingUrl(player, data); break;
-        case 'itemPlace': handlePlaceItem(player, data); break;
-        case 'itemRemove': handleItemRemove(player, data); break;
-        case 'itemSetText': handleItemSetText(player, data); break;
-        case 'itemSetDrawingUrl': handleItemSetDrawingUrl(player, data); break;
+        case 'roomBuildOp': handleRoomBuildOp(player, data); break;
         case 'voiceOffer': handleVoiceOffer(player, data); break;
         case 'voiceAnswer': handleVoiceAnswer(player, data); break;
         case 'voiceIceCandidate': handleVoiceIceCandidate(player, data); break;
@@ -3873,6 +5923,9 @@ wss.on('connection', (ws) => {
         case 'skillRespec': handleSkillRespec(player); break;
         case 'skillLearn': handleSkillLearn(player, data); break;
         case 'abilityBind': handleAbilityBind(player, data); break;
+        case 'abilityCast': handleAbilityCast(player, data); break;
+        case 'fireModeSet': handleFireModeSet(player, data); break;
+        case 'memeCast': handleMemeCast(player, data); break;
         case 'caveChestOpen': handleCaveChestOpen(player, data); break;
         case 'canyonWarp': handleCanyonWarp(player, data); break;
         case 'canyonMapRequest': handleCanyonMapRequest(player); break;
@@ -3940,6 +5993,7 @@ wss.on('connection', (ws) => {
     }
 
     removePlayerZone(player);
+    clearPlayerAbilityWorld(player.id);
 
     if (player.cave?.portalDoomed) {
       player.cave = null;
@@ -4092,8 +6146,9 @@ wss.on('connection', (ws) => {
         refreshCombatStats(player);
 
         if (savedProgression.loadout && typeof savedProgression.loadout === 'object') {
-          for (const [slot, abilityId] of Object.entries(savedProgression.loadout)) {
+          for (const [rawSlot, abilityId] of Object.entries(savedProgression.loadout)) {
             if (typeof abilityId !== 'string') continue;
+            const slot = LEGACY_ABILITY_SLOTS[rawSlot] || rawSlot;
             if (!ABILITY_SLOTS.includes(slot)) continue;
             if (!skills.hasAbility(state.skills, abilityId)) continue;
             state.loadout[slot] = abilityId;
@@ -4248,6 +6303,7 @@ wss.on('connection', (ws) => {
     safeSend(ws, { type: 'factionMyListResult', factions: player.factions });
     safeSend(ws, buildWorldStatusPayload());
     sendCosmeticState(player);
+    sendActiveZones(player);
 
     if (player.locationId === 'main-world') {
       safeSend(ws, { type: 'lootState', loot: serializeLoot(player.instance) });
@@ -4266,11 +6322,7 @@ wss.on('connection', (ws) => {
 
     sendShardState(player);
 
-    if (typeof player.locationId === 'string' && player.locationId.startsWith(FACTION_ROOM_PREFIX)) {
-      const joinRoomFactionId = player.locationId.slice(FACTION_ROOM_PREFIX.length);
-      await ensureFurnitureLoaded(joinRoomFactionId);
-      safeSend(ws, { type: 'furnitureState', items: serializeFurnitureForRoom(joinRoomFactionId) });
-    }
+    await refreshRoomEditRights(player);
 
     safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
     sendProgressionState(player);
@@ -4282,14 +6334,16 @@ wss.on('connection', (ws) => {
       });
     }
 
-    autoStartQuests(player);
-
+    let hasRunningQuest = false;
     for (const quest of QUEST_LIST) {
       const state = getQuestState(player, quest.id);
       if (state.status === 'active' || state.status === 'ready_to_turn_in') {
+        hasRunningQuest = true;
         safeSend(ws, buildQuestInfoPayload(player, quest));
       }
     }
+
+    if (!hasRunningQuest) sendOfferedQuests(player);
 
     broadcastCount();
   }
@@ -4366,12 +6420,28 @@ wss.on('connection', (ws) => {
     if (!player.alive) return;
     clearSpawnProtection(player);
 
-    if (!Array.isArray(data.origin) || !Array.isArray(data.direction)) return;
-    if (data.origin.length !== 3 || data.direction.length !== 3) return;
+    if (!Array.isArray(data.origin) || data.origin.length !== 3) return;
+    if (!data.origin.every(Number.isFinite)) return;
 
     const now = Date.now();
+    const weapon = weaponConfigFor(player);
+    const mode = fireModeFor(player);
+    const isStaff = player.combat.weapon === 'staff';
 
-    if (player.weaponAmmo <= 0) {
+    const directions = readShotDirections(data, shotProjectileCount(mode), mode.spreadDegrees || 0);
+    if (!directions) {
+      console.log(`[!] Shoot hack: ${playerId} sent an invalid projectile spread`);
+      return;
+    }
+
+    const overdrive = abilities.findEffect(player, 'overdrive', now);
+    const boltCost = isStaff ? boltEnergyCost(player, weapon, mode) : 0;
+
+    if (isStaff) {
+      if (player.ability.energy < boltCost) return;
+    } else if (overdrive && overdrive.noReload) {
+      player.weaponAmmo = player.combat.magSize;
+    } else if (player.weaponAmmo <= 0) {
       if (now - player.ammoEmptyAt >= player.combat.reloadMs) {
         player.weaponAmmo = player.combat.magSize;
       } else {
@@ -4379,14 +6449,14 @@ wss.on('connection', (ws) => {
       }
     }
 
-    if (now - player.lastShotAt < WEAPON_CONFIG.fireRateMs - WEAPON_CONFIG.fireRateToleranceMs) {
-      console.log(`[!] Shoot hack: ${playerId} firing faster than weapon fire rate`);
+    const allowedInterval = shotIntervalFor(player, weapon, mode, now);
+    if (now - player.lastShotAt < allowedInterval - weapon.fireRateToleranceMs) {
+      console.log(`[!] Shoot hack: ${playerId} firing faster than ${mode.id} allows`);
       return;
     }
 
     const [px, , pz] = player.position;
     const [ox, oy, oz] = data.origin;
-    const [dx, dy, dz] = data.direction;
 
     const distFromPlayer = Math.sqrt((ox - px) ** 2 + (oz - pz) ** 2);
     if (distFromPlayer > 3) {
@@ -4400,33 +6470,72 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    const dirLength = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (dirLength < 0.001) return;
-    const direction = [dx / dirLength, dy / dirLength, dz / dirLength];
-
     if (isInProtectedZone(player)) {
       safeSend(ws, { type: 'error', message: 'Cannot shoot in safe zone' });
       return;
     }
 
-    player.weaponAmmo--;
+    if (isStaff) {
+      player.ability.energy = Math.max(0, player.ability.energy - boltCost);
+      sendAbilityMeter(player);
+    } else {
+      player.weaponAmmo--;
+      if (player.weaponAmmo <= 0) player.ammoEmptyAt = now;
+    }
+
     player.lastShotAt = now;
-    if (player.weaponAmmo <= 0) player.ammoEmptyAt = now;
 
     player.stats.shotsFired++;
     bumpFactionTaskProgress(player, 'shots', 1).catch((err) => console.error('[FactionTask] bump error:', err.message));
 
-    player.recentShots.push({ time: now, origin: [ox, oy, oz], direction });
-    player.recentShots = player.recentShots.filter(
-      s => now - s.time < CONFIG.combat.shotMatchWindowMs
-    );
+    const speed = isStaff ? boltSpeedFor(player, weapon) : 0;
+    const origin = [ox, oy, oz];
+    const explosive = advanceExplosiveRound(player);
+
+    for (const direction of directions) {
+      player.recentShots.push({
+        time: now,
+        origin,
+        direction,
+        speed,
+        maxRange: weapon.maxRange,
+        damageMult: mode.damageMult,
+        hitsLeft: 1 + Math.max(0, mode.pierceCount || 0),
+        mode: mode.id,
+        explosive,
+      });
+    }
+    player.recentShots = player.recentShots.filter((s) => now - s.time < shotLifetimeMs(s));
 
     broadcast({
       type: 'shoot',
       id: playerId,
-      origin: data.origin,
-      direction: direction,
+      origin,
+      direction: directions[0],
+      directions,
+      weapon: player.combat.weapon,
+      mode: mode.id,
+      speed,
     }, playerId, true, player);
+  }
+
+  function handleFireModeSet(player, data) {
+    if (typeof data.mode !== 'string') return;
+
+    const state = player.progression;
+    if (data.mode !== 'single') {
+      if (!skills.hasMode(state.skills, data.mode)) {
+        safeSend(player.ws, { type: 'error', message: 'You have not unlocked that fire mode' });
+        return;
+      }
+      if (skills.modeBranch(data.mode) !== state.branch) return;
+    }
+
+    state.fireMode = data.mode;
+    persistPlayer(player);
+
+    safeSend(player.ws, { type: 'fireModeChanged', mode: state.fireMode });
+    sendProgressionState(player);
   }
 
   async function handleNicknameChange(player, data) {
@@ -4653,25 +6762,11 @@ wss.on('connection', (ws) => {
 
     if (isSpawnProtected(target)) return;
 
-    const damage = Math.max(1, Math.round(player.combat.pvpDamage * target.combat.damageTakenMult));
-    target.health = Math.max(0, target.health - damage);
-    target.lastDamageTime = Date.now();
-
-    broadcast({
-      type: 'playerDamaged',
-      targetId: data.target,
-      attackerId: playerId,
-      damage: damage,
-      health: target.health,
+    applyBulletDamage(player, target, player.combat.pvpDamage * matchedShot.damageMult * allyDamageBonus(player), {
       point: historicalPos,
-      historicalPosition: historicalPos,
-    }, null, true, player);
+    });
 
-    if (target.health <= 0) {
-      player.stats.kills++;
-      bumpFactionTaskProgress(player, 'kills', 1).catch((err) => console.error('[FactionTask] bump error:', err.message));
-      markPlayerDead(target, playerId, historicalPos);
-    }
+    applyShotPassives(player, matchedShot, { kind: 'player', entity: target }, historicalPos);
   }
 
   function handleEnemyHit(player, data) {
@@ -4706,102 +6801,11 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    const enemyDamage = Math.max(1, Math.round(player.combat.enemyDamage));
-    enemy.health = Math.max(0, enemy.health - enemyDamage);
-
-    const shared = player.locationId === 'main-world';
-    const damagedMessage = {
-      type: 'enemyDamaged',
-      id: enemy.id,
-      health: enemy.health,
-      attackerId: playerId,
+    applyEnemyDamage(player, enemy, player.combat.enemyDamage * matchedShot.damageMult * allyDamageBonus(player), {
       point: data.point,
-    };
+    });
 
-    if (shared) broadcastToLocation('main-world', damagedMessage, null, player.instance);
-    else safeSend(player.ws, damagedMessage);
-
-    if (enemy.health <= 0) {
-      enemy.alive = false;
-      enemy.targetId = null;
-
-      const deathMessage = {
-        type: 'enemyDeath',
-        id: enemy.id,
-        killerId: playerId,
-      };
-
-      if (shared) broadcastToLocation('main-world', deathMessage, null, player.instance);
-      else safeSend(player.ws, deathMessage);
-
-      incrementKillQuests(player);
-      grantEnemyKillXp(player, enemy.type);
-
-      if (player.combat.healOnKill > 0 && player.alive) {
-        const healed = Math.min(player.maxHealth, player.health + player.combat.healOnKill);
-        if (healed !== player.health) {
-          player.health = healed;
-          safeSend(player.ws, { type: 'playerHealed', health: player.health, maxHealth: player.maxHealth });
-        }
-      }
-
-      if (shared) {
-        const cfg = ENEMY_TYPES[enemy.type];
-        enemy.cast = null;
-        enemy.pendingImpacts = [];
-        enemy.pools = [];
-        enemy.respawnAt = Date.now() + WARDEN_RESPAWN_MS;
-        dropLoot(enemy.position, player.instance, cfg.lootMin, cfg.lootMax);
-        return;
-      }
-
-      if (player.locationId === CAVE_LOCATION_ID) {
-        if (player.cave && enemy.id === player.cave.bossId) {
-          player.cave.bossDefeated = true;
-          player.cave.portalDoomed = true;
-          grantXp(player, progression.XP_SOURCES.caveBossXp, 'cave_boss');
-          safeSend(player.ws, { type: 'caveBossState', defeated: true });
-        }
-        return;
-      }
-
-      const alreadyCleared = player.canyon.clearedSegments.has(player.canyon.segment);
-      if (!alreadyCleared) {
-        const cfg = ENEMY_TYPES[enemy.type];
-        dropCanyonLoot(
-          player,
-          enemy.position,
-          cfg.lootMin,
-          Math.round(cfg.lootMax * player.combat.lootMult)
-        );
-      }
-
-      if (enemy.type === 'slime_boss') {
-        const clearedSegment = player.canyon.segment;
-        if (!alreadyCleared) {
-          player.canyon.clearedSegments.add(clearedSegment);
-        }
-        grantXp(player, progression.canyonSegmentXp(clearedSegment, alreadyCleared), `canyon:${clearedSegment}`);
-        const nextSegment = Math.min(clearedSegment + 1, CANYON_MAX_SEGMENT_CAP);
-        if (nextSegment > player.canyon.maxSegmentReached) {
-          player.canyon.maxSegmentReached = nextSegment;
-        }
-        persistPlayer(player);
-
-        player.canyon.pendingSegment = nextSegment;
-
-        safeSend(player.ws, {
-          type: 'canyonCleared',
-          clearedSegment,
-          segment: nextSegment,
-          maxSegmentReached: player.canyon.maxSegmentReached,
-          name: canyonSegmentName(nextSegment),
-          biome: canyonBiomeFor(nextSegment).key,
-        });
-      }
-    } else {
-      enemy.targetId = playerId;
-    }
+    applyShotPassives(player, matchedShot, { kind: 'enemy', entity: enemy }, historicalPos);
   }
 
   function handleCaveChestOpen(player, data) {
@@ -5131,127 +7135,6 @@ wss.on('connection', (ws) => {
       return null;
     });
     applyPlayerFactions(player, result?.factions);
-  }
-
-  function broadcastToFaction(factionId, message, excludePlayerId, senderUserId = null) {
-    players.forEach((p) => {
-      if (p.authenticated && p.id !== excludePlayerId && p.factions?.some((f) => f.id === factionId)) {
-        if (senderUserId && p.blockedUserIds?.has(senderUserId)) return;
-        safeSend(p.ws, message);
-      }
-    });
-  }
-
-  async function hydrateFactionTaskState(factionId, gameId) {
-    const myGen = nextFactionTaskGeneration(factionId);
-
-    const result = await callInternalApi('/api/internal/game/faction/get-by-id', {
-      gameId, factionId,
-    }).catch((err) => {
-      console.error('[FactionTask] hydrate error:', err.message);
-      return null;
-    });
-
-    if (factionTaskGeneration.get(factionId) !== myGen) {
-      return factionTaskState.get(factionId) || null;
-    }
-
-    const faction = result?.faction;
-    if (!faction || !faction.activeTask) {
-      factionTaskState.delete(factionId);
-      return null;
-    }
-
-    const def = FACTION_TASKS_BY_KEY.get(faction.activeTask.key);
-    const state = {
-      taskKey: faction.activeTask.key,
-      metric: def ? def.metric : null,
-      target: faction.activeTask.target,
-      progress: faction.activeTask.progress,
-      dirty: false,
-      contributions: new Map(),
-    };
-    factionTaskState.set(factionId, state);
-    return state;
-  }
-
-  async function completeFactionTask(factionId, taskKey, gameId, contributions) {
-    factionTaskState.delete(factionId);
-
-    const contributionsPayload = contributions
-      ? Array.from(contributions.entries()).map(([userId, amount]) => ({ userId, amount }))
-      : [];
-
-    const result = await callInternalApi('/api/internal/game/faction/complete-task', {
-      factionId, taskKey, contributions: contributionsPayload,
-    }).catch((err) => {
-      console.error('[FactionTask] complete error:', err.message);
-      return null;
-    });
-
-    if (!result || !result.success) return;
-
-    const recipient = userIdToPlayer.get(result.rewardUserId);
-    if (recipient) {
-      recipient.ash += result.rewardAsh;
-      safeSend(recipient.ws, { type: 'inventoryUpdate', inventory: recipient.inventory, ash: recipient.ash });
-    }
-
-    const def = FACTION_TASKS_BY_KEY.get(taskKey);
-    broadcastToFaction(factionId, {
-      type: 'factionTaskCompleted',
-      taskKey,
-      label: def ? def.label : taskKey,
-      rewardAsh: result.rewardAsh,
-      rewardNickname: result.rewardNickname,
-    });
-
-    const fresh = await callInternalApi('/api/internal/game/faction/get-by-id', {
-      gameId, factionId,
-    }).catch((err) => {
-      console.error('[FactionTask] refresh error:', err.message);
-      return null;
-    });
-    if (fresh?.faction) {
-      broadcastToFaction(factionId, { type: 'factionInfo', faction: fresh.faction });
-    }
-  }
-
-  async function getOrHydrateFactionTaskState(factionId, gameId) {
-    const cached = factionTaskState.get(factionId);
-    if (cached) return cached;
-
-    let inflight = factionTaskHydrating.get(factionId);
-    if (!inflight) {
-      inflight = hydrateFactionTaskState(factionId, gameId).finally(() => {
-        factionTaskHydrating.delete(factionId);
-      });
-      factionTaskHydrating.set(factionId, inflight);
-    }
-    return inflight;
-  }
-
-  async function bumpSingleFactionTask(factionId, gameId, metric, amount, userId) {
-    const state = await getOrHydrateFactionTaskState(factionId, gameId);
-    if (!state || !state.taskKey || state.metric !== metric) return;
-    if (factionTaskState.get(factionId) !== state) return;
-
-    state.progress += amount;
-    state.dirty = true;
-
-    if (userId) {
-      if (!state.contributions) state.contributions = new Map();
-      state.contributions.set(userId, (state.contributions.get(userId) || 0) + amount);
-    }
-
-    if (state.progress >= state.target) {
-      await completeFactionTask(factionId, state.taskKey, gameId, state.contributions);
-    }
-  }
-
-  async function bumpFactionTaskProgress(player, metric, amount) {
-    if (!player.factions?.length || amount <= 0) return;
-    await Promise.all(player.factions.map((f) => bumpSingleFactionTask(f.id, player.gameId, metric, amount, player.userId)));
   }
 
   function handleFactionTaskListRequest(player) {
@@ -6008,10 +7891,6 @@ wss.on('connection', (ws) => {
     return Object.prototype.hasOwnProperty.call(QUESTS, questId) ? QUESTS[questId] : null;
   }
 
-  function getQuestState(player, questId) {
-    return player.quests[questId] || { status: 'not_started', progress: 0, visited: [] };
-  }
-
   function questAvailable(player, quest) {
     if (!quest.requiresQuest) return true;
     return getQuestState(player, quest.requiresQuest).status === 'completed';
@@ -6046,15 +7925,15 @@ wss.on('connection', (ws) => {
     };
   }
 
-  function autoStartQuests(player) {
+  function sendOfferedQuests(player) {
+    const seen = new Set();
+
     for (const quest of QUEST_LIST) {
-      if (!quest.autoStart) continue;
+      if (seen.has(quest.npc)) continue;
       if (!questAvailable(player, quest)) continue;
+      if (getQuestState(player, quest.id).status === 'completed') continue;
 
-      const state = getQuestState(player, quest.id);
-      if (state.status !== 'not_started') continue;
-
-      player.quests[quest.id] = { status: 'active', progress: 0, visited: [] };
+      seen.add(quest.npc);
       safeSend(player.ws, buildQuestInfoPayload(player, quest));
     }
   }
@@ -6091,31 +7970,6 @@ wss.on('connection', (ws) => {
         targetCount: quest.targetCount,
         visited: state.visited,
         visitedName: target.name,
-      });
-    }
-  }
-
-  function incrementKillQuests(player) {
-    for (const quest of Object.values(QUESTS)) {
-      if (quest.type !== 'kill_enemies') continue;
-      if (quest.locationId && player.locationId !== quest.locationId) continue;
-
-      const state = getQuestState(player, quest.id);
-      if (state.status !== 'active') continue;
-
-      state.progress = Math.min(quest.targetCount, state.progress + 1);
-      if (state.progress >= quest.targetCount) {
-        state.status = 'ready_to_turn_in';
-      }
-      player.quests[quest.id] = state;
-      persistPlayer(player);
-
-      safeSend(player.ws, {
-        type: 'questUpdate',
-        questId: quest.id,
-        status: state.status,
-        progress: state.progress,
-        targetCount: quest.targetCount,
       });
     }
   }
@@ -6329,6 +8183,9 @@ wss.on('connection', (ws) => {
     }
 
     state.branch = data.branch;
+    state.fireMode = 'single';
+    refreshCombatStats(player);
+    resetPlayerAbilities(player);
     persistPlayer(player);
 
     safeSend(player.ws, { type: 'branchSelected', branch: state.branch });
@@ -6409,6 +8266,7 @@ wss.on('connection', (ws) => {
     state.branch = null;
     state.respecCount += 1;
     refreshCombatStats(player);
+    resetPlayerAbilities(player);
     persistPlayer(player);
 
     safeSend(player.ws, { type: 'skillsRespecced', costAsh: cost });
@@ -6707,178 +8565,13 @@ wss.on('connection', (ws) => {
     }
   }
 
-  async function handlePlaceItem(player, data) {
-    if (!player.alive) return;
-    const item = FURNITURE_ITEMS[data.itemId];
-    if (!item) return;
+  function handleRoomBuildOp(player, data) {
+    if (!player.roomCanEdit) return;
 
-    const roomFactionId = roomFactionIdFor(player);
-    if (!roomFactionId) {
-      safeSend(player.ws, { type: 'error', message: 'This can only be placed in a faction room' });
-      return;
-    }
-    if (!player.factions?.some((f) => f.id === roomFactionId)) {
-      safeSend(player.ws, { type: 'error', message: "You can only place furniture in your own faction's room" });
-      return;
-    }
-    if (isMuted(player)) {
-      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
-      return;
-    }
-    if (!Array.isArray(data.position) || data.position.length !== 3) return;
-    if (!isValidPositionForLocation(player.locationId, data.position)) {
-      safeSend(player.ws, { type: 'error', message: 'Invalid placement position' });
-      return;
-    }
-    const rotation = typeof data.rotation === 'number' && isFinite(data.rotation) ? data.rotation : 0;
+    const op = sanitizeRoomBuildOp(data.op);
+    if (!op) return;
 
-    await ensureFurnitureLoaded(roomFactionId);
-    const roomItems = worldFurniture.get(roomFactionId) || new Map();
-    const ownedOfType = Array.from(roomItems.values()).filter((f) => f.ownerId === player.userId && f.itemId === data.itemId).length;
-    if (ownedOfType >= item.maxOwned) {
-      safeSend(player.ws, { type: 'error', message: `You can only place ${item.maxOwned} of this here` });
-      return;
-    }
-
-    if (item.price > 0) {
-      if (!(player.placeables[data.itemId] > 0)) {
-        safeSend(player.ws, { type: 'error', message: "You don't own any of that — buy one from the Shop" });
-        return;
-      }
-      player.placeables[data.itemId] -= 1;
-    }
-
-    const result = await callInternalApi('/api/internal/game/furniture/create', {
-      userId: player.userId, gameId: player.gameId, factionId: roomFactionId, itemId: data.itemId, position: data.position, rotation,
-    }).catch((err) => {
-      console.error('[Furniture] create error:', err.message);
-      return null;
-    });
-
-    if (!result || !result.success) {
-      if (item.price > 0) player.placeables[data.itemId] += 1;
-      safeSend(player.ws, { type: 'error', message: 'Could not place item right now' });
-      return;
-    }
-
-    player.stats.buildingsPlaced += 1;
-    player.economyChangedAt = Date.now();
-    persistPlayer(player);
-
-    const furnitureItem = {
-      id: result.id,
-      itemId: data.itemId,
-      ownerId: player.userId,
-      ownerNickname: player.nickname,
-      factionId: roomFactionId,
-      position: data.position,
-      rotation,
-      contentType: null,
-      textContent: null,
-      drawingUrl: null,
-      createdAt: result.createdAt,
-    };
-    if (!worldFurniture.has(roomFactionId)) worldFurniture.set(roomFactionId, new Map());
-    worldFurniture.get(roomFactionId).set(furnitureItem.id, furnitureItem);
-
-    if (item.price > 0) {
-      safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
-    }
-    broadcastToLocation(player.locationId, { type: 'furnitureSpawn', item: furnitureItem });
-  }
-
-  async function handleItemSetText(player, data) {
-    const roomFactionId = roomFactionIdFor(player);
-    if (!roomFactionId) return;
-    const item = worldFurniture.get(roomFactionId)?.get(data.id);
-    if (!item) return;
-    if (item.ownerId !== player.userId) {
-      safeSend(player.ws, { type: 'error', message: 'You cannot edit this item' });
-      return;
-    }
-    if (isMuted(player)) {
-      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
-      return;
-    }
-    if (typeof data.text !== 'string') return;
-
-    const text = sanitizeMessage(data.text.trim().slice(0, 150));
-    if (text.length === 0) return;
-    if (containsLink(text)) {
-      safeSend(player.ws, { type: 'error', message: 'Links are not allowed' });
-      return;
-    }
-
-    const result = await callInternalApi('/api/internal/game/furniture/set-content', {
-      itemId: item.id, userId: player.userId, contentType: 'text', textContent: text,
-    }).catch((err) => {
-      console.error('[Furniture] set-content error:', err.message);
-      return null;
-    });
-    if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: 'Could not save item right now' });
-      return;
-    }
-
-    item.contentType = 'text';
-    item.textContent = text;
-    broadcastToLocation(player.locationId, { type: 'furnitureContentSet', id: item.id, contentType: 'text', textContent: text });
-  }
-
-  async function handleItemSetDrawingUrl(player, data) {
-    const roomFactionId = roomFactionIdFor(player);
-    if (!roomFactionId) return;
-    const item = worldFurniture.get(roomFactionId)?.get(data.id);
-    if (!item) return;
-    if (item.ownerId !== player.userId) {
-      safeSend(player.ws, { type: 'error', message: 'You cannot edit this item' });
-      return;
-    }
-    if (typeof data.url !== 'string' || !data.url.startsWith('https://') || data.url.length > 512) {
-      safeSend(player.ws, { type: 'error', message: 'Invalid drawing' });
-      return;
-    }
-
-    const result = await callInternalApi('/api/internal/game/furniture/set-content', {
-      itemId: item.id, userId: player.userId, contentType: 'draw', drawingUrl: data.url,
-    }).catch((err) => {
-      console.error('[Furniture] set-content error:', err.message);
-      return null;
-    });
-    if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: 'Could not save item right now' });
-      return;
-    }
-
-    item.contentType = 'draw';
-    item.drawingUrl = data.url;
-    broadcastToLocation(player.locationId, { type: 'furnitureContentSet', id: item.id, contentType: 'draw', drawingUrl: data.url });
-  }
-
-  async function handleItemRemove(player, data) {
-    const roomFactionId = roomFactionIdFor(player);
-    if (!roomFactionId) return;
-    const roomItems = worldFurniture.get(roomFactionId);
-    const item = roomItems?.get(data.id);
-    if (!item) return;
-    if (item.ownerId !== player.userId) {
-      safeSend(player.ws, { type: 'error', message: 'You can only remove your own item' });
-      return;
-    }
-
-    const result = await callInternalApi('/api/internal/game/furniture/delete', {
-      itemId: item.id, userId: item.ownerId,
-    }).catch((err) => {
-      console.error('[Furniture] delete error:', err.message);
-      return null;
-    });
-    if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: 'Could not remove item right now' });
-      return;
-    }
-
-    roomItems.delete(item.id);
-    broadcastToLocation(player.locationId, { type: 'furnitureDespawn', id: item.id });
+    broadcastToLocation(player.locationId, { type: 'roomBuildOp', op }, player.id);
   }
 
   function handleSaveProgress(player) {
@@ -6927,6 +8620,7 @@ wss.on('connection', (ws) => {
       player.recentShots = [];
 
       safeSend(player.ws, { type: 'shardTeleport', position: player.position, instance: target });
+      sendActiveZones(player);
       recomputeAOI(player);
       broadcastShardState(oldLocation);
       return;
@@ -7002,6 +8696,8 @@ wss.on('connection', (ws) => {
       broadcastShardState(oldLocation);
     }
 
+    sendActiveZones(player);
+
     if (data.locationId === 'main-world') {
       safeSend(ws, { type: 'lootState', loot: serializeLoot(player.instance) });
       await ensureSignsLoaded(player.gameId);
@@ -7025,11 +8721,7 @@ wss.on('connection', (ws) => {
       safeSend(ws, { type: 'factionGatesState', gates: displayedFactionGatesList, accountCount });
     }
 
-    if (data.locationId.startsWith(FACTION_ROOM_PREFIX)) {
-      const newRoomFactionId = data.locationId.slice(FACTION_ROOM_PREFIX.length);
-      await ensureFurnitureLoaded(newRoomFactionId);
-      safeSend(ws, { type: 'furnitureState', items: serializeFurnitureForRoom(newRoomFactionId) });
-    }
+    await refreshRoomEditRights(player);
   }
 });
 

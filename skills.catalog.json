@@ -93,12 +93,12 @@
       "id": "gun_burst_fire",
       "column": "ordnance",
       "row": 2,
-      "name": "Burst Fire",
-      "description": "Unlocks a three-round burst mode.",
+      "name": "Marksman",
+      "description": "Unlocks a slow, heavy single shot that reloads between rounds.",
       "kind": "mode",
       "maxRank": 1,
       "requires": { "level": 8, "columnPoints": 3 },
-      "mode": { "id": "burst", "name": "Burst", "fireRateMs": 90, "burstSize": 3, "burstPauseMs": 320, "damageMult": 1.1, "spreadMult": 1 }
+      "mode": { "id": "marksman", "name": "Marksman", "fireRateMs": 650, "damageMult": 4.5 }
     },
     {
       "id": "gun_extended_mag",
@@ -116,7 +116,7 @@
       "column": "ordnance",
       "row": 4,
       "name": "Armor Piercing",
-      "description": "Rounds ignore part of enemy armour and player shields.",
+      "description": "Rounds punch straight through part of a player's shield.",
       "kind": "passive",
       "maxRank": 3,
       "requires": { "level": 16, "columnPoints": 6 },
@@ -138,11 +138,11 @@
       "column": "ordnance",
       "row": 6,
       "name": "Full Auto",
-      "description": "Unlocks continuous fire at the cost of damage and accuracy.",
+      "description": "Trades damage for a much faster cadence.",
       "kind": "mode",
       "maxRank": 1,
       "requires": { "level": 24, "columnPoints": 11 },
-      "mode": { "id": "auto", "name": "Full Auto", "fireRateMs": 100, "burstSize": 0, "burstPauseMs": 0, "damageMult": 0.92, "spreadMult": 1.35 }
+      "mode": { "id": "auto", "name": "Full Auto", "fireRateMs": 100, "damageMult": 0.92, "spreadMult": 1.35 }
     },
     {
       "id": "gun_overpressure",

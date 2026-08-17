@@ -124,6 +124,11 @@ function modeDefinition(modeId) {
   return node ? node.mode : null;
 }
 
+function modeBranch(modeId) {
+  const node = MODE_NODES_BY_MODE_ID.get(modeId);
+  return node ? branchOfColumn(node.column) : null;
+}
+
 function hasAbility(ranks, abilityId) {
   const node = ABILITY_NODES_BY_ABILITY_ID.get(abilityId);
   return !!node && rankOf(ranks, node.id) > 0;
@@ -205,6 +210,7 @@ module.exports = {
   unlockedTriggers,
   abilityDefinition,
   modeDefinition,
+  modeBranch,
   hasAbility,
   hasMode,
   sanitizeRanks,
