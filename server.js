@@ -252,6 +252,8 @@ const ORIENTATION_TARGETS = [
 
 const ORIENTATION_TARGET_IDS = new Set(ORIENTATION_TARGETS.map((t) => t.id));
 
+const MET_NPC_IDS = new Set([...ORIENTATION_TARGET_IDS, 'quest-giver-sola']);
+
 const QUESTS = {
   sola_orientation: {
     id: 'sola_orientation',
@@ -5414,6 +5416,7 @@ function buildSavePayload(player) {
         ash: player.ash,
         placeables: player.placeables,
         quests: player.quests,
+        metNpcs: Array.from(player.metNpcs || []),
         canyonProgress: {
           maxSegmentReached: player.canyon.maxSegmentReached,
           clearedSegments: Array.from(player.canyon.clearedSegments),
@@ -5700,6 +5703,7 @@ wss.on('connection', (ws) => {
     roomCanEdit: false,
     activeTradeId: null,
     quests: {},
+    metNpcs: new Set(),
     factions: [],
     cosmeticsOwned: new Set(),
     cosmeticSkinId: null,
@@ -5822,7 +5826,7 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'cosmetic', CONFIG.network.cosmeticRateLimit)) return;
       } else if (data.type === 'emote') {
         if (!checkRateLimit(playerId, 'emote', CONFIG.network.emoteRateLimit)) return;
-      } else if (data.type === 'questInteract' || data.type === 'questAccept' || data.type === 'questTurnIn' || data.type === 'npcVisit') {
+      } else if (data.type === 'questInteract' || data.type === 'questAccept' || data.type === 'questTurnIn' || data.type === 'npcVisit' || data.type === 'npcMet') {
         if (!checkRateLimit(playerId, 'quest', CONFIG.network.questRateLimit)) return;
       } else if (data.type === 'branchSelect' || data.type === 'skillRespec' || data.type === 'skillLearn' || data.type === 'abilityBind' || data.type === 'fireModeSet') {
         if (!checkRateLimit(playerId, 'progression', CONFIG.network.progressionRateLimit)) return;
@@ -5919,6 +5923,7 @@ wss.on('connection', (ws) => {
         case 'questAccept': handleQuestAccept(player, data); break;
         case 'questTurnIn': handleQuestTurnIn(player, data); break;
         case 'npcVisit': handleNpcVisit(player, data); break;
+        case 'npcMet': handleNpcMet(player, data); break;
         case 'branchSelect': handleBranchSelect(player, data); break;
         case 'skillRespec': handleSkillRespec(player); break;
         case 'skillLearn': handleSkillLearn(player, data); break;
@@ -6192,6 +6197,13 @@ wss.on('connection', (ws) => {
         }
       }
 
+      const savedMetNpcs = savedProgress.progress?.data?.metNpcs;
+      if (Array.isArray(savedMetNpcs)) {
+        for (const npcId of savedMetNpcs) {
+          if (MET_NPC_IDS.has(npcId)) player.metNpcs.add(npcId);
+        }
+      }
+
       const savedCaveChests = savedProgress.progress?.data?.caveChests;
       if (savedCaveChests && typeof savedCaveChests === 'object') {
         for (const [chestId, at] of Object.entries(savedCaveChests)) {
@@ -6303,6 +6315,7 @@ wss.on('connection', (ws) => {
     safeSend(ws, { type: 'factionMyListResult', factions: player.factions });
     safeSend(ws, buildWorldStatusPayload());
     sendCosmeticState(player);
+    sendMetNpcs(player);
     sendActiveZones(player);
 
     if (player.locationId === 'main-world') {
@@ -7972,6 +7985,23 @@ wss.on('connection', (ws) => {
         visitedName: target.name,
       });
     }
+  }
+
+  function sendMetNpcs(player) {
+    safeSend(player.ws, {
+      type: 'npcMetState',
+      metNpcs: Array.from(player.metNpcs || []),
+    });
+  }
+
+  function handleNpcMet(player, data) {
+    if (typeof data.npcId !== 'string') return;
+    if (!MET_NPC_IDS.has(data.npcId)) return;
+    if (player.metNpcs.has(data.npcId)) return;
+
+    player.metNpcs.add(data.npcId);
+    persistPlayer(player);
+    sendMetNpcs(player);
   }
 
   function sendCosmeticState(player) {
