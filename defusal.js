@@ -28,8 +28,8 @@ const DEFUSAL_CONFIG = {
   bombBlastRadius: 22,
 
   sites: {
-    A: { x: 22, z: -15 },
-    B: { x: -29, z: -16 },
+    A: { x: 21.5, z: -13.5 },
+    B: { x: -21, z: -19 },
   },
 
   tSpawns: [[30, 34], [27, 34], [30, 31], [30, 37], [33, 34]],
