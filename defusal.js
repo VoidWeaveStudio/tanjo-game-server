@@ -28,18 +28,17 @@ const DEFUSAL_CONFIG = {
   bombBlastRadius: 22,
 
   sites: {
-    A: { x: 26, z: -16 },
-    B: { x: -24, z: -15 },
+    A: { x: 22, z: -15 },
+    B: { x: -29, z: -16 },
   },
 
-  tSpawns: [[21, 34], [24, 35], [27, 34], [22, 31], [26, 31]],
-  ctSpawns: [[4, -31], [7, -32], [10, -31], [6, -28], [10, -28]],
+  tSpawns: [[30, 34], [27, 34], [30, 31], [30, 37], [33, 34]],
+  ctSpawns: [[-3, -33], [-6, -33], [-3, -36], [-3, -30], [0, -33]],
 
   // Skill tree and degen stay out of this mode — the arsenal decides everything.
   baseHealth: 100,
   armorPoints: 100,
   armorAbsorb: 0.5,
-  helmetHeadshotMult: 0.35,
 };
 
 const queue = [];
@@ -406,6 +405,7 @@ const GRENADE_PHYSICS = {
   flashMaxMs: 3400,
   cloudRange: 9,
   cloudMs: 12000,
+  maxStepMetres: 0.35,
 };
 
 let nextGrenadeSeq = 0;
@@ -442,23 +442,71 @@ function throwGrenade(match, playerId, itemId, origin, direction, now = Date.now
   return grenade;
 }
 
+// Grenades bounce off the map, not just the floor: the step is split fine
+// enough that nothing tunnels through a wall, and each hit reflects the axis
+// it came in on while the other two lose speed to friction.
+function bounceOffBlockers(grenade) {
+  const r = GRENADE_PHYSICS.radius;
+
+  for (const box of geometry.BLOCKERS) {
+    if (grenade.x + r <= box.minX || grenade.x - r >= box.maxX) continue;
+    if (grenade.y + r <= box.minY || grenade.y - r >= box.maxY) continue;
+    if (grenade.z + r <= box.minZ || grenade.z - r >= box.maxZ) continue;
+
+    const west = grenade.x + r - box.minX;
+    const east = box.maxX + r - grenade.x;
+    const below = grenade.y + r - box.minY;
+    const above = box.maxY + r - grenade.y;
+    const south = grenade.z + r - box.minZ;
+    const north = box.maxZ + r - grenade.z;
+
+    const push = Math.min(west, east, below, above, south, north);
+
+    if (push === west || push === east) {
+      grenade.x += push === west ? -west : east;
+      grenade.vx = -grenade.vx * GRENADE_PHYSICS.bounce;
+      grenade.vy *= GRENADE_PHYSICS.friction;
+      grenade.vz *= GRENADE_PHYSICS.friction;
+    } else if (push === below || push === above) {
+      grenade.y += push === below ? -below : above;
+      grenade.vy = -grenade.vy * GRENADE_PHYSICS.bounce;
+      grenade.vx *= GRENADE_PHYSICS.friction;
+      grenade.vz *= GRENADE_PHYSICS.friction;
+      if (push === above && Math.abs(grenade.vy) < 0.6) grenade.vy = 0;
+    } else {
+      grenade.z += push === south ? -south : north;
+      grenade.vz = -grenade.vz * GRENADE_PHYSICS.bounce;
+      grenade.vx *= GRENADE_PHYSICS.friction;
+      grenade.vy *= GRENADE_PHYSICS.friction;
+    }
+  }
+}
+
 function stepGrenades(match, delta, now) {
   if (!match.grenades || match.grenades.length === 0) return [];
 
   const detonated = [];
 
   for (const grenade of match.grenades) {
-    grenade.vy -= GRENADE_PHYSICS.gravity * delta;
-    grenade.x += grenade.vx * delta;
-    grenade.y += grenade.vy * delta;
-    grenade.z += grenade.vz * delta;
+    const speed = Math.hypot(grenade.vx, grenade.vy, grenade.vz);
+    const steps = Math.max(1, Math.min(24, Math.ceil((speed * delta) / GRENADE_PHYSICS.maxStepMetres)));
+    const step = delta / steps;
 
-    if (grenade.y <= GRENADE_PHYSICS.radius) {
-      grenade.y = GRENADE_PHYSICS.radius;
-      grenade.vy = Math.abs(grenade.vy) * GRENADE_PHYSICS.bounce;
-      grenade.vx *= GRENADE_PHYSICS.friction;
-      grenade.vz *= GRENADE_PHYSICS.friction;
-      if (grenade.vy < 0.6) grenade.vy = 0;
+    for (let i = 0; i < steps; i++) {
+      grenade.vy -= GRENADE_PHYSICS.gravity * step;
+      grenade.x += grenade.vx * step;
+      grenade.y += grenade.vy * step;
+      grenade.z += grenade.vz * step;
+
+      if (grenade.y <= GRENADE_PHYSICS.radius) {
+        grenade.y = GRENADE_PHYSICS.radius;
+        grenade.vy = Math.abs(grenade.vy) * GRENADE_PHYSICS.bounce;
+        grenade.vx *= GRENADE_PHYSICS.friction;
+        grenade.vz *= GRENADE_PHYSICS.friction;
+        if (grenade.vy < 0.6) grenade.vy = 0;
+      }
+
+      bounceOffBlockers(grenade);
     }
 
     if (now >= grenade.detonatesAt) {
@@ -619,6 +667,7 @@ function serializeQueue() {
 
 module.exports = {
   DEFUSAL_CONFIG,
+  bounceOffBlockers,
   HELD_SLOTS,
   heldItemId,
   isHoldingGrenade,

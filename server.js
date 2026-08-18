@@ -24,6 +24,7 @@ const arena = require('./arena');
 const eventSchedule = require('./eventSchedule');
 const defusal = require('./defusal');
 const defusalArsenal = require('./defusalArsenal');
+const grinder = require('./grinder');
 
 const PORT = process.env.PORT || 3001;
 const MAX_CONNECTIONS = 2000;
@@ -355,6 +356,7 @@ const EVENTS_LOBBY_ID = 'tower-events';
 const EVENT_ROOMS = {
   'event-arena': { radius: 60, spawn: [0, 0, 46] },
   'event-dust2': { radius: 72, spawn: [24, 0, 33] },
+  'event-grinder': { radius: 72, spawn: [24, 0, 33] },
   'event-pump': { radius: 58, spawn: [0, 0, 44] },
   'event-whale': { radius: 62, spawn: [0, 0, 48] },
   'event-mint': { radius: 54, spawn: [0, 0, 40] },
@@ -370,6 +372,7 @@ const EVENT_ROOM_IDS = Object.keys(EVENT_ROOMS);
 const EVENT_ID_BY_LOCATION = {
   'event-arena': 'arena',
   'event-dust2': 'dust2',
+  'event-grinder': 'dust2',
   'event-pump': 'pump',
   'event-whale': 'whale',
   'event-mint': 'mint',
@@ -1287,9 +1290,9 @@ function isSpawnProtected(player) {
   return !!player.invulnerableUntil && Date.now() < player.invulnerableUntil;
 }
 
-function grantSpawnProtection(player) {
-  player.invulnerableUntil = Date.now() + SPAWN_PROTECTION_MS;
-  safeSend(player.ws, { type: 'spawnProtection', untilMs: player.invulnerableUntil, durationMs: SPAWN_PROTECTION_MS });
+function grantSpawnProtection(player, durationMs = SPAWN_PROTECTION_MS) {
+  player.invulnerableUntil = Date.now() + durationMs;
+  safeSend(player.ws, { type: 'spawnProtection', untilMs: player.invulnerableUntil, durationMs });
 }
 
 function clearSpawnProtection(player) {
@@ -2387,7 +2390,7 @@ function dropRunLoot(player) {
 
 function markPlayerDead(target, killerId, position) {
   target.alive = false;
-  target.stats.deaths++;
+  if (!dust2MemberOf(target)) target.stats.deaths++;
   clearCombat(target);
   cancelHomeTeleport(target, 'dead');
   clearPlayerAbilityBuffs(target, false);
@@ -2414,6 +2417,12 @@ function markPlayerDead(target, killerId, position) {
     broadcastDefusalState(defusalMatch);
   }
 
+  const grinderMatch = grinder.matchOf(target.id);
+  if (grinderMatch) {
+    grinder.markDead(grinderMatch, target.id, killerId, Date.now());
+    broadcastGrinderState(grinderMatch);
+  }
+
   const deathMessage = {
     type: 'playerDeath',
     playerId: target.id,
@@ -2421,7 +2430,15 @@ function markPlayerDead(target, killerId, position) {
     position,
   };
 
-  safeSend(target.ws, { ...deathMessage, options: respawnOptionsFor(target), loot });
+  if (grinderMatch) {
+    safeSend(target.ws, {
+      type: 'grinderDeath',
+      killerId,
+      killerName: killerId ? players.get(killerId)?.nickname ?? null : null,
+    });
+  } else {
+    safeSend(target.ws, { ...deathMessage, options: respawnOptionsFor(target), loot });
+  }
   broadcast(deathMessage, target.id, true, target);
 }
 
@@ -2501,6 +2518,12 @@ function respawnPlayer(target, requested) {
 
 function handleRespawnRequest(player, data) {
   if (player.alive) return;
+
+  const grinderMatch = grinder.matchOf(player.id);
+  if (grinderMatch) {
+    if (data?.target !== 'hall') return;
+    leaveGrinder(player);
+  }
 
   // Defusal rounds respawn you themselves — leaving early forfeits the match.
   const match = defusal.matchOf(player.id);
@@ -3514,24 +3537,124 @@ function broadcastQueueState() {
   });
 }
 
-function applyDefusalLoadout(player) {
-  const match = defusal.matchOf(player.id);
-  const member = match?.members.get(player.id) ?? null;
+const DUST2_ZONE_MULT = { head: 4, chest: 1, stomach: 1.25, legs: 0.75 };
+const DUST2_FALLOFF_METRES = 12.7;
+const DUST2_GUN_SLOTS = new Set(['primary', 'pistol']);
+
+function dust2MemberOf(player) {
+  if (!player) return null;
+
+  const grinderMatch = grinder.matchOf(player.id);
+  if (grinderMatch) {
+    return {
+      mode: 'grinder',
+      match: grinderMatch,
+      member: grinderMatch.members.get(player.id) ?? null,
+      config: grinder.GRINDER_CONFIG,
+    };
+  }
+
+  const defusalMatch = defusal.matchOf(player.id);
+  if (defusalMatch) {
+    return {
+      mode: 'defusal',
+      match: defusalMatch,
+      member: defusalMatch.members.get(player.id) ?? null,
+      config: defusal.DEFUSAL_CONFIG,
+    };
+  }
+
+  return null;
+}
+
+function dust2GunOf(entry) {
+  const item = entry?.member ? defusal.heldItem(entry.member) : null;
+  return item && DUST2_GUN_SLOTS.has(item.slot) ? item : null;
+}
+
+function dust2WeaponConfig(item) {
+  return {
+    fireRateMs: item.fireRateMs,
+    fireRateToleranceMs: 20,
+    maxRange: item.maxRange,
+    boltEnergyCost: 0,
+  };
+}
+
+function dust2HitZone(point, targetPosition) {
+  const height = point[1] - targetPosition[1];
+  if (height > 1.35) return 'head';
+  if (height > 1) return 'chest';
+  if (height > 0.6) return 'stomach';
+  return 'legs';
+}
+
+function syncArsenalAmmo(player, member, weapon, now = Date.now()) {
+  if (!member.ammo) member.ammo = {};
+
+  const previous = player.defusalWeaponId;
+  if (previous && Number.isFinite(player.weaponAmmo)) member.ammo[previous] = player.weaponAmmo;
+
+  if (!weapon) {
+    player.weaponAmmo = 0;
+    return;
+  }
+
+  const stored = member.ammo[weapon.id];
+  player.weaponAmmo = Number.isFinite(stored) ? Math.min(stored, weapon.magSize) : weapon.magSize;
+  if (player.weaponAmmo <= 0) player.ammoEmptyAt = now;
+}
+
+function refillArsenalAmmo(member, itemId) {
+  if (!member) return;
+  if (!member.ammo) member.ammo = {};
+  if (itemId) delete member.ammo[itemId];
+  else member.ammo = {};
+}
+
+function applyArsenalLoadout(player) {
+  const entry = dust2MemberOf(player);
+  if (!entry || !entry.member) return;
+
+  const { member, config } = entry;
   const weapon = defusal.heldItem(member);
   const holdingGrenade = defusal.isHoldingGrenade(member);
-  const config = defusal.DEFUSAL_CONFIG;
+
+  syncArsenalAmmo(player, member, holdingGrenade ? null : dust2GunOf(entry));
 
   player.combat = {
     ...player.combat,
+    weapon: 'rifle',
     maxHealth: config.baseHealth,
     moveSpeedMult: holdingGrenade ? 1.06 : weapon?.moveSpeedMult ?? 1,
     enemyDamage: holdingGrenade ? 0 : weapon?.damage ?? 26,
     pvpDamage: holdingGrenade ? 0 : weapon?.damage ?? 26,
-    magSize: holdingGrenade ? 0 : weapon?.magSize || 20,
+    magSize: holdingGrenade ? 0 : weapon?.magSize || 0,
     reloadMs: weapon?.reloadMs || 2100,
     armorPen: weapon?.armorPen ?? 0.5,
+    damageTakenMult: 1,
+    lowHealthDamageTakenMult: 1,
     damageVsUnshielded: 0,
-    explosiveDamage: 1,
+    healOnKill: 0,
+    energyOnKill: 0,
+    shieldStrength: 0,
+    postShieldRegen: 0,
+    postDashSpeed: 0,
+    postDashDamageTaken: 0,
+    reloadWhileDashing: false,
+    allyDamageInZone: 0,
+    markedAllyFireRate: 0,
+    bleedDamage: 0,
+    bleedDurationMs: 0,
+    clusterCount: 0,
+    clusterDamage: 0,
+    ricochetChance: 0,
+    ricochetDamage: 0,
+    explosiveEveryNthShot: 0,
+    explosiveDamage: 0,
+    explosiveRadius: 0,
+    burnDamage: 0,
+    burnDurationMs: 0,
   };
 
   player.maxHealth = config.baseHealth;
@@ -3542,36 +3665,49 @@ function applyDefusalLoadout(player) {
   safeSend(player.ws, buildProgressionPayload(player));
 }
 
+function applyDefusalLoadout(player) {
+  applyArsenalLoadout(player);
+}
+
 function clearDefusalLoadout(player) {
   if (!player) return;
   player.defusalLocked = false;
   player.defusalWeaponId = null;
   refreshCombatStats(player);
+  player.weaponAmmo = player.combat.magSize;
+  player.ammoEmptyAt = 0;
   safeSend(player.ws, buildProgressionPayload(player));
 }
 
-// Armour eats half of what gets through, the helmet blunts headshots, and the
-// sniper is allowed to skip all of it — that is what people pay 4750 for.
-function defusalDamage(attacker, target, rawDamage, isHeadshot) {
-  const match = defusal.matchOf(target.id);
-  const member = match?.members.get(target.id);
-  if (!member) return rawDamage;
+// Counter-Strike shape: the hit zone scales the shot, distance eats it off per
+// 12.7 metres, and armour takes the share the weapon cannot punch through —
+// legs are never covered, the head only with a helmet.
+function arsenalDamage(attacker, target, zone, distance) {
+  const targetEntry = dust2MemberOf(target);
+  const member = targetEntry?.member;
+  if (!member) return 0;
 
-  const weapon = attacker ? defusal.heldItem(match.members.get(attacker.id)) : null;
-  const config = defusal.DEFUSAL_CONFIG;
+  const attackerEntry = dust2MemberOf(attacker);
+  const weapon = attackerEntry ? defusal.heldItem(attackerEntry.member) : null;
+  const config = targetEntry.config;
 
-  let damage = rawDamage;
-  if (isHeadshot) {
-    const mult = weapon?.headshotMult ?? 1;
-    damage *= member.helmet ? Math.max(1, mult * config.helmetHeadshotMult) : mult;
-  }
+  const zoneMult = zone === 'head' ? weapon?.headshotMult ?? DUST2_ZONE_MULT.head : DUST2_ZONE_MULT[zone];
+  let damage = (weapon?.damage ?? 26) * zoneMult;
+  damage *= Math.pow(weapon?.rangeModifier ?? 1, Math.max(0, distance) / DUST2_FALLOFF_METRES);
 
-  if (weapon?.oneShot) return Math.max(damage, config.baseHealth + 1);
+  const covered = zone !== 'legs' && (zone !== 'head' || member.helmet);
+  if (covered && member.armorPoints > 0) {
+    const penetration = Math.min(1, Math.max(0, weapon?.armorPen ?? 0.5));
+    let through = damage * penetration;
+    let armorLoss = (damage - through) * config.armorAbsorb;
 
-  if (member.armorPoints > 0) {
-    const absorbed = Math.round(damage * config.armorAbsorb * (1 - (weapon?.armorPen ?? 0)));
-    member.armorPoints = Math.max(0, member.armorPoints - Math.round(absorbed * 0.5));
-    damage -= absorbed;
+    if (armorLoss > member.armorPoints) {
+      through += (armorLoss - member.armorPoints) / config.armorAbsorb;
+      armorLoss = member.armorPoints;
+    }
+
+    member.armorPoints = Math.max(0, member.armorPoints - armorLoss);
+    damage = through;
   }
 
   return Math.max(1, Math.round(damage));
@@ -3587,12 +3723,15 @@ function respawnForRound(match, now) {
 
     player.alive = true;
     member.alive = true;
-    player.health = defusal.DEFUSAL_CONFIG.loadout.maxHealth;
+    player.health = defusal.DEFUSAL_CONFIG.baseHealth;
     player.positionHistory = [];
     player.recentShots = [];
     player.justTeleported = true;
     player.teleportSettleUntil = now + TELEPORT_SETTLE_MS;
+    clearPlayerAbilityBuffs(player, false);
 
+    refillArsenalAmmo(member);
+    player.defusalWeaponId = null;
     applyDefusalLoadout(player);
 
     safeSend(player.ws, {
@@ -3814,6 +3953,301 @@ function defusalTick() {
 }
 
 safeInterval(defusalTick, 250);
+
+function grinderNicknames(match) {
+  const names = new Map();
+  for (const id of match.members.keys()) {
+    names.set(id, players.get(id)?.nickname ?? 'Player');
+  }
+  return names;
+}
+
+function broadcastGrinder(match, payload) {
+  for (const id of match.members.keys()) {
+    const player = players.get(id);
+    if (player) safeSend(player.ws, payload);
+  }
+}
+
+function broadcastGrinderState(match) {
+  broadcastGrinder(match, grinder.serializeMatch(match, grinderNicknames(match)));
+}
+
+function applyGrinderLoadout(player) {
+  applyArsenalLoadout(player);
+}
+
+function livingGrinderPositions(match) {
+  const entries = [];
+  for (const [id, member] of match.members) {
+    if (!member.alive) continue;
+    const player = players.get(id);
+    if (player) entries.push({ id, position: player.position });
+  }
+  return entries;
+}
+
+function respawnInGrinder(match, player, now) {
+  const member = match.members.get(player.id);
+  if (!member) return;
+
+  grinder.respawn(member);
+
+  player.position = grinder.pickSpawn(match, player.id, livingGrinderPositions(match));
+  player.alive = true;
+  player.health = grinder.GRINDER_CONFIG.baseHealth;
+  player.positionHistory = [];
+  player.recentShots = [];
+  player.justTeleported = true;
+  player.teleportSettleUntil = now + TELEPORT_SETTLE_MS;
+  player.weaponEquipped = true;
+  clearPlayerAbilityBuffs(player, false);
+
+  refillArsenalAmmo(member);
+  player.defusalWeaponId = null;
+  applyGrinderLoadout(player);
+  grantSpawnProtection(player, grinder.GRINDER_CONFIG.spawnImmunityMs);
+
+  safeSend(player.ws, {
+    type: 'grinderRespawn',
+    position: player.position,
+    health: player.health,
+  });
+  broadcast(
+    { type: 'playerRespawn', id: player.id, position: player.position, health: player.health },
+    player.id,
+    true,
+    player
+  );
+}
+
+function enterGrinder(player, now = Date.now()) {
+  const match = grinder.ensureMatch(player.instance, now);
+  grinder.join(match, player.id, now);
+  respawnInGrinder(match, player, now);
+  broadcastGrinderState(match);
+}
+
+function leaveGrinder(player) {
+  const match = grinder.leave(player.id);
+  clearDefusalLoadout(player);
+  if (!match) return;
+
+  if (match.members.size === 0) grinder.closeMatch(match);
+  else broadcastGrinderState(match);
+}
+
+function detonateGrinderGrenade(match, grenade, now) {
+  const physics = defusal.GRENADE_PHYSICS;
+
+  broadcastGrinder(match, {
+    type: 'defusalGrenadeBurst',
+    id: grenade.id,
+    itemId: grenade.itemId,
+    x: grenade.x,
+    y: grenade.y,
+    z: grenade.z,
+  });
+
+  if (grenade.itemId === 'liquidation') {
+    const item = defusalArsenal.ARSENAL_BY_ID.get('liquidation');
+    for (const [id, member] of match.members) {
+      if (!member.alive) continue;
+      const target = players.get(id);
+      if (!target) continue;
+
+      const distance = Math.hypot(target.position[0] - grenade.x, target.position[2] - grenade.z);
+      if (distance > item.maxRange) continue;
+
+      const falloff = 1 - distance / item.maxRange;
+      applyPlayerDamage(target, Math.max(1, Math.round(item.damage * falloff)), {
+        attackerId: grenade.ownerId,
+        ignoreShield: true,
+      });
+    }
+    return;
+  }
+
+  if (grenade.itemId === 'rug-flash') {
+    for (const [id, member] of match.members) {
+      if (!member.alive) continue;
+      const target = players.get(id);
+      if (!target) continue;
+
+      const blindMs = defusal.flashStrength(grenade, target.position, target.rotation || 0);
+      if (blindMs > 250) safeSend(target.ws, { type: 'defusalFlashed', durationMs: blindMs });
+    }
+    return;
+  }
+
+  broadcastGrinder(match, {
+    type: 'defusalCloud',
+    x: grenade.x,
+    z: grenade.z,
+    radius: physics.cloudRange,
+    untilMs: now + physics.cloudMs,
+  });
+}
+
+function tickGrinderMatch(match, now) {
+  for (const id of Array.from(match.members.keys())) {
+    const player = players.get(id);
+    const present = player && player.authenticated && player.locationId === grinder.GRINDER_CONFIG.locationId;
+    if (!present) grinder.leave(id);
+  }
+
+  if (match.members.size === 0) {
+    grinder.closeMatch(match);
+    return;
+  }
+
+  for (const grenade of defusal.stepGrenades(match, 0.1, now)) detonateGrinderGrenade(match, grenade, now);
+  if ((match.grenades ?? []).length > 0) {
+    broadcastGrinder(match, { type: 'defusalGrenades', grenades: defusal.serializeGrenades(match) });
+  }
+
+  let changed = false;
+
+  if (match.phase === 'live' && now >= match.phaseUntil) {
+    const winner = grinder.finishRound(match, now);
+    broadcastGrinder(match, {
+      type: 'grinderRoundEnd',
+      round: match.round,
+      winnerId: winner?.id ?? null,
+      winnerName: winner ? players.get(winner.id)?.nickname ?? 'Player' : null,
+      standings: match.standings.map((entry) => ({
+        ...entry,
+        nickname: players.get(entry.id)?.nickname ?? 'Player',
+      })),
+    });
+    changed = true;
+  } else if (match.phase === 'over' && now >= match.phaseUntil) {
+    grinder.startRound(match, now);
+    changed = true;
+  }
+
+  for (const id of grinder.readyToRespawn(match, now)) {
+    const player = players.get(id);
+    if (!player) continue;
+    respawnInGrinder(match, player, now);
+    changed = true;
+  }
+
+  if (changed) broadcastGrinderState(match);
+}
+
+function grinderTick() {
+  const now = Date.now();
+  for (const match of grinder.allMatches()) tickGrinderMatch(match, now);
+}
+
+safeInterval(grinderTick, 100);
+
+const GRINDER_PICK_ERRORS = {
+  buy_closed: 'The round is over — wait for the next one.',
+  grenades_full: 'You are carrying enough grenades.',
+  already_owned: 'You already have that.',
+  not_for_sale: 'Not available here.',
+};
+
+function handleGrinderBuy(player, match, itemId) {
+  const result = grinder.applyPick(match, player.id, itemId);
+  if (!result.ok) {
+    safeSend(player.ws, { type: 'error', message: GRINDER_PICK_ERRORS[result.error] ?? 'Cannot take that.' });
+    return;
+  }
+
+  refillArsenalAmmo(result.member, result.item.id);
+  applyGrinderLoadout(player);
+  broadcastGrinderState(match);
+}
+
+function handleGrinderSwitch(player, match, slot) {
+  const member = match.members.get(player.id);
+  if (!member || !defusal.selectSlot(member, slot)) return;
+
+  applyGrinderLoadout(player);
+  broadcastGrinderState(match);
+}
+
+function handleGrinderThrow(player, match, direction) {
+  if (!player.alive || match.phase !== 'live') return;
+  if (!Array.isArray(direction) || direction.length !== 3) return;
+  if (!direction.every((value) => Number.isFinite(value))) return;
+
+  const member = match.members.get(player.id);
+  if (!defusal.isHoldingGrenade(member)) return;
+
+  const itemId = defusal.heldItemId(member);
+  if (!itemId) return;
+
+  clearSpawnProtection(player);
+
+  const grenade = grinder.throwGrenade(match, player.id, itemId, player.position, direction, Date.now());
+  if (!grenade) return;
+
+  broadcastGrinder(match, {
+    type: 'defusalGrenadeThrown',
+    id: grenade.id,
+    itemId: grenade.itemId,
+    ownerId: grenade.ownerId,
+    x: grenade.x,
+    y: grenade.y,
+    z: grenade.z,
+  });
+
+  applyGrinderLoadout(player);
+  broadcastGrinderState(match);
+}
+
+function handleGrinderMelee(player, match) {
+  const member = match.members.get(player.id);
+  if (!member || !player.alive || match.phase !== 'live') return;
+  if (member.held !== 'melee') return;
+
+  const now = Date.now();
+  if (now < (player.defusalSwingUntil || 0)) return;
+
+  clearSpawnProtection(player);
+
+  const knife = defusalArsenal.ARSENAL_BY_ID.get(member.melee);
+  player.defusalSwingUntil = now + knife.fireRateMs;
+  broadcastGrinder(match, { type: 'defusalSwing', playerId: player.id });
+
+  const [px, , pz] = player.position;
+  const facing = player.rotation || 0;
+  const forwardX = Math.sin(facing);
+  const forwardZ = -Math.cos(facing);
+
+  let best = null;
+  let bestDistance = Infinity;
+
+  for (const [id, other] of match.members) {
+    if (id === player.id || !other.alive) continue;
+
+    const target = players.get(id);
+    if (!target || !target.alive) continue;
+
+    const dx = target.position[0] - px;
+    const dz = target.position[2] - pz;
+    const distance = Math.hypot(dx, dz);
+    if (distance > knife.maxRange || distance >= bestDistance) continue;
+
+    const dot = distance > 0.001 ? (dx / distance) * forwardX + (dz / distance) * forwardZ : 1;
+    if (dot < 0.5) continue;
+
+    best = target;
+    bestDistance = distance;
+  }
+
+  if (!best) return;
+
+  const theirFacing = best.rotation || 0;
+  const behind = forwardX * Math.sin(theirFacing) + forwardZ * -Math.cos(theirFacing) > 0.35;
+  const damage = arsenalDamage(player, best, 'chest', bestDistance) * (behind ? 3 : 1);
+
+  applyBulletDamage(player, best, Math.round(damage), { point: best.position });
+}
 
 const SHOP_ITEMS = {
   'sign-on-a-stick': { id: 'sign-on-a-stick', name: 'Sign on a Stick', price: 100, maxOwned: 10 },
@@ -4342,7 +4776,7 @@ const CRATE_CONFIG = {
   pickupRadius: 3,
 };
 
-const CRATE_BLOCKED_LOCATIONS = new Set([ARENA_LOCATION_ID]);
+const CRATE_BLOCKED_LOCATIONS = new Set([ARENA_LOCATION_ID, ...EVENT_ROOM_IDS]);
 
 const deathCrates = new Map();
 let nextCrateId = 0;
@@ -5188,7 +5622,7 @@ function applyPlayerDamage(target, amount, options = {}) {
   if (target.health <= 0) {
     if (attemptDeathTrigger(target, !!attacker, now)) return applied;
 
-    if (attacker) {
+    if (attacker && !dust2MemberOf(attacker)) {
       attacker.stats.kills++;
       bumpFactionTaskProgress(attacker, 'kills', 1).catch((err) => console.error('[FactionTask] bump error:', err.message));
       applyKillRewards(attacker);
@@ -6633,6 +7067,10 @@ function executeMeme(player, meme, now) {
 
 function handleMemeCast(player, data) {
   if (typeof data.memeId !== 'string') return;
+  if (dust2MemberOf(player)) {
+    safeSend(player.ws, { type: 'memeResult', memeId: data.memeId, ok: false, reason: 'arsenal_only' });
+    return;
+  }
 
   const now = Date.now();
   const unlocked = progression.memeAbilityIdsForLevel(player.progression.level);
@@ -6686,6 +7124,7 @@ function rejectAbility(player, abilityId, reason) {
 function handleAbilityCast(player, data) {
   if (typeof data.abilityId !== 'string') return;
   if (!player.alive) return rejectAbility(player, data.abilityId, 'dead');
+  if (dust2MemberOf(player)) return rejectAbility(player, data.abilityId, 'arsenal_only');
 
   const state = player.progression;
   if (!skills.hasAbility(state.skills, data.abilityId)) return rejectAbility(player, data.abilityId, 'not_learned');
@@ -7363,6 +7802,7 @@ wss.on('connection', (ws) => {
         case 'skillRespec': handleSkillRespec(player); break;
         case 'skillLearn': handleSkillLearn(player, data); break;
         case 'abilityBind': handleAbilityBind(player, data); break;
+        case 'reload': handleReload(player); break;
         case 'abilityCast': handleAbilityCast(player, data); break;
         case 'fireModeSet': handleFireModeSet(player, data); break;
         case 'memeCast': handleMemeCast(player, data); break;
@@ -7455,6 +7895,12 @@ wss.on('connection', (ws) => {
       broadcastDefusalState(leavingMatch);
     }
     broadcastQueueState();
+
+    const leavingGrinder = grinder.leave(player.id);
+    if (leavingGrinder) {
+      if (leavingGrinder.members.size === 0) grinder.closeMatch(leavingGrinder);
+      else broadcastGrinderState(leavingGrinder);
+    }
 
     if (player.cave?.portalDoomed) {
       player.cave = null;
@@ -7934,6 +8380,15 @@ wss.on('connection', (ws) => {
     }
   }
 
+  function handleReload(player) {
+    if (!player.alive) return;
+    if (player.combat.weapon === 'staff') return;
+    if (player.weaponAmmo >= player.combat.magSize) return;
+
+    player.weaponAmmo = 0;
+    player.ammoEmptyAt = Date.now();
+  }
+
   function handleShoot(player, data) {
     if (!player.alive) return;
     clearSpawnProtection(player);
@@ -7942,9 +8397,13 @@ wss.on('connection', (ws) => {
     if (!data.origin.every(Number.isFinite)) return;
 
     const now = Date.now();
-    const weapon = weaponConfigFor(player);
-    const mode = fireModeFor(player);
-    const isStaff = player.combat.weapon === 'staff';
+    const arsenalEntry = dust2MemberOf(player);
+    const arsenalGun = arsenalEntry ? dust2GunOf(arsenalEntry) : null;
+    if (arsenalEntry && !arsenalGun) return;
+
+    const weapon = arsenalGun ? dust2WeaponConfig(arsenalGun) : weaponConfigFor(player);
+    const mode = arsenalGun ? progression.SINGLE_FIRE_MODE : fireModeFor(player);
+    const isStaff = !arsenalGun && player.combat.weapon === 'staff';
 
     const directions = readShotDirections(data, shotProjectileCount(mode), mode.spreadDegrees || 0);
     if (!directions) {
@@ -7967,7 +8426,7 @@ wss.on('connection', (ws) => {
       }
     }
 
-    const allowedInterval = shotIntervalFor(player, weapon, mode, now);
+    const allowedInterval = arsenalGun ? arsenalGun.fireRateMs : shotIntervalFor(player, weapon, mode, now);
     if (now - player.lastShotAt < allowedInterval - weapon.fireRateToleranceMs) {
       console.log(`[!] Shoot hack: ${playerId} firing faster than ${mode.id} allows`);
       return;
@@ -8241,7 +8700,14 @@ wss.on('connection', (ws) => {
     const target = players.get(data.target);
     if (!target || !target.authenticated || !target.alive) return;
     if (data.target === playerId) return;
-    if (party.areAllies(playerId, data.target)) return;
+
+    const grinderMatch = grinder.matchOf(playerId);
+    if (grinderMatch) {
+      if (grinderMatch.phase !== 'live') return;
+      if (!grinderMatch.members.has(data.target)) return;
+    } else if (party.areAllies(playerId, data.target)) {
+      return;
+    }
 
     const defusalMatch = defusal.matchOf(playerId);
     if (defusalMatch) {
@@ -8287,14 +8753,16 @@ wss.on('connection', (ws) => {
 
     if (isSpawnProtected(target)) return;
 
-    const isHeadshot = Array.isArray(data.point) && data.point[1] - historicalPos[1] > 1.35;
-    const baseDamage = defusalMatch
-      ? defusalDamage(player, target, player.combat.pvpDamage, isHeadshot)
+    const inArsenalMode = defusalMatch !== null || grinderMatch !== null;
+    const baseDamage = inArsenalMode
+      ? arsenalDamage(player, target, dust2HitZone(data.point, historicalPos), dist)
       : player.combat.pvpDamage * matchedShot.damageMult * allyDamageBonus(player);
 
     applyBulletDamage(player, target, baseDamage, { point: historicalPos });
 
-    applyShotPassives(player, matchedShot, { kind: 'player', entity: target }, historicalPos);
+    if (!inArsenalMode) {
+      applyShotPassives(player, matchedShot, { kind: 'player', entity: target }, historicalPos);
+    }
   }
 
   function handleEnemyHit(player, data) {
@@ -10203,8 +10671,16 @@ wss.on('connection', (ws) => {
   }
 
   function handleDefusalBuy(player, data) {
+    if (typeof data.itemId !== 'string') return;
+
+    const grinderMatch = grinder.matchOf(player.id);
+    if (grinderMatch) {
+      handleGrinderBuy(player, grinderMatch, data.itemId);
+      return;
+    }
+
     const match = defusal.matchOf(player.id);
-    if (!match || typeof data.itemId !== 'string') return;
+    if (!match) return;
 
     const result = defusal.applyPurchase(match, player.id, data.itemId);
     if (!result.ok) {
@@ -10219,11 +10695,18 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    refillArsenalAmmo(result.member, result.item.id);
     applyDefusalLoadout(player);
     broadcastDefusalState(match);
   }
 
   function handleDefusalThrow(player, data) {
+    const grinderMatch = grinder.matchOf(player.id);
+    if (grinderMatch) {
+      handleGrinderThrow(player, grinderMatch, data.direction);
+      return;
+    }
+
     const match = defusal.matchOf(player.id);
     if (!match || !player.alive || match.phase === 'freeze' || match.phase === 'over') return;
     if (!Array.isArray(data.direction) || data.direction.length !== 3) return;
@@ -10234,6 +10717,8 @@ wss.on('connection', (ws) => {
 
     const itemId = defusal.heldItemId(member);
     if (!itemId) return;
+
+    clearSpawnProtection(player);
 
     const grenade = defusal.throwGrenade(match, player.id, itemId, player.position, data.direction, Date.now());
     if (!grenade) {
@@ -10256,6 +10741,12 @@ wss.on('connection', (ws) => {
   // Melee is server-side entirely: reach, arc and a back-strike bonus, no
   // client-reported hit to trust.
   function handleDefusalMelee(player) {
+    const grinderMatch = grinder.matchOf(player.id);
+    if (grinderMatch) {
+      handleGrinderMelee(player, grinderMatch);
+      return;
+    }
+
     const match = defusal.matchOf(player.id);
     const member = match?.members.get(player.id);
     if (!match || !member || !player.alive) return;
@@ -10264,6 +10755,8 @@ wss.on('connection', (ws) => {
 
     const now = Date.now();
     if (now < (player.defusalSwingUntil || 0)) return;
+
+    clearSpawnProtection(player);
 
     const knife = defusalArsenal.ARSENAL_BY_ID.get(member.melee);
     player.defusalSwingUntil = now + knife.fireRateMs;
@@ -10301,12 +10794,18 @@ wss.on('connection', (ws) => {
 
     const theirFacing = best.rotation || 0;
     const behind = forwardX * Math.sin(theirFacing) + forwardZ * -Math.cos(theirFacing) > 0.35;
-    const damage = defusalDamage(player, best, knife.damage * (behind ? 3 : 1), false);
+    const damage = arsenalDamage(player, best, 'chest', bestDistance) * (behind ? 3 : 1);
 
-    applyBulletDamage(player, best, damage, { point: best.position });
+    applyBulletDamage(player, best, Math.round(damage), { point: best.position });
   }
 
   function handleDefusalSwitch(player, data) {
+    const grinderMatch = grinder.matchOf(player.id);
+    if (grinderMatch) {
+      handleGrinderSwitch(player, grinderMatch, data.slot);
+      return;
+    }
+
     const match = defusal.matchOf(player.id);
     const member = match?.members.get(player.id);
     if (!member) return;
@@ -10905,6 +11404,14 @@ wss.on('connection', (ws) => {
 
     if (data.locationId === CAVE_LOCATION_ID) {
       enterCave(player);
+    }
+
+    if (oldLocation === grinder.GRINDER_CONFIG.locationId) {
+      leaveGrinder(player);
+    }
+
+    if (data.locationId === grinder.GRINDER_CONFIG.locationId) {
+      enterGrinder(player);
     }
 
     if (data.locationId === GALAXY_LOCATION_ID) {
