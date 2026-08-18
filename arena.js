@@ -1,6 +1,6 @@
 // game-server/arena.js
 const ARENA_CONFIG = {
-  locationId: 'tower-events',
+  locationId: 'event-arena',
   candleHealth: 3000,
   candlePosition: [0, 0, 0],
   arenaRadius: 52,
@@ -18,10 +18,10 @@ const ARENA_CONFIG = {
   xpCap: 3000,
   cooldownMs: 60 * 60 * 1000,
   spawnGates: [
-    [0, 0, -46],
-    [46, 0, 0],
-    [0, 0, 46],
-    [-46, 0, 0],
+    [32.5, 0, -32.5],
+    [32.5, 0, 32.5],
+    [-32.5, 0, 32.5],
+    [-32.5, 0, -32.5],
   ],
 };
 
@@ -56,10 +56,15 @@ function waveComposition(wave) {
   };
 }
 
-function rewardsFor(wavesCleared) {
+function rewardsFor(wavesCleared, config = null) {
+  const ashPerWave = Number.isFinite(config?.ashPerWave) ? config.ashPerWave : ARENA_CONFIG.ashPerWave;
+  const xpPerWave = Number.isFinite(config?.xpPerWave) ? config.xpPerWave : ARENA_CONFIG.xpPerWave;
+  const ashCap = Number.isFinite(config?.ashCap) ? config.ashCap : ARENA_CONFIG.ashCap;
+  const xpCap = Number.isFinite(config?.xpCap) ? config.xpCap : ARENA_CONFIG.xpCap;
+
   return {
-    ash: Math.min(ARENA_CONFIG.ashPerWave * wavesCleared, ARENA_CONFIG.ashCap),
-    xp: Math.min(ARENA_CONFIG.xpPerWave * wavesCleared, ARENA_CONFIG.xpCap),
+    ash: Math.min(ashPerWave * wavesCleared, ashCap),
+    xp: Math.min(xpPerWave * wavesCleared, xpCap),
   };
 }
 

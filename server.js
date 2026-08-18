@@ -21,6 +21,9 @@ const skills = require('./skills');
 const abilities = require('./abilities');
 const party = require('./party');
 const arena = require('./arena');
+const eventSchedule = require('./eventSchedule');
+const defusal = require('./defusal');
+const defusalArsenal = require('./defusalArsenal');
 
 const PORT = process.env.PORT || 3001;
 const MAX_CONNECTIONS = 2000;
@@ -347,6 +350,81 @@ function nextFactionTaskGeneration(factionId) {
 }
 
 const VALID_STATES = new Set(['idle', 'walk', 'sprint', 'jump']);
+const EVENTS_LOBBY_ID = 'tower-events';
+
+const EVENT_ROOMS = {
+  'event-arena': { radius: 60, spawn: [0, 0, 46] },
+  'event-dust2': { radius: 72, spawn: [24, 0, 33] },
+  'event-pump': { radius: 58, spawn: [0, 0, 44] },
+  'event-whale': { radius: 62, spawn: [0, 0, 48] },
+  'event-mint': { radius: 54, spawn: [0, 0, 40] },
+  'event-bridge': { radius: 58, spawn: [0, 0, 44] },
+  'event-audit': { radius: 52, spawn: [0, 0, 38] },
+  'event-airdrop': { radius: 60, spawn: [0, 0, 46] },
+  'event-burn': { radius: 56, spawn: [0, 0, 42] },
+  'event-diamond': { radius: 54, spawn: [0, 0, 40] },
+};
+
+const EVENT_ROOM_IDS = Object.keys(EVENT_ROOMS);
+
+const EVENT_ID_BY_LOCATION = {
+  'event-arena': 'arena',
+  'event-dust2': 'dust2',
+  'event-pump': 'pump',
+  'event-whale': 'whale',
+  'event-mint': 'mint',
+  'event-bridge': 'bridge',
+  'event-audit': 'audit',
+  'event-airdrop': 'airdrop',
+  'event-burn': 'burn',
+  'event-diamond': 'diamond',
+};
+
+const EVENT_CONFIG_POLL_MS = 30000;
+const eventConfigs = new Map();
+
+async function refreshEventConfigs(gameId) {
+  if (!gameId || !CONFIG.internalSecret) return;
+
+  const result = await callInternalApi('/api/internal/game/event-configs', { gameId }).catch((err) => {
+    console.error('[Events] config refresh error:', err.message);
+    return null;
+  });
+  if (!Array.isArray(result?.events)) return;
+
+  eventConfigs.clear();
+  for (const event of result.events) {
+    if (typeof event?.id === 'string') eventConfigs.set(event.id, event);
+  }
+}
+
+function eventConfigFor(eventId) {
+  return eventConfigs.get(eventId) || null;
+}
+
+function eventConfigForLocation(locationId) {
+  const eventId = EVENT_ID_BY_LOCATION[locationId];
+  return eventId ? eventConfigFor(eventId) : null;
+}
+
+// An event with no config row yet is sealed, except the arena, which shipped open.
+// A configured event also has to be inside its scheduled window right now.
+function isEventOpen(eventId) {
+  const config = eventConfigFor(eventId);
+  if (!config) return eventId === 'arena';
+  if (config.enabled !== true) return false;
+  return eventSchedule.eventWindow(config).open;
+}
+
+function eventSealedReason(eventId) {
+  const config = eventConfigFor(eventId);
+  if (!config || config.enabled !== true) return 'sealed';
+
+  const window = eventSchedule.eventWindow(config);
+  if (window.open) return null;
+  return window.state === 'upcoming' ? 'not_started' : 'window_closed';
+}
+
 const VALID_LOCATIONS = new Set([
   'main-world',
   'cave',
@@ -354,8 +432,9 @@ const VALID_LOCATIONS = new Set([
   'tower-first-floor',
   'tower-token-gates',
   'tower-basement',
-  'tower-events',
+  EVENTS_LOBBY_ID,
   'open-world-canyon',
+  ...EVENT_ROOM_IDS,
 ]);
 
 const FACTION_GATE_LOCATION_PATTERN = /^faction-gate-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -387,10 +466,14 @@ const LOCATION_MAX_RADIUS = {
   'tower-main-hall': 140,
   'tower-token-gates': 80,
   'tower-basement': GALAXY_MAX_RADIUS,
-  'tower-events': 62,
+  [EVENTS_LOBBY_ID]: 58,
   cave: 360,
   'open-world-canyon': 150,
 };
+
+for (const [locationId, room] of Object.entries(EVENT_ROOMS)) {
+  LOCATION_MAX_RADIUS[locationId] = room.radius;
+}
 const CAVE_LOCATION_ID = 'cave';
 const CAVE_CHEST_REWARD = 1000;
 const CAVE_CHEST_COOLDOWN_MS = 60 * 60 * 1000;
@@ -1192,6 +1275,7 @@ function markPlayerReady(player) {
 
 function isInProtectedZone(player) {
   if (player.locationId === 'tower-main-hall') return true;
+  if (player.locationId === EVENTS_LOBBY_ID) return true;
   if (player.locationId === 'main-world') {
     const [x, , z] = player.position;
     return Math.sqrt(x * x + z * z) <= MAIN_WORLD_SAFE_RADIUS;
@@ -1253,6 +1337,16 @@ function spawnInSafeZone(player, locationId) {
     player.position = [0, 0, 2];
     return;
   }
+  const eventRoom = EVENT_ROOMS[target];
+  if (eventRoom) {
+    const spread = 5;
+    player.position = [
+      eventRoom.spawn[0] + (Math.random() - 0.5) * spread,
+      eventRoom.spawn[1],
+      eventRoom.spawn[2] + (Math.random() - 0.5) * spread,
+    ];
+    return;
+  }
   const angle = Math.random() * Math.PI * 2;
   const maxRadius = getLocationMaxRadius(target);
   const spread = maxRadius == null ? 25 : Math.min(25, Math.max(0, maxRadius - 6));
@@ -1302,6 +1396,18 @@ function listShards(locationId) {
     shards.push({ instance: i, count: counts.get(i) || 0 });
   }
   return shards;
+}
+
+function partyShardFor(player, locationId) {
+  const group = party.partyOf(player.id);
+  if (!group) return null;
+
+  for (const id of group.memberIds) {
+    if (id === player.id) continue;
+    const member = players.get(id);
+    if (member && member.authenticated && member.locationId === locationId) return member.instance;
+  }
+  return null;
 }
 
 function pickShard(locationId, requestedInstance) {
@@ -2295,6 +2401,19 @@ function markPlayerDead(target, killerId, position) {
     broadcastArenaState(arenaRun);
   }
 
+  const defusalMatch = defusal.matchOf(target.id);
+  if (defusalMatch) {
+    const killer = killerId ? players.get(killerId) : null;
+    const killerMember = killer ? defusalMatch.members.get(killer.id) : null;
+    if (killerMember && defusal.sideOf(defusalMatch, killer.id) !== defusal.sideOf(defusalMatch, target.id)) {
+      const weapon = defusal.heldItem(killerMember);
+      defusal.award(killerMember, weapon?.killReward ?? 300);
+    }
+
+    defusal.markDead(defusalMatch, target.id);
+    broadcastDefusalState(defusalMatch);
+  }
+
   const deathMessage = {
     type: 'playerDeath',
     playerId: target.id,
@@ -2382,6 +2501,18 @@ function respawnPlayer(target, requested) {
 
 function handleRespawnRequest(player, data) {
   if (player.alive) return;
+
+  // Defusal rounds respawn you themselves — leaving early forfeits the match.
+  const match = defusal.matchOf(player.id);
+  if (match && match.phase !== 'ended') {
+    if (data?.target !== 'hall') {
+      safeSend(player.ws, { type: 'error', message: 'You are out until the round ends.' });
+      return;
+    }
+    defusal.dropMember(match, player.id);
+    clearDefusalLoadout(player);
+  }
+
   respawnPlayer(player, typeof data?.target === 'string' ? data.target : null);
 }
 
@@ -3173,7 +3304,10 @@ function startArenaWave(run, now) {
 
 function finishArenaRun(run, reason, now) {
   const cleared = run.wavesCleared;
-  const reward = arena.rewardsFor(cleared);
+  const config = eventConfigFor('arena');
+  const reward = arena.rewardsFor(cleared, config);
+  const cooldownMs = Math.max(0, Math.round((config?.cooldownMinutes ?? arena.ARENA_CONFIG.cooldownMs / 60000) * 60000));
+  const participants = [];
 
   for (const id of run.memberIds) {
     const member = players.get(id);
@@ -3184,9 +3318,12 @@ function finishArenaRun(run, reason, now) {
       member.economyChangedAt = now;
       grantXp(member, reward.xp, 'arena');
       if (cleared > (member.arenaBestWave || 0)) member.arenaBestWave = cleared;
+      if (member.userId && member.wallet) {
+        participants.push({ userId: member.userId, wallet: member.wallet, ash: reward.ash, xp: reward.xp });
+      }
     }
 
-    member.arenaCooldownUntil = now + arena.ARENA_CONFIG.cooldownMs;
+    member.arenaCooldownUntil = now + cooldownMs;
     member.arenaReviveUntil = 0;
     member.arenaReviveTargetId = null;
 
@@ -3204,7 +3341,24 @@ function finishArenaRun(run, reason, now) {
     persistPlayer(member);
   }
 
+  recordEventRun(run, 'arena', cleared, participants, now);
   arena.endRun(run);
+}
+
+function recordEventRun(run, eventId, wavesCleared, participants, now) {
+  if (wavesCleared <= 0 || participants.length === 0) return;
+
+  const gameId = players.get(run.memberIds[0])?.gameId;
+  if (!gameId) return;
+
+  callInternalApi('/api/internal/game/event-run', {
+    gameId,
+    eventId,
+    wavesCleared,
+    partySize: run.memberIds.length,
+    durationSeconds: Math.max(0, Math.round((now - run.startedAt) / 1000)),
+    participants,
+  }).catch((err) => console.error('[Events] run record error:', err.message));
 }
 
 function damageCandle(run, enemy, now) {
@@ -3331,6 +3485,335 @@ function arenaTick() {
 }
 
 safeInterval(arenaTick, CANYON_CONFIG.tickRate);
+
+function defusalNicknames(match) {
+  const names = new Map();
+  for (const id of match.members.keys()) {
+    names.set(id, players.get(id)?.nickname ?? 'Player');
+  }
+  return names;
+}
+
+function broadcastDefusal(match, payload) {
+  for (const id of match.members.keys()) {
+    const player = players.get(id);
+    if (player) safeSend(player.ws, payload);
+  }
+}
+
+function broadcastDefusalState(match) {
+  broadcastDefusal(match, defusal.serializeMatch(match, defusalNicknames(match)));
+}
+
+function broadcastQueueState() {
+  const payload = defusal.serializeQueue();
+  players.forEach((player) => {
+    if (player.authenticated && (player.locationId === EVENTS_LOBBY_ID || defusal.isQueued(player.id))) {
+      safeSend(player.ws, payload);
+    }
+  });
+}
+
+function applyDefusalLoadout(player) {
+  const match = defusal.matchOf(player.id);
+  const member = match?.members.get(player.id) ?? null;
+  const weapon = defusal.heldItem(member);
+  const holdingGrenade = defusal.isHoldingGrenade(member);
+  const config = defusal.DEFUSAL_CONFIG;
+
+  player.combat = {
+    ...player.combat,
+    maxHealth: config.baseHealth,
+    moveSpeedMult: holdingGrenade ? 1.06 : weapon?.moveSpeedMult ?? 1,
+    enemyDamage: holdingGrenade ? 0 : weapon?.damage ?? 26,
+    pvpDamage: holdingGrenade ? 0 : weapon?.damage ?? 26,
+    magSize: holdingGrenade ? 0 : weapon?.magSize || 20,
+    reloadMs: weapon?.reloadMs || 2100,
+    armorPen: weapon?.armorPen ?? 0.5,
+    damageVsUnshielded: 0,
+    explosiveDamage: 1,
+  };
+
+  player.maxHealth = config.baseHealth;
+  player.defusalLocked = true;
+  player.defusalWeaponId = weapon?.id ?? null;
+  player.defusalHolding = member?.held ?? 'pistol';
+
+  safeSend(player.ws, buildProgressionPayload(player));
+}
+
+function clearDefusalLoadout(player) {
+  if (!player) return;
+  player.defusalLocked = false;
+  player.defusalWeaponId = null;
+  refreshCombatStats(player);
+  safeSend(player.ws, buildProgressionPayload(player));
+}
+
+// Armour eats half of what gets through, the helmet blunts headshots, and the
+// sniper is allowed to skip all of it — that is what people pay 4750 for.
+function defusalDamage(attacker, target, rawDamage, isHeadshot) {
+  const match = defusal.matchOf(target.id);
+  const member = match?.members.get(target.id);
+  if (!member) return rawDamage;
+
+  const weapon = attacker ? defusal.heldItem(match.members.get(attacker.id)) : null;
+  const config = defusal.DEFUSAL_CONFIG;
+
+  let damage = rawDamage;
+  if (isHeadshot) {
+    const mult = weapon?.headshotMult ?? 1;
+    damage *= member.helmet ? Math.max(1, mult * config.helmetHeadshotMult) : mult;
+  }
+
+  if (weapon?.oneShot) return Math.max(damage, config.baseHealth + 1);
+
+  if (member.armorPoints > 0) {
+    const absorbed = Math.round(damage * config.armorAbsorb * (1 - (weapon?.armorPen ?? 0)));
+    member.armorPoints = Math.max(0, member.armorPoints - Math.round(absorbed * 0.5));
+    damage -= absorbed;
+  }
+
+  return Math.max(1, Math.round(damage));
+}
+
+function respawnForRound(match, now) {
+  for (const [id, member] of match.members) {
+    const player = players.get(id);
+    if (!player) continue;
+
+    const spawn = defusal.spawnFor(match, id);
+    if (spawn) player.position = spawn;
+
+    player.alive = true;
+    member.alive = true;
+    player.health = defusal.DEFUSAL_CONFIG.loadout.maxHealth;
+    player.positionHistory = [];
+    player.recentShots = [];
+    player.justTeleported = true;
+    player.teleportSettleUntil = now + TELEPORT_SETTLE_MS;
+
+    applyDefusalLoadout(player);
+
+    safeSend(player.ws, {
+      type: 'defusalRespawn',
+      position: player.position,
+      health: player.health,
+      side: defusal.sideOf(match, id),
+    });
+    broadcast({ type: 'playerRespawn', id, position: player.position, health: player.health }, id, true, player);
+  }
+}
+
+function finishDefusalRound(match, outcome, now) {
+  match.score[outcome.side] += 1;
+  match.phase = 'over';
+  match.phaseUntil = now + defusal.DEFUSAL_CONFIG.roundEndMs;
+
+  defusal.payRound(match, outcome.side);
+  defusal.carryLoadout(match);
+
+  broadcastDefusal(match, {
+    type: 'defusalRoundEnd',
+    round: match.round,
+    side: outcome.side,
+    reason: outcome.reason,
+    score: { t: match.score.t, ct: match.score.ct },
+  });
+  broadcastDefusalState(match);
+}
+
+function explodeBomb(match, now) {
+  const bomb = match.bomb;
+  bomb.state = 'exploded';
+
+  const config = defusal.DEFUSAL_CONFIG;
+  for (const [id, member] of match.members) {
+    if (!member.alive) continue;
+    const player = players.get(id);
+    if (!player) continue;
+
+    const distance = Math.hypot(player.position[0] - bomb.x, player.position[2] - bomb.z);
+    if (distance > config.bombBlastRadius) continue;
+
+    applyPlayerDamage(player, config.bombDamage, { ignoreShield: true });
+  }
+
+  broadcastDefusal(match, { type: 'defusalBombExploded', x: bomb.x, z: bomb.z });
+}
+
+function detonateGrenade(match, grenade, now) {
+  const physics = defusal.GRENADE_PHYSICS;
+
+  broadcastDefusal(match, {
+    type: 'defusalGrenadeBurst',
+    id: grenade.id,
+    itemId: grenade.itemId,
+    x: grenade.x,
+    y: grenade.y,
+    z: grenade.z,
+  });
+
+  if (grenade.itemId === 'liquidation') {
+    const item = defusalArsenal.ARSENAL_BY_ID.get('liquidation');
+    for (const [id, member] of match.members) {
+      if (!member.alive) continue;
+      const target = players.get(id);
+      if (!target) continue;
+
+      const distance = Math.hypot(target.position[0] - grenade.x, target.position[2] - grenade.z);
+      if (distance > item.maxRange) continue;
+
+      const falloff = 1 - distance / item.maxRange;
+      applyPlayerDamage(target, Math.max(1, Math.round(item.damage * falloff)), {
+        attackerId: grenade.ownerId,
+        ignoreShield: true,
+      });
+    }
+    return;
+  }
+
+  if (grenade.itemId === 'rug-flash') {
+    for (const [id, member] of match.members) {
+      if (!member.alive) continue;
+      const target = players.get(id);
+      if (!target) continue;
+
+      const blindMs = defusal.flashStrength(grenade, target.position, target.rotation || 0);
+      if (blindMs > 250) safeSend(target.ws, { type: 'defusalFlashed', durationMs: blindMs });
+    }
+    return;
+  }
+
+  broadcastDefusal(match, {
+    type: 'defusalCloud',
+    x: grenade.x,
+    z: grenade.z,
+    radius: physics.cloudRange,
+    untilMs: now + physics.cloudMs,
+  });
+}
+
+function tickDefusalMatch(match, now) {
+  for (const id of Array.from(match.members.keys())) {
+    const player = players.get(id);
+    const present = player && player.authenticated && player.locationId === defusal.DEFUSAL_CONFIG.locationId;
+    if (!present) defusal.dropMember(match, id);
+  }
+
+  if (match.members.size === 0) {
+    defusal.endMatch(match);
+    return;
+  }
+
+  for (const grenade of defusal.stepGrenades(match, 0.25, now)) detonateGrenade(match, grenade, now);
+  if ((match.grenades ?? []).length > 0) {
+    broadcastDefusal(match, { type: 'defusalGrenades', grenades: defusal.serializeGrenades(match) });
+  }
+
+  const bomb = match.bomb;
+
+  if (bomb && bomb.planting && now >= bomb.planting.until) {
+    bomb.state = 'planted';
+    bomb.site = bomb.planting.site;
+    bomb.x = bomb.planting.x;
+    bomb.z = bomb.planting.z;
+    bomb.plantedAt = now;
+    bomb.explodesAt = now + defusal.DEFUSAL_CONFIG.bombMs;
+    bomb.carrierId = null;
+    bomb.planting = null;
+    match.phase = 'planted';
+    match.phaseUntil = bomb.explodesAt;
+    broadcastDefusal(match, { type: 'defusalBombPlanted', site: bomb.site, x: bomb.x, z: bomb.z, explodesAt: bomb.explodesAt });
+    broadcastDefusalState(match);
+  }
+
+  if (bomb && bomb.defusing && now >= bomb.defusing.until) {
+    bomb.state = 'defused';
+    bomb.defusing = null;
+    broadcastDefusal(match, { type: 'defusalBombDefused' });
+  }
+
+  if (bomb && bomb.state === 'planted' && now >= bomb.explodesAt) {
+    explodeBomb(match, now);
+  }
+
+  if (match.phase === 'warmup' && now >= match.phaseUntil) {
+    defusal.startRound(match, now);
+    respawnForRound(match, now);
+    broadcastDefusalState(match);
+    return;
+  }
+
+  if (match.phase === 'freeze' && now >= match.phaseUntil) {
+    match.phase = 'live';
+    match.phaseUntil = now + defusal.DEFUSAL_CONFIG.roundMs;
+    broadcastDefusalState(match);
+    return;
+  }
+
+  if (match.phase === 'live' || match.phase === 'planted') {
+    const outcome = defusal.roundOutcome(match, now);
+    if (outcome) finishDefusalRound(match, outcome, now);
+    return;
+  }
+
+  if (match.phase === 'over' && now >= match.phaseUntil) {
+    if (defusal.isMatchOver(match)) {
+      const winner = match.score.t > match.score.ct ? 't' : 'ct';
+      broadcastDefusal(match, {
+        type: 'defusalMatchEnd',
+        winner,
+        score: { t: match.score.t, ct: match.score.ct },
+      });
+      for (const id of match.members.keys()) clearDefusalLoadout(players.get(id));
+      defusal.endMatch(match);
+      return;
+    }
+
+    if (match.round === defusal.DEFUSAL_CONFIG.swapAfterRound && !match.swapped) {
+      match.swapped = true;
+      defusal.resetLoadouts(match);
+      broadcastDefusal(match, { type: 'defusalSideSwap' });
+    }
+
+    defusal.startRound(match, now);
+    respawnForRound(match, now);
+    broadcastDefusalState(match);
+  }
+}
+
+function defusalTick() {
+  const now = Date.now();
+
+  for (const match of defusal.allMatches()) tickDefusalMatch(match, now);
+
+  if (defusal.shouldFormMatch(now)) {
+    const match = defusal.createMatch(1, now);
+    if (match) {
+      for (const id of match.members.keys()) {
+        const player = players.get(id);
+        if (!player) continue;
+
+        player.locationId = defusal.DEFUSAL_CONFIG.locationId;
+        player.instance = 1;
+        player.position = defusal.spawnFor(match, id) ?? [0, 0, 0];
+        player.weaponEquipped = true;
+        applyDefusalLoadout(player);
+
+        safeSend(player.ws, {
+          type: 'forceTeleport',
+          locationId: defusal.DEFUSAL_CONFIG.locationId,
+          position: player.position,
+        });
+      }
+      broadcastDefusalState(match);
+    }
+    broadcastQueueState();
+  }
+}
+
+safeInterval(defusalTick, 250);
 
 const SHOP_ITEMS = {
   'sign-on-a-stick': { id: 'sign-on-a-stick', name: 'Sign on a Stick', price: 100, maxOwned: 10 },
@@ -4188,6 +4671,7 @@ function computeCombatStats(player) {
 }
 
 function refreshCombatStats(player) {
+  if (player.defusalLocked) return;
   player.combat = computeCombatStats(player);
 
   if (!player.ability) player.ability = abilities.createAbilityState(player.combat.maxEnergy);
@@ -6494,6 +6978,11 @@ safeInterval(async () => {
 }, 60000);
 
 safeInterval(async () => {
+  const anyPlayer = Array.from(players.values()).find((p) => p.authenticated && p.gameId);
+  if (anyPlayer) await refreshEventConfigs(anyPlayer.gameId);
+}, EVENT_CONFIG_POLL_MS);
+
+safeInterval(async () => {
   if (!CONFIG.internalSecret) return;
 
   const authedPlayers = Array.from(players.values()).filter((p) => p.authenticated && p.userId && p.gameId);
@@ -6778,6 +7267,8 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'crate', CONFIG.network.crateRateLimit)) return;
       } else if (data.type === 'partyInvite' || data.type === 'partyAccept' || data.type === 'partyDecline' || data.type === 'partyLeave' || data.type === 'partyKick') {
         if (!checkRateLimit(playerId, 'party', CONFIG.network.partyRateLimit)) return;
+      } else if (data.type === 'defusalQueue' || data.type === 'defusalLeaveQueue' || data.type === 'defusalPlant' || data.type === 'defusalDefuse' || data.type === 'defusalCancel' || data.type === 'defusalBuy' || data.type === 'defusalSwitch' || data.type === 'defusalThrow' || data.type === 'defusalMelee') {
+        if (!checkRateLimit(playerId, 'arena', CONFIG.network.arenaRateLimit)) return;
       } else if (data.type === 'arenaStart' || data.type === 'arenaJoin' || data.type === 'arenaLeave' || data.type === 'arenaRevive') {
         if (!checkRateLimit(playerId, 'arena', CONFIG.network.arenaRateLimit)) return;
       } else if (data.type === 'stuckTeleport' || data.type === 'homeTeleport') {
@@ -6834,6 +7325,15 @@ wss.on('connection', (ws) => {
         case 'arenaJoin': handleArenaJoin(player); break;
         case 'arenaLeave': handleArenaLeave(player); break;
         case 'arenaRevive': handleArenaRevive(player, data); break;
+        case 'defusalQueue': handleDefusalQueue(player); break;
+        case 'defusalLeaveQueue': handleDefusalLeaveQueue(player); break;
+        case 'defusalPlant': handleDefusalPlant(player); break;
+        case 'defusalDefuse': handleDefusalDefuse(player); break;
+        case 'defusalCancel': handleDefusalCancel(player); break;
+        case 'defusalBuy': handleDefusalBuy(player, data); break;
+        case 'defusalSwitch': handleDefusalSwitch(player, data); break;
+        case 'defusalThrow': handleDefusalThrow(player, data); break;
+        case 'defusalMelee': handleDefusalMelee(player); break;
         case 'sellToken': handleSellToken(player, data); break;
         case 'shopBuyItem': handleShopBuyItem(player, data); break;
         case 'signPlace': handleSignPlace(player, data); break;
@@ -6947,6 +7447,14 @@ wss.on('connection', (ws) => {
       player.arenaCooldownUntil = Date.now() + arena.ARENA_CONFIG.cooldownMs;
       broadcastArenaState(leavingRun);
     }
+
+    defusal.forgetQueued(player.id);
+    const leavingMatch = defusal.matchOf(player.id);
+    if (leavingMatch) {
+      defusal.dropMember(leavingMatch, player.id);
+      broadcastDefusalState(leavingMatch);
+    }
+    broadcastQueueState();
 
     if (player.cave?.portalDoomed) {
       player.cave = null;
@@ -7244,6 +7752,7 @@ wss.on('connection', (ws) => {
 
     await refreshPlayerCosmetics(player);
     if (shopPriceOverrides.size === 0) await refreshShopPrices(player.gameId);
+    if (eventConfigs.size === 0) await refreshEventConfigs(player.gameId);
 
     const blocksResult = await callInternalApi('/api/internal/game/blocks/list', {
       userId: player.userId, gameId: player.gameId,
@@ -7734,6 +8243,12 @@ wss.on('connection', (ws) => {
     if (data.target === playerId) return;
     if (party.areAllies(playerId, data.target)) return;
 
+    const defusalMatch = defusal.matchOf(playerId);
+    if (defusalMatch) {
+      if (defusalMatch.phase === 'freeze' || defusalMatch.phase === 'over') return;
+      if (defusal.sideOf(defusalMatch, playerId) === defusal.sideOf(defusalMatch, data.target)) return;
+    }
+
     if (player.locationId !== target.locationId) {
       console.log(`[!] Hit hack: different locations ${player.locationId} vs ${target.locationId}`);
       return;
@@ -7772,9 +8287,12 @@ wss.on('connection', (ws) => {
 
     if (isSpawnProtected(target)) return;
 
-    applyBulletDamage(player, target, player.combat.pvpDamage * matchedShot.damageMult * allyDamageBonus(player), {
-      point: historicalPos,
-    });
+    const isHeadshot = Array.isArray(data.point) && data.point[1] - historicalPos[1] > 1.35;
+    const baseDamage = defusalMatch
+      ? defusalDamage(player, target, player.combat.pvpDamage, isHeadshot)
+      : player.combat.pvpDamage * matchedShot.damageMult * allyDamageBonus(player);
+
+    applyBulletDamage(player, target, baseDamage, { point: historicalPos });
 
     applyShotPassives(player, matchedShot, { kind: 'player', entity: target }, historicalPos);
   }
@@ -9537,16 +10055,20 @@ wss.on('connection', (ws) => {
 
     if (!player.alive) return arenaRefusal(player, 'dead');
     if (player.locationId !== ARENA_LOCATION_ID) return arenaRefusal(player, 'wrong_place');
+    const sealed = eventSealedReason('arena');
+    if (sealed) return arenaRefusal(player, sealed);
     if (arena.runForPlayer(player.id)) return arenaRefusal(player, 'already_running');
     if (arena.runForInstance(player.instance)) return arenaRefusal(player, 'instance_busy');
     if (now < (player.arenaCooldownUntil || 0)) return arenaRefusal(player, 'cooldown');
 
+    const maxParty = Math.max(1, Math.min(party.MAX_PARTY_SIZE, eventConfigFor('arena')?.maxParty ?? party.MAX_PARTY_SIZE));
     const group = party.partyOf(player.id);
     const memberIds = [player.id];
 
     if (group) {
       for (const id of group.memberIds) {
         if (id === player.id) continue;
+        if (memberIds.length >= maxParty) break;
         const member = players.get(id);
         if (!member || !member.alive) continue;
         if (member.locationId !== ARENA_LOCATION_ID || member.instance !== player.instance) continue;
@@ -9554,6 +10076,9 @@ wss.on('connection', (ws) => {
         memberIds.push(id);
       }
     }
+
+    const minParty = Math.max(1, Math.min(maxParty, eventConfigFor('arena')?.minParty ?? 1));
+    if (memberIds.length < minParty) return arenaRefusal(player, 'need_party');
 
     const created = arena.createRun(player.instance, memberIds, now);
     if (!created.ok) return arenaRefusal(player, created.error);
@@ -9597,6 +10122,214 @@ wss.on('connection', (ws) => {
     });
     safeSend(player.ws, { type: 'enemyState', enemies: [] });
     broadcastArenaState(run);
+  }
+
+  function handleDefusalQueue(player) {
+    if (player.locationId !== EVENTS_LOBBY_ID) {
+      safeSend(player.ws, { type: 'error', message: 'Queue from the Events Hall.' });
+      return;
+    }
+    if (!isEventOpen(defusal.DEFUSAL_CONFIG.eventId)) {
+      safeSend(player.ws, { type: 'error', message: 'Dust II is sealed right now.' });
+      return;
+    }
+    if (defusal.matchOf(player.id)) return;
+
+    const group = party.partyOf(player.id);
+    const ids = group
+      ? group.memberIds.filter((id) => {
+        const member = players.get(id);
+        return member && member.authenticated && member.locationId === EVENTS_LOBBY_ID;
+      })
+      : [player.id];
+
+    const result = defusal.enqueue(ids.length > 0 ? ids : [player.id]);
+    if (!result.ok) {
+      safeSend(player.ws, { type: 'error', message: result.error === 'party_too_big' ? 'A party of five is the limit.' : 'Already in the queue.' });
+      return;
+    }
+
+    broadcastQueueState();
+  }
+
+  function handleDefusalLeaveQueue(player) {
+    if (defusal.dequeue(player.id)) broadcastQueueState();
+  }
+
+  function handleDefusalPlant(player) {
+    const match = defusal.matchOf(player.id);
+    if (!match || !player.alive) return;
+    if (match.phase !== 'live') return;
+
+    const bomb = match.bomb;
+    if (!bomb || bomb.state !== 'carried' || bomb.carrierId !== player.id) return;
+    if (bomb.planting) return;
+
+    const [x, , z] = player.position;
+    const site = defusal.siteAt(x, z);
+    if (!site) {
+      safeSend(player.ws, { type: 'error', message: 'You have to be on a bomb site.' });
+      return;
+    }
+
+    bomb.planting = {
+      playerId: player.id,
+      site,
+      x,
+      z,
+      until: Date.now() + defusal.DEFUSAL_CONFIG.plantMs,
+    };
+    broadcastDefusalState(match);
+  }
+
+  function handleDefusalDefuse(player) {
+    const match = defusal.matchOf(player.id);
+    if (!match || !player.alive) return;
+
+    const bomb = match.bomb;
+    if (!bomb || bomb.state !== 'planted' || bomb.defusing) return;
+
+    const side = defusal.sideOf(match, player.id);
+    if (side !== 'ct') return;
+
+    const distance = Math.hypot(player.position[0] - bomb.x, player.position[2] - bomb.z);
+    if (distance > defusal.DEFUSAL_CONFIG.defuseReach) {
+      safeSend(player.ws, { type: 'error', message: 'Get closer to the bomb.' });
+      return;
+    }
+
+    bomb.defusing = { playerId: player.id, until: Date.now() + defusal.DEFUSAL_CONFIG.defuseMs };
+    broadcastDefusalState(match);
+  }
+
+  function handleDefusalBuy(player, data) {
+    const match = defusal.matchOf(player.id);
+    if (!match || typeof data.itemId !== 'string') return;
+
+    const result = defusal.applyPurchase(match, player.id, data.itemId);
+    if (!result.ok) {
+      const messages = {
+        buy_closed: 'The buy window is closed.',
+        too_poor: 'Not enough money.',
+        wrong_side: 'Not available to your side.',
+        grenades_full: 'You are carrying enough grenades.',
+        already_owned: 'You already have that.',
+      };
+      safeSend(player.ws, { type: 'error', message: messages[result.error] ?? 'Cannot buy that.' });
+      return;
+    }
+
+    applyDefusalLoadout(player);
+    broadcastDefusalState(match);
+  }
+
+  function handleDefusalThrow(player, data) {
+    const match = defusal.matchOf(player.id);
+    if (!match || !player.alive || match.phase === 'freeze' || match.phase === 'over') return;
+    if (!Array.isArray(data.direction) || data.direction.length !== 3) return;
+    if (!data.direction.every((value) => Number.isFinite(value))) return;
+
+    const member = match.members.get(player.id);
+    if (!defusal.isHoldingGrenade(member)) return;
+
+    const itemId = defusal.heldItemId(member);
+    if (!itemId) return;
+
+    const grenade = defusal.throwGrenade(match, player.id, itemId, player.position, data.direction, Date.now());
+    if (!grenade) {
+      safeSend(player.ws, { type: 'error', message: 'You are not carrying that.' });
+      return;
+    }
+
+    broadcastDefusal(match, {
+      type: 'defusalGrenadeThrown',
+      id: grenade.id,
+      itemId: grenade.itemId,
+      ownerId: grenade.ownerId,
+      x: grenade.x,
+      y: grenade.y,
+      z: grenade.z,
+    });
+    broadcastDefusalState(match);
+  }
+
+  // Melee is server-side entirely: reach, arc and a back-strike bonus, no
+  // client-reported hit to trust.
+  function handleDefusalMelee(player) {
+    const match = defusal.matchOf(player.id);
+    const member = match?.members.get(player.id);
+    if (!match || !member || !player.alive) return;
+    if (match.phase === 'freeze' || match.phase === 'over') return;
+    if (member.held !== 'melee') return;
+
+    const now = Date.now();
+    if (now < (player.defusalSwingUntil || 0)) return;
+
+    const knife = defusalArsenal.ARSENAL_BY_ID.get(member.melee);
+    player.defusalSwingUntil = now + knife.fireRateMs;
+    broadcastDefusal(match, { type: 'defusalSwing', playerId: player.id });
+
+    const mySide = defusal.sideOf(match, player.id);
+    const [px, , pz] = player.position;
+    const facing = player.rotation || 0;
+    const forwardX = Math.sin(facing);
+    const forwardZ = -Math.cos(facing);
+
+    let best = null;
+    let bestDistance = Infinity;
+
+    for (const [id, other] of match.members) {
+      if (id === player.id || !other.alive) continue;
+      if (defusal.sideOf(match, id) === mySide) continue;
+
+      const target = players.get(id);
+      if (!target || !target.alive) continue;
+
+      const dx = target.position[0] - px;
+      const dz = target.position[2] - pz;
+      const distance = Math.hypot(dx, dz);
+      if (distance > knife.maxRange || distance >= bestDistance) continue;
+
+      const dot = distance > 0.001 ? (dx / distance) * forwardX + (dz / distance) * forwardZ : 1;
+      if (dot < 0.5) continue;
+
+      best = target;
+      bestDistance = distance;
+    }
+
+    if (!best) return;
+
+    const theirFacing = best.rotation || 0;
+    const behind = forwardX * Math.sin(theirFacing) + forwardZ * -Math.cos(theirFacing) > 0.35;
+    const damage = defusalDamage(player, best, knife.damage * (behind ? 3 : 1), false);
+
+    applyBulletDamage(player, best, damage, { point: best.position });
+  }
+
+  function handleDefusalSwitch(player, data) {
+    const match = defusal.matchOf(player.id);
+    const member = match?.members.get(player.id);
+    if (!member) return;
+    if (!defusal.selectSlot(member, data.slot)) return;
+
+    applyDefusalLoadout(player);
+    broadcastDefusalState(match);
+  }
+
+  function handleDefusalCancel(player) {
+    const match = defusal.matchOf(player.id);
+    if (!match?.bomb) return;
+
+    let changed = false;
+    if (match.bomb.planting?.playerId === player.id) {
+      match.bomb.planting = null;
+      changed = true;
+    }
+    if (match.bomb.defusing?.playerId === player.id) {
+      match.bomb.defusing = null;
+      changed = true;
+    }
+    if (changed) broadcastDefusalState(match);
   }
 
   function handleArenaRevive(player, data) {
@@ -10030,6 +10763,21 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    const eventId = EVENT_ID_BY_LOCATION[data.locationId];
+    if (eventId && !isEventOpen(eventId)) {
+      const config = eventConfigFor(eventId);
+      const name = config?.title || 'That event';
+      const reason = eventSealedReason(eventId);
+      const message = reason === 'not_started'
+        ? `${name} has not opened yet.`
+        : reason === 'window_closed'
+          ? `${name} is over for now.`
+          : `${name} is sealed right now.`;
+
+      safeSend(player.ws, { type: 'error', message });
+      return;
+    }
+
     const oldLocation = player.locationId;
     if (oldLocation === data.locationId) {
       if (!isShardedLocation(oldLocation)) return;
@@ -10106,8 +10854,11 @@ wss.on('connection', (ws) => {
 
     const previousInstance = player.instance;
     player.locationId = data.locationId;
+    const requestedInstance = Number.isInteger(data.instance)
+      ? data.instance
+      : partyShardFor(player, data.locationId);
     player.instance = isShardedLocation(data.locationId)
-      ? pickShard(data.locationId, Number.isInteger(data.instance) ? data.instance : null)
+      ? pickShard(data.locationId, requestedInstance)
       : 1;
 
     if (player.locationId === 'tower-main-hall' && player.weaponEquipped) {
