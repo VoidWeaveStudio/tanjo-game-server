@@ -44,7 +44,6 @@ function contains(box, x, y, z) {
     && z >= box.minZ && z <= box.maxZ;
 }
 
-
 function hasLineOfSight(ax, ay, az, bx, by, bz) {
   for (const box of BLOCKERS) {
     if (contains(box, ax, ay, az) || contains(box, bx, by, bz)) continue;

@@ -1,6 +1,5 @@
 // game-server/defusalArsenal.js
 
-
 const DEFUSAL_ECONOMY = {
     startMoney: 800,
     maxMoney: 16000,
