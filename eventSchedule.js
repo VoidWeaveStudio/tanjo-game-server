@@ -1,6 +1,5 @@
 // game-server/eventSchedule.js
-// Mirror of eventWindow() in src/features/game/data/eventDoors.ts. Keep the two
-// in step: the client draws the countdown from its copy, this one gates entry.
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 function toEpoch(value) {

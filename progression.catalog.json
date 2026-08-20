@@ -69,38 +69,38 @@
   "branches": [
     {
       "id": "gunslinger",
-      "name": "Gunslinger",
+      "name": "g.branch.gunslinger.name",
       "weapon": "rifle",
-      "resourceName": "Energy",
+      "resourceName": "g.branch.gunslinger.resource",
       "accent": "#4FD1FF",
-      "tagline": "Rifles, fire modes and heavy ordnance."
+      "tagline": "g.branch.gunslinger.tagline"
     },
     {
       "id": "arcanist",
-      "name": "Arcanist",
+      "name": "g.branch.arcanist.name",
       "weapon": "staff",
-      "resourceName": "Mana",
+      "resourceName": "g.branch.arcanist.resource",
       "accent": "#C79AE0",
-      "tagline": "Staff bolts, wards and battlefield control."
+      "tagline": "g.branch.arcanist.tagline"
     }
   ],
   "tiers": [
-    { "index": 1, "id": "shrimp", "name": "Shrimp", "emoji": "🦐", "minLevel": 1, "accent": "#FF9E9E", "memeAbility": "shrimp_squeak" },
-    { "index": 2, "id": "crab", "name": "Crab", "emoji": "🦀", "minLevel": 6, "accent": "#FF7A4D", "memeAbility": "crab_walk" },
-    { "index": 3, "id": "octopus", "name": "Octopus", "emoji": "🐙", "minLevel": 11, "accent": "#C77DFF", "memeAbility": "ink_dump" },
-    { "index": 4, "id": "fish", "name": "Fish", "emoji": "🐟", "minLevel": 16, "accent": "#4FD1FF", "memeAbility": "bag_holder" },
-    { "index": 5, "id": "dolphin", "name": "Dolphin", "emoji": "🐬", "minLevel": 21, "accent": "#3BA9E8", "memeAbility": "pump_it" },
-    { "index": 6, "id": "shark", "name": "Shark", "emoji": "🦈", "minLevel": 26, "accent": "#7A8FA6", "memeAbility": "rug_pull" },
-    { "index": 7, "id": "orca", "name": "Orca", "emoji": "🐋", "minLevel": 31, "accent": "#E5E7EB", "memeAbility": "copium_cloud" },
-    { "index": 8, "id": "whale", "name": "Whale", "emoji": "🐳", "minLevel": 36, "accent": "#5C7CFA", "memeAbility": "whale_splash" },
-    { "index": 9, "id": "humpback", "name": "Humpback", "emoji": "🐋", "minLevel": 41, "accent": "#2F6B8F", "memeAbility": "airdrop" },
-    { "index": 10, "id": "kraken", "name": "Kraken", "emoji": "🦑", "minLevel": 46, "accent": "#B14AED", "memeAbility": "moon_launch" }
+    { "index": 1, "id": "shrimp", "name": "g.tier.shrimp.name", "emoji": "🦐", "minLevel": 1, "accent": "#FF9E9E", "memeAbility": "shrimp_squeak" },
+    { "index": 2, "id": "crab", "name": "g.tier.crab.name", "emoji": "🦀", "minLevel": 6, "accent": "#FF7A4D", "memeAbility": "crab_walk" },
+    { "index": 3, "id": "octopus", "name": "g.tier.octopus.name", "emoji": "🐙", "minLevel": 11, "accent": "#C77DFF", "memeAbility": "ink_dump" },
+    { "index": 4, "id": "fish", "name": "g.tier.fish.name", "emoji": "🐟", "minLevel": 16, "accent": "#4FD1FF", "memeAbility": "bag_holder" },
+    { "index": 5, "id": "dolphin", "name": "g.tier.dolphin.name", "emoji": "🐬", "minLevel": 21, "accent": "#3BA9E8", "memeAbility": "pump_it" },
+    { "index": 6, "id": "shark", "name": "g.tier.shark.name", "emoji": "🦈", "minLevel": 26, "accent": "#7A8FA6", "memeAbility": "rug_pull" },
+    { "index": 7, "id": "orca", "name": "g.tier.orca.name", "emoji": "🐋", "minLevel": 31, "accent": "#E5E7EB", "memeAbility": "copium_cloud" },
+    { "index": 8, "id": "whale", "name": "g.tier.whale.name", "emoji": "🐳", "minLevel": 36, "accent": "#5C7CFA", "memeAbility": "whale_splash" },
+    { "index": 9, "id": "humpback", "name": "g.tier.humpback.name", "emoji": "🐋", "minLevel": 41, "accent": "#2F6B8F", "memeAbility": "airdrop" },
+    { "index": 10, "id": "kraken", "name": "g.tier.kraken.name", "emoji": "🦑", "minLevel": 46, "accent": "#B14AED", "memeAbility": "moon_launch" }
   ],
   "memeAbilities": [
     {
       "id": "shrimp_squeak",
-      "name": "Shrimp Squeak",
-      "description": "A tiny squeak that kicks you half a metre backwards.",
+      "name": "g.meme.shrimp_squeak.name",
+      "description": "g.meme.shrimp_squeak.description",
       "emoji": "🦐",
       "cooldownMs": 20000,
       "durationMs": 1500,
@@ -108,8 +108,8 @@
     },
     {
       "id": "crab_walk",
-      "name": "Crab Walk",
-      "description": "Eight seconds of sideways strutting, slightly faster than usual.",
+      "name": "g.meme.crab_walk.name",
+      "description": "g.meme.crab_walk.description",
       "emoji": "🦀",
       "cooldownMs": 45000,
       "durationMs": 8000,
@@ -117,8 +117,8 @@
     },
     {
       "id": "ink_dump",
-      "name": "Ink Dump",
-      "description": "An ink cloud that darkens the screen of anyone standing in it.",
+      "name": "g.meme.ink_dump.name",
+      "description": "g.meme.ink_dump.description",
       "emoji": "🌊",
       "cooldownMs": 60000,
       "durationMs": 2000,
@@ -126,8 +126,8 @@
     },
     {
       "id": "bag_holder",
-      "name": "Bag Holder",
-      "description": "Carry a sack of worthless coins. It bends your back and attracts loot.",
+      "name": "g.meme.bag_holder.name",
+      "description": "g.meme.bag_holder.description",
       "emoji": "👜",
       "cooldownMs": 90000,
       "durationMs": 15000,
@@ -135,8 +135,8 @@
     },
     {
       "id": "pump_it",
-      "name": "Pump It",
-      "description": "Green candle overhead, double jump height for five seconds.",
+      "name": "g.meme.pump_it.name",
+      "description": "g.meme.pump_it.description",
       "emoji": "🕯️",
       "cooldownMs": 45000,
       "durationMs": 5000,
@@ -144,8 +144,8 @@
     },
     {
       "id": "rug_pull",
-      "name": "Rug Pull",
-      "description": "Yank yourself backwards on a red candle. The nearest enemy drops small change.",
+      "name": "g.meme.rug_pull.name",
+      "description": "g.meme.rug_pull.description",
       "emoji": "📉",
       "cooldownMs": 60000,
       "durationMs": 600,
@@ -153,8 +153,8 @@
     },
     {
       "id": "copium_cloud",
-      "name": "Copium Cloud",
-      "description": "Inside the cloud every nickname reads WAGMI.",
+      "name": "g.meme.copium_cloud.name",
+      "description": "g.meme.copium_cloud.description",
       "emoji": "💨",
       "cooldownMs": 90000,
       "durationMs": 8000,
@@ -162,8 +162,8 @@
     },
     {
       "id": "whale_splash",
-      "name": "Whale Splash",
-      "description": "A harmless wave that shoves everything nearby out of the way.",
+      "name": "g.meme.whale_splash.name",
+      "description": "g.meme.whale_splash.description",
       "emoji": "🐳",
       "cooldownMs": 60000,
       "durationMs": 1200,
@@ -171,8 +171,8 @@
     },
     {
       "id": "airdrop",
-      "name": "Airdrop",
-      "description": "Confetti parachute. Allies caught in it get a few points of health.",
+      "name": "g.meme.airdrop.name",
+      "description": "g.meme.airdrop.description",
       "emoji": "🪂",
       "cooldownMs": 120000,
       "durationMs": 4000,
@@ -180,8 +180,8 @@
     },
     {
       "id": "moon_launch",
-      "name": "Moon Launch",
-      "description": "Actually launches you at the moon. Four seconds of hang time.",
+      "name": "g.meme.moon_launch.name",
+      "description": "g.meme.moon_launch.description",
       "emoji": "🚀",
       "cooldownMs": 120000,
       "durationMs": 4000,
@@ -189,11 +189,11 @@
     }
   ],
   "weaponTiers": [
-    { "tier": 1, "minLevel": 1, "rifleName": "Standard Rifle", "staffName": "Wooden Branch", "accent": "#8B8F98" },
-    { "tier": 2, "minLevel": 10, "rifleName": "Reinforced Rifle", "staffName": "Carved Staff", "accent": "#A8B4C0" },
-    { "tier": 3, "minLevel": 20, "rifleName": "Tactical Rifle", "staffName": "Runed Staff", "accent": "#4FD1FF" },
-    { "tier": 4, "minLevel": 30, "rifleName": "Prototype Rifle", "staffName": "Crystal Staff", "accent": "#7FE6CF" },
-    { "tier": 5, "minLevel": 40, "rifleName": "Ascendant Rifle", "staffName": "Void-Touched Staff", "accent": "#C79AE0" },
-    { "tier": 6, "minLevel": 50, "rifleName": "Diamond Hands", "staffName": "Kraken Staff", "accent": "#FFD166" }
+    { "tier": 1, "minLevel": 1, "rifleName": "g.weapontier.1.rifle", "staffName": "g.weapontier.1.staff", "accent": "#8B8F98" },
+    { "tier": 2, "minLevel": 10, "rifleName": "g.weapontier.2.rifle", "staffName": "g.weapontier.2.staff", "accent": "#A8B4C0" },
+    { "tier": 3, "minLevel": 20, "rifleName": "g.weapontier.3.rifle", "staffName": "g.weapontier.3.staff", "accent": "#4FD1FF" },
+    { "tier": 4, "minLevel": 30, "rifleName": "g.weapontier.4.rifle", "staffName": "g.weapontier.4.staff", "accent": "#7FE6CF" },
+    { "tier": 5, "minLevel": 40, "rifleName": "g.weapontier.5.rifle", "staffName": "g.weapontier.5.staff", "accent": "#C79AE0" },
+    { "tier": 6, "minLevel": 50, "rifleName": "g.weapontier.6.rifle", "staffName": "g.weapontier.6.staff", "accent": "#FFD166" }
   ]
 }

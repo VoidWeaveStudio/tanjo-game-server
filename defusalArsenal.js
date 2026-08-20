@@ -1,6 +1,5 @@
 // game-server/defusalArsenal.js
-// Generated from src/features/game/data/defusalArsenal.ts by
-// scripts/sync-arsenal.js — do not edit by hand.
+
 
 const DEFUSAL_ECONOMY = {
     startMoney: 800,
@@ -17,7 +16,7 @@ const DEFUSAL_ECONOMY = {
 const ARSENAL = [
     {
         id: "rug-beater",
-        name: "Rug Beater",
+        name: "g.arsenal.rug-beater.name",
         flavour: "A carpet beater on a broom handle. Nobody knows who left it here.",
         slot: "melee",
         side: "both",
@@ -38,7 +37,7 @@ const ARSENAL = [
     },
     {
         id: "dust-nine",
-        name: "Dust Nine",
+        name: "g.arsenal.dust-nine.name",
         flavour: "Standard issue. Everyone spawns with one, nobody is happy about it.",
         slot: "pistol",
         side: "both",
@@ -59,7 +58,7 @@ const ARSENAL = [
     },
     {
         id: "whale-cannon",
-        name: "Whale Cannon",
+        name: "g.arsenal.whale-cannon.name",
         flavour: "Hand cannon chambered for something that should not fit in a hand.",
         slot: "pistol",
         side: "both",
@@ -80,7 +79,7 @@ const ARSENAL = [
     },
     {
         id: "pump-rifle",
-        name: "Pump AK",
+        name: "g.arsenal.pump-rifle.name",
         flavour: "Kicks like a chart correction. Rewards anyone who taps it.",
         slot: "primary",
         side: "t",
@@ -101,7 +100,7 @@ const ARSENAL = [
     },
     {
         id: "bluechip-rifle",
-        name: "Blue Chip",
+        name: "g.arsenal.bluechip-rifle.name",
         flavour: "Boring, dependable, holds its value. The rifle equivalent of index funds.",
         slot: "primary",
         side: "ct",
@@ -122,7 +121,7 @@ const ARSENAL = [
     },
     {
         id: "moon-ladder",
-        name: "Moon Ladder",
+        name: "g.arsenal.moon-ladder.name",
         flavour: "The barrel is four metres long. It is not a joke to anyone downrange.",
         slot: "primary",
         side: "both",
@@ -143,7 +142,7 @@ const ARSENAL = [
     },
     {
         id: "cold-wallet",
-        name: "Cold Wallet",
+        name: "g.arsenal.cold-wallet.name",
         flavour: "Body armour. Keeps most of your balance off the table.",
         slot: "armor",
         side: "both",
@@ -164,7 +163,7 @@ const ARSENAL = [
     },
     {
         id: "seed-phrase",
-        name: "Cold Wallet + Seed Phrase",
+        name: "g.arsenal.seed-phrase.name",
         flavour: "Armour and a helmet. Your keys survive a headshot, mostly.",
         slot: "armor",
         side: "both",
@@ -185,7 +184,7 @@ const ARSENAL = [
     },
     {
         id: "rug-flash",
-        name: "Rug Flash",
+        name: "g.arsenal.rug-flash.name",
         flavour: "Detonates into pure white candle light. Nobody sees the dump coming.",
         slot: "grenade",
         side: "both",
@@ -206,7 +205,7 @@ const ARSENAL = [
     },
     {
         id: "fud-cloud",
-        name: "FUD Cloud",
+        name: "g.arsenal.fud-cloud.name",
         flavour: "Screams fake sell orders in every direction and fogs the lane.",
         slot: "grenade",
         side: "both",
@@ -227,7 +226,7 @@ const ARSENAL = [
     },
     {
         id: "liquidation",
-        name: "Liquidation",
+        name: "g.arsenal.liquidation.name",
         flavour: "Straightforward. Everything nearby loses most of its value at once.",
         slot: "grenade",
         side: "both",
@@ -248,7 +247,7 @@ const ARSENAL = [
     },
     {
         id: "audit-kit",
-        name: "Audit Kit",
+        name: "g.arsenal.audit-kit.name",
         flavour: "Reads the contract twice as fast. Defenders only.",
         slot: "kit",
         side: "ct",
@@ -280,7 +279,7 @@ function isBuyable(item) {
 }
 const RUG = {
     id: "the-rug",
-    name: "The Rug",
+    name: "g.arsenal.the-rug.name",
     plantVerb: "Roll it out",
     defuseVerb: "Audit the contract",
     plantedLabel: "RUG DEPLOYED",

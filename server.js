@@ -410,8 +410,7 @@ function eventConfigForLocation(locationId) {
   return eventId ? eventConfigFor(eventId) : null;
 }
 
-// An event with no config row yet is sealed, except the arena, which shipped open.
-// A configured event also has to be inside its scheduled window right now.
+
 function isEventOpen(eventId) {
   const config = eventConfigFor(eventId);
   if (!config) return eventId === 'arena';
@@ -2237,6 +2236,23 @@ function completeHomeTeleport(player, now) {
   });
 }
 
+function partyErrorKey(code) {
+  switch (code) {
+    case 'self': return 'g.err.party.self';
+    case 'target_in_party': return 'g.err.party.targetInParty';
+    case 'already_invited': return 'g.err.party.alreadyInvited';
+    case 'already_in_party': return 'g.err.party.alreadyInParty';
+    case 'full': return 'g.err.party.full';
+    case 'no_invite': return 'g.err.party.noInvite';
+    case 'expired': return 'g.err.party.expired';
+    case 'gone': return 'g.err.party.gone';
+    case 'not_leader': return 'g.err.party.notLeader';
+    case 'not_member': return 'g.err.party.notMember';
+    case 'no_party': return 'g.err.party.noParty';
+    default: return 'g.err.party.failed';
+  }
+}
+
 function partyErrorMessage(code) {
   switch (code) {
     case 'self': return 'You cannot invite yourself';
@@ -2525,11 +2541,10 @@ function handleRespawnRequest(player, data) {
     leaveGrinder(player);
   }
 
-  // Defusal rounds respawn you themselves — leaving early forfeits the match.
   const match = defusal.matchOf(player.id);
   if (match && match.phase !== 'ended') {
     if (data?.target !== 'hall') {
-      safeSend(player.ws, { type: 'error', message: 'You are out until the round ends.' });
+      safeSend(player.ws, { type: 'error', message: 'You are out until the round ends.', messageKey: 'g.err.outUntilRoundEnds' });
       return;
     }
     defusal.dropMember(match, player.id);
@@ -3679,9 +3694,7 @@ function clearDefusalLoadout(player) {
   safeSend(player.ws, buildProgressionPayload(player));
 }
 
-// Counter-Strike shape: the hit zone scales the shot, distance eats it off per
-// 12.7 metres, and armour takes the share the weapon cannot punch through —
-// legs are never covered, the head only with a helmet.
+
 function arsenalDamage(attacker, target, zone, distance) {
   const targetEntry = dust2MemberOf(target);
   const member = targetEntry?.member;
@@ -4150,10 +4163,17 @@ const GRINDER_PICK_ERRORS = {
   not_for_sale: 'Not available here.',
 };
 
+const GRINDER_PICK_ERROR_KEYS = {
+  buy_closed: 'g.err.grinder.buyClosed',
+  grenades_full: 'g.err.grenadesFull',
+  already_owned: 'g.err.alreadyHaveThat',
+  not_for_sale: 'g.err.notAvailableHere',
+};
+
 function handleGrinderBuy(player, match, itemId) {
   const result = grinder.applyPick(match, player.id, itemId);
   if (!result.ok) {
-    safeSend(player.ws, { type: 'error', message: GRINDER_PICK_ERRORS[result.error] ?? 'Cannot take that.' });
+    safeSend(player.ws, { type: 'error', message: GRINDER_PICK_ERRORS[result.error] ?? 'Cannot take that.', messageKey: GRINDER_PICK_ERROR_KEYS[result.error] ?? 'g.err.cannotTakeThat' });
     return;
   }
 
@@ -4250,12 +4270,12 @@ function handleGrinderMelee(player, match) {
 }
 
 const SHOP_ITEMS = {
-  'sign-on-a-stick': { id: 'sign-on-a-stick', name: 'Sign on a Stick', price: 100, maxOwned: 10 },
-  'sphere': { id: 'sphere', name: 'Sphere', price: 100, maxOwned: 50, tradeable: true },
-  'wall-poster': { id: 'wall-poster', name: 'Wall Poster', price: 100, maxOwned: 4 },
-  'home-teleport': { id: 'home-teleport', name: 'Homeward Charge', price: 250, maxOwned: 10 },
-  'storage-crate': { id: 'storage-crate', name: 'Storage Crate', price: 200, maxOwned: null },
-  'run-insurance': { id: 'run-insurance', name: 'Run Insurance', price: 1000, maxOwned: 1, blockedInCombat: true },
+  'sign-on-a-stick': { id: 'sign-on-a-stick', name: 'g.placeable.sign-on-a-stick.name', price: 100, maxOwned: 10 },
+  'sphere': { id: 'sphere', name: 'g.placeable.sphere.name', price: 100, maxOwned: 50, tradeable: true },
+  'wall-poster': { id: 'wall-poster', name: 'g.placeable.wall-poster.name', price: 100, maxOwned: 4 },
+  'home-teleport': { id: 'home-teleport', name: 'g.placeable.home-teleport.name', price: 250, maxOwned: 10 },
+  'storage-crate': { id: 'storage-crate', name: 'g.placeable.storage-crate.name', price: 200, maxOwned: null },
+  'run-insurance': { id: 'run-insurance', name: 'g.placeable.run-insurance.name', price: 1000, maxOwned: 1, blockedInCombat: true },
 };
 
 const shopPriceOverrides = new Map();
@@ -4649,11 +4669,14 @@ function reconcileStorage(player) {
     safeSend(player.ws, {
       type: 'error',
       message: `📦 ${recovered} stack${recovered === 1 ? '' : 's'} from a removed crate moved into your storage`,
+      messageKey: recovered === 1 ? 'g.err.crateRecoveredOne' : 'g.err.crateRecoveredMany',
+      messageVars: { count: recovered },
     });
   } else if (player.storageOrphan.length > 0) {
     safeSend(player.ws, {
       type: 'error',
       message: '📦 Your crate is gone — its tokens are held safe until you build another one',
+      messageKey: 'g.err.crateGoneSafe',
     });
   }
 
@@ -7630,27 +7653,27 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'update', CONFIG.network.updateRateLimit)) return;
       } else if (data.type === 'chat') {
         if (!checkRateLimit(playerId, 'chat', CONFIG.network.chatRateLimit)) {
-          safeSend(ws, { type: 'error', message: 'Chat rate limit exceeded' });
+          safeSend(ws, { type: 'error', message: 'Chat rate limit exceeded', messageKey: 'g.err.rateChat' });
           return;
         }
       } else if (data.type === 'shoot') {
         if (!checkRateLimit(playerId, 'shoot', CONFIG.network.shootRateLimit)) {
-          safeSend(ws, { type: 'error', message: 'Shoot rate limit exceeded' });
+          safeSend(ws, { type: 'error', message: 'Shoot rate limit exceeded', messageKey: 'g.err.rateShoot' });
           return;
         }
       } else if (data.type === 'hit' || data.type === 'enemyHit' || data.type === 'lootPickup') {
         if (!checkRateLimit(playerId, 'hit', CONFIG.network.hitRateLimit)) {
-          safeSend(ws, { type: 'error', message: 'Hit rate limit exceeded' });
+          safeSend(ws, { type: 'error', message: 'Hit rate limit exceeded', messageKey: 'g.err.rateHit' });
           return;
         }
       } else if (data.type === 'sellToken') {
         if (!checkRateLimit(playerId, 'sell', CONFIG.network.sellRateLimit)) {
-          safeSend(ws, { type: 'error', message: 'Sell rate limit exceeded' });
+          safeSend(ws, { type: 'error', message: 'Sell rate limit exceeded', messageKey: 'g.err.rateSell' });
           return;
         }
       } else if (data.type === 'shopBuyItem' || data.type === 'signPlace' || data.type === 'signRemove' || data.type === 'signSetText' || data.type === 'signSetDrawingUrl') {
         if (!checkRateLimit(playerId, 'build', CONFIG.network.buildRateLimit)) {
-          safeSend(ws, { type: 'error', message: 'Build rate limit exceeded' });
+          safeSend(ws, { type: 'error', message: 'Build rate limit exceeded', messageKey: 'g.err.rateBuild' });
           return;
         }
       } else if (data.type === 'roomBuildOp') {
@@ -7695,7 +7718,7 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'friendSearch', CONFIG.network.friendSearchRateLimit)) return;
       } else if (data.type === 'mailSend') {
         if (!checkRateLimit(playerId, 'mailSend', CONFIG.network.mailSendRateLimit)) {
-          safeSend(ws, { type: 'error', message: 'Mail rate limit exceeded' });
+          safeSend(ws, { type: 'error', message: 'Mail rate limit exceeded', messageKey: 'g.err.rateMail' });
           return;
         }
       } else if (data.type === 'mailInboxRequest' || data.type === 'mailMarkRead') {
@@ -7716,31 +7739,31 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'storage', CONFIG.network.storageRateLimit)) return;
       } else if (data.type === 'tokenInfoRequest') {
         if (!checkRateLimit(playerId, 'tokenLookup', CONFIG.network.tokenLookupRateLimit)) {
-          safeSend(ws, { type: 'error', message: 'Token lookup rate limit exceeded' });
+          safeSend(ws, { type: 'error', message: 'Token lookup rate limit exceeded', messageKey: 'g.err.rateTokenLookup' });
           return;
         }
       } else if (data.type === 'supportTicketSend') {
         if (!checkRateLimit(playerId, 'support', CONFIG.network.supportRateLimit)) {
-          safeSend(ws, { type: 'error', message: 'Please wait before sending another support message' });
+          safeSend(ws, { type: 'error', message: 'Please wait before sending another support message', messageKey: 'g.err.rateSupport' });
           return;
         }
       } else if (data.type === 'blockUser' || data.type === 'unblockUser' || data.type === 'blockedListRequest') {
         if (!checkRateLimit(playerId, 'block', CONFIG.network.blockRateLimit)) return;
       } else if (data.type === 'privateMessage') {
         if (!checkRateLimit(playerId, 'privateMessage', CONFIG.network.privateMessageRateLimit)) {
-          safeSend(ws, { type: 'error', message: 'Private message rate limit exceeded' });
+          safeSend(ws, { type: 'error', message: 'Private message rate limit exceeded', messageKey: 'g.err.ratePrivateMessage' });
           return;
         }
       } else if (data.type === 'factionChat') {
         if (!checkRateLimit(playerId, 'factionChat', CONFIG.network.factionChatRateLimit)) {
-          safeSend(ws, { type: 'error', message: 'Chat rate limit exceeded' });
+          safeSend(ws, { type: 'error', message: 'Chat rate limit exceeded', messageKey: 'g.err.rateChat' });
           return;
         }
       } else if (data.type === 'factionInvite') {
         if (!checkRateLimit(playerId, 'factionInvite', CONFIG.network.factionInviteRateLimit)) return;
       } else if (data.type === 'tradeInvite' || data.type === 'tradeInviteRespond' || data.type === 'tradeSetOffer' || data.type === 'tradeSetReady' || data.type === 'tradeSubmitPayment' || data.type === 'tradeCancel') {
         if (!checkRateLimit(playerId, 'trade', CONFIG.network.tradeRateLimit)) {
-          safeSend(ws, { type: 'error', message: 'Trade action rate limit exceeded' });
+          safeSend(ws, { type: 'error', message: 'Trade action rate limit exceeded', messageKey: 'g.err.rateTrade' });
           return;
         }
       }
@@ -8448,7 +8471,7 @@ wss.on('connection', (ws) => {
     }
 
     if (isInProtectedZone(player)) {
-      safeSend(ws, { type: 'error', message: 'Cannot shoot in safe zone' });
+      safeSend(ws, { type: 'error', message: 'Cannot shoot in safe zone', messageKey: 'g.err.noShootSafeZone' });
       return;
     }
 
@@ -8502,7 +8525,7 @@ wss.on('connection', (ws) => {
     const state = player.progression;
     if (data.mode !== 'single') {
       if (!skills.hasMode(state.skills, data.mode)) {
-        safeSend(player.ws, { type: 'error', message: 'You have not unlocked that fire mode' });
+        safeSend(player.ws, { type: 'error', message: 'You have not unlocked that fire mode', messageKey: 'g.err.fireModeLocked' });
         return;
       }
       if (skills.modeBranch(data.mode) !== state.branch) return;
@@ -8536,6 +8559,7 @@ wss.on('connection', (ws) => {
       safeSend(ws, {
         type: 'error',
         message: result?.error === 'nickname_taken' ? 'That nickname is already taken' : 'Could not change nickname',
+        messageKey: result?.error === 'nickname_taken' ? 'g.err.nicknameTaken' : 'g.err.nicknameChangeFailed',
       });
       return;
     }
@@ -8562,7 +8586,7 @@ wss.on('connection', (ws) => {
     }
 
     if (parsed.protocol !== 'https:' || !parsed.hostname.endsWith('.public.blob.vercel-storage.com')) {
-      safeSend(ws, { type: 'error', message: 'Invalid skin URL' });
+      safeSend(ws, { type: 'error', message: 'Invalid skin URL', messageKey: 'g.err.invalidSkinUrl' });
       return;
     }
 
@@ -8587,7 +8611,7 @@ wss.on('connection', (ws) => {
     if (typeof data.message !== 'string') return;
 
     if (isMuted(player)) {
-      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
+      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}`, messageKey: 'g.err.mutedUntil', messageVars: { until: new Date(player.mutedUntil).toLocaleString() } });
       return;
     }
 
@@ -8595,7 +8619,7 @@ wss.on('connection', (ws) => {
     if (msg.length === 0) return;
 
     if (containsLink(msg)) {
-      safeSend(player.ws, { type: 'error', message: 'Links are not allowed in chat' });
+      safeSend(player.ws, { type: 'error', message: 'Links are not allowed in chat', messageKey: 'g.err.noLinksInChat' });
       return;
     }
 
@@ -8620,12 +8644,12 @@ wss.on('connection', (ws) => {
     if (typeof data.factionId !== 'string' || !data.factionId) return;
 
     if (isMuted(player)) {
-      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
+      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}`, messageKey: 'g.err.mutedUntil', messageVars: { until: new Date(player.mutedUntil).toLocaleString() } });
       return;
     }
 
     if (!player.factions?.some((f) => f.id === data.factionId)) {
-      safeSend(player.ws, { type: 'error', message: 'You are not a member of that faction' });
+      safeSend(player.ws, { type: 'error', message: 'You are not a member of that faction', messageKey: 'g.err.notFactionMember' });
       return;
     }
 
@@ -8633,7 +8657,7 @@ wss.on('connection', (ws) => {
     if (msg.length === 0) return;
 
     if (containsLink(msg)) {
-      safeSend(player.ws, { type: 'error', message: 'Links are not allowed in chat' });
+      safeSend(player.ws, { type: 'error', message: 'Links are not allowed in chat', messageKey: 'g.err.noLinksInChat' });
       return;
     }
 
@@ -8823,7 +8847,7 @@ wss.on('connection', (ws) => {
 
     const lootedAt = player.caveChests[data.chestId] || 0;
     if (now - lootedAt < CAVE_CHEST_COOLDOWN_MS) {
-      safeSend(player.ws, { type: 'error', message: 'This chest is still empty — come back later' });
+      safeSend(player.ws, { type: 'error', message: 'This chest is still empty — come back later', messageKey: 'g.err.chestEmpty' });
       return;
     }
 
@@ -8868,7 +8892,7 @@ wss.on('connection', (ws) => {
     if (player.canyon.inHub) return;
 
     if (!player.canyon.runCleared) {
-      safeSend(player.ws, { type: 'error', message: 'The evacuation pad stays dark until the segment boss is down.' });
+      safeSend(player.ws, { type: 'error', message: 'The evacuation pad stays dark until the segment boss is down.', messageKey: 'g.err.evacPadLocked' });
       return;
     }
 
@@ -8876,7 +8900,7 @@ wss.on('connection', (ws) => {
     const [px, , pz] = player.position;
     const distance = Math.sqrt((pad[0] - px) ** 2 + (pad[2] - pz) ** 2);
     if (distance > CANYON_RETURN_PAD_REACH) {
-      safeSend(player.ws, { type: 'error', message: 'Stand on the evacuation pad to leave.' });
+      safeSend(player.ws, { type: 'error', message: 'Stand on the evacuation pad to leave.', messageKey: 'g.err.standOnEvacPad' });
       return;
     }
 
@@ -8973,15 +8997,15 @@ wss.on('connection', (ws) => {
     if (typeof data.key !== 'string' || data.key.length === 0) return null;
 
     if (!isOwnRoom(player)) {
-      safeSend(player.ws, { type: 'error', message: 'Storage crates only open in your own room' });
+      safeSend(player.ws, { type: 'error', message: 'Storage crates only open in your own room', messageKey: 'g.err.crateOwnRoomOnly' });
       return null;
     }
     if (!player.storages.has(data.key)) {
-      safeSend(player.ws, { type: 'error', message: 'That crate is no longer there' });
+      safeSend(player.ws, { type: 'error', message: 'That crate is no longer there', messageKey: 'g.err.crateGone' });
       return null;
     }
     if (!storageInReach(player, data.key)) {
-      safeSend(player.ws, { type: 'error', message: 'Step closer to the crate' });
+      safeSend(player.ws, { type: 'error', message: 'Step closer to the crate', messageKey: 'g.err.crateTooFar' });
       return null;
     }
 
@@ -9016,7 +9040,7 @@ wss.on('connection', (ws) => {
     });
 
     if (moved <= 0) {
-      safeSend(player.ws, { type: 'error', message: `This crate is full — ${STORAGE_SLOTS} stacks is the limit` });
+      safeSend(player.ws, { type: 'error', message: `This crate is full — ${STORAGE_SLOTS} stacks is the limit`, messageKey: 'g.err.crateFull', messageVars: { limit: STORAGE_SLOTS } });
       return;
     }
 
@@ -9044,7 +9068,7 @@ wss.on('connection', (ws) => {
 
     const slot = player.inventory.find((entry) => entry.address === address);
     if (!slot && player.inventory.length >= LOOT_CONFIG.maxInventory) {
-      safeSend(player.ws, { type: 'error', message: 'Your inventory is full' });
+      safeSend(player.ws, { type: 'error', message: 'Your inventory is full', messageKey: 'g.err.inventoryFull' });
       return;
     }
 
@@ -9078,6 +9102,19 @@ wss.on('connection', (ws) => {
     });
   }
 
+  function factionErrorKey(code) {
+    switch (code) {
+      case 'already_in_faction': return 'g.err.faction.alreadyMember';
+      case 'name_taken': return 'g.err.faction.nameTaken';
+      case 'faction_not_found': return 'g.err.faction.notFound';
+      case 'invalid_name': return 'g.err.faction.invalidName';
+      case 'token_not_found': return 'g.err.faction.tokenNotFound';
+      case 'insufficient_token_balance': return 'g.err.faction.needTokenBalance';
+      case 'balance_check_failed': return 'g.err.faction.balanceCheckFailed';
+      default: return 'g.err.faction.failed';
+    }
+  }
+
   function factionErrorMessage(code) {
     switch (code) {
       case 'already_in_faction': return 'You are already a member of that faction';
@@ -9095,6 +9132,7 @@ wss.on('connection', (ws) => {
     safeSend(player.ws, {
       type: 'error',
       message: 'Faction creation now happens through Alaric in-game and costs 1,000,000 TNJ. Please update your client.',
+      messageKey: 'g.err.factionCreateMoved',
     });
   }
 
@@ -9112,7 +9150,7 @@ wss.on('connection', (ws) => {
     });
 
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: factionErrorMessage(result?.error) });
+      safeSend(player.ws, { type: 'error', message: factionErrorMessage(result?.error), messageKey: factionErrorKey(result?.error) });
       return;
     }
 
@@ -9127,7 +9165,7 @@ wss.on('connection', (ws) => {
     if (typeof data.toWallet !== 'string' || !data.toWallet.trim()) return;
 
     if (!player.factions?.some((f) => f.id === data.factionId)) {
-      safeSend(player.ws, { type: 'error', message: 'You are not a member of that faction' });
+      safeSend(player.ws, { type: 'error', message: 'You are not a member of that faction', messageKey: 'g.err.notFactionMember' });
       return;
     }
 
@@ -9142,7 +9180,7 @@ wss.on('connection', (ws) => {
     });
 
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: 'Could not send faction invite' });
+      safeSend(player.ws, { type: 'error', message: 'Could not send faction invite', messageKey: 'g.err.factionInviteFailed' });
       return;
     }
 
@@ -9177,7 +9215,7 @@ wss.on('connection', (ws) => {
     });
 
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: 'Could not switch displayed faction' });
+      safeSend(player.ws, { type: 'error', message: 'Could not switch displayed faction', messageKey: 'g.err.factionSwitchFailed' });
       return;
     }
 
@@ -9340,7 +9378,7 @@ wss.on('connection', (ws) => {
     if (typeof data.taskKey !== 'string') return;
     const def = FACTION_TASKS_BY_KEY.get(data.taskKey);
     if (!def) {
-      safeSend(player.ws, { type: 'error', message: 'Unknown task' });
+      safeSend(player.ws, { type: 'error', message: 'Unknown task', messageKey: 'g.err.unknownTask' });
       return;
     }
 
@@ -9360,7 +9398,12 @@ wss.on('connection', (ws) => {
         : result?.error === 'not_authorized'
           ? 'Only the faction leader or verified token creator can accept tasks'
           : 'Could not accept task';
-      safeSend(player.ws, { type: 'error', message });
+      const messageKey = result?.error === 'task_already_active'
+        ? 'g.err.task.alreadyActive'
+        : result?.error === 'not_authorized'
+          ? 'g.err.task.notAuthorized'
+          : 'g.err.task.acceptFailed';
+      safeSend(player.ws, { type: 'error', message, messageKey });
       return;
     }
 
@@ -9384,7 +9427,7 @@ wss.on('connection', (ws) => {
     });
 
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: 'Could not verify token creator right now' });
+      safeSend(player.ws, { type: 'error', message: 'Could not verify token creator right now', messageKey: 'g.err.creatorVerifyFailed' });
       return;
     }
 
@@ -9400,24 +9443,24 @@ wss.on('connection', (ws) => {
 
     const targetUrl = typeof data.targetUrl === 'string' ? data.targetUrl.trim() : '';
     if (!isValidXPostUrl(targetUrl)) {
-      safeSend(player.ws, { type: 'error', message: 'The quest link must be a post on https://x.com/' });
+      safeSend(player.ws, { type: 'error', message: 'The quest link must be a post on https://x.com/', messageKey: 'g.err.questLinkMustBeX' });
       return;
     }
 
     const slotsTotal = Number.isInteger(data.slotsTotal) ? data.slotsTotal : 0;
     const rewardAsh = Number.isInteger(data.rewardAsh) ? data.rewardAsh : 0;
     if (slotsTotal < QUEST_MIN_SLOTS || slotsTotal > QUEST_MAX_SLOTS) {
-      safeSend(player.ws, { type: 'error', message: `Participants must be between ${QUEST_MIN_SLOTS} and ${QUEST_MAX_SLOTS}` });
+      safeSend(player.ws, { type: 'error', message: `Participants must be between ${QUEST_MIN_SLOTS} and ${QUEST_MAX_SLOTS}`, messageKey: 'g.err.participantsRange', messageVars: { min: QUEST_MIN_SLOTS, max: QUEST_MAX_SLOTS } });
       return;
     }
     if (rewardAsh < QUEST_MIN_REWARD_ASH || rewardAsh > QUEST_MAX_REWARD_ASH) {
-      safeSend(player.ws, { type: 'error', message: `Reward must be between ${QUEST_MIN_REWARD_ASH} and ${QUEST_MAX_REWARD_ASH} Ash` });
+      safeSend(player.ws, { type: 'error', message: `Reward must be between ${QUEST_MIN_REWARD_ASH} and ${QUEST_MAX_REWARD_ASH} Ash`, messageKey: 'g.err.rewardRange', messageVars: { min: QUEST_MIN_REWARD_ASH, max: QUEST_MAX_REWARD_ASH } });
       return;
     }
 
     const totalCost = questTotalCostAsh(slotsTotal, rewardAsh);
     if (player.ash < totalCost) {
-      safeSend(player.ws, { type: 'error', message: `Not enough Ash — this quest costs ${totalCost} Ash` });
+      safeSend(player.ws, { type: 'error', message: `Not enough Ash — this quest costs ${totalCost} Ash`, messageKey: 'g.err.questCost', messageVars: { amount: totalCost } });
       return;
     }
 
@@ -9443,7 +9486,12 @@ wss.on('connection', (ws) => {
         : result?.error === 'invalid_post_url'
           ? 'The quest link must be a post on https://x.com/'
           : 'Could not publish that quest right now';
-      safeSend(player.ws, { type: 'error', message });
+      const messageKey = result?.error === 'not_verified_creator'
+        ? 'g.err.quest.notVerifiedCreator'
+        : result?.error === 'invalid_post_url'
+          ? 'g.err.questLinkMustBeX'
+          : 'g.err.quest.publishFailed';
+      safeSend(player.ws, { type: 'error', message, messageKey });
       safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
       return;
     }
@@ -9505,7 +9553,14 @@ wss.on('connection', (ws) => {
           : result?.error === 'own_quest'
             ? "You can't claim your own faction's quest"
             : 'Could not claim that quest right now';
-      safeSend(player.ws, { type: 'error', message });
+      const messageKey = result?.error === 'already_claimed'
+        ? 'g.err.quest.alreadyClaimed'
+        : result?.error === 'quest_full'
+          ? 'g.err.quest.full'
+          : result?.error === 'own_quest'
+            ? 'g.err.quest.ownQuest'
+            : 'g.err.quest.claimFailed';
+      safeSend(player.ws, { type: 'error', message, messageKey });
       return;
     }
 
@@ -9524,6 +9579,17 @@ wss.on('connection', (ws) => {
       status: result.status,
     });
     safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+  }
+
+  function friendErrorKey(code) {
+    switch (code) {
+      case 'user_not_found': return 'g.err.friend.userNotFound';
+      case 'cannot_friend_self': return 'g.err.friend.self';
+      case 'already_friends': return 'g.err.friend.already';
+      case 'request_already_sent': return 'g.err.friend.requestSent';
+      case 'request_not_found': return 'g.err.friend.requestGone';
+      default: return 'g.err.friend.failed';
+    }
   }
 
   function friendErrorMessage(code) {
@@ -9545,7 +9611,7 @@ wss.on('connection', (ws) => {
     if (targetWallet) {
       const targetPlayer = walletToPlayer.get(targetWallet);
       if (targetPlayer && targetPlayer.authenticated && targetPlayer.blockedUserIds?.has(player.userId)) {
-        safeSend(player.ws, { type: 'error', message: 'This player is not accepting friend requests' });
+        safeSend(player.ws, { type: 'error', message: 'This player is not accepting friend requests', messageKey: 'g.err.friendRequestsClosed' });
         return;
       }
     }
@@ -9558,7 +9624,7 @@ wss.on('connection', (ws) => {
     });
 
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: friendErrorMessage(result?.error) });
+      safeSend(player.ws, { type: 'error', message: friendErrorMessage(result?.error), messageKey: friendErrorKey(result?.error) });
       return;
     }
 
@@ -9588,7 +9654,7 @@ wss.on('connection', (ws) => {
     });
 
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: 'Could not block player' });
+      safeSend(player.ws, { type: 'error', message: 'Could not block player', messageKey: 'g.err.blockFailed' });
       return;
     }
 
@@ -9636,7 +9702,7 @@ wss.on('connection', (ws) => {
     });
 
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: friendErrorMessage(result?.error) });
+      safeSend(player.ws, { type: 'error', message: friendErrorMessage(result?.error), messageKey: friendErrorKey(result?.error) });
       return;
     }
 
@@ -9698,6 +9764,15 @@ wss.on('connection', (ws) => {
     safeSend(player.ws, { type: 'friendSearchResult', results: result?.results || [] });
   }
 
+  function mailErrorKey(code) {
+    switch (code) {
+      case 'recipient_not_found': return 'g.err.mail.recipientNotFound';
+      case 'cannot_mail_self': return 'g.err.mail.self';
+      case 'invalid_message': return 'g.err.mail.invalidMessage';
+      default: return 'g.err.mail.failed';
+    }
+  }
+
   function mailErrorMessage(code) {
     switch (code) {
       case 'recipient_not_found': return 'No player found with that wallet or nickname';
@@ -9722,7 +9797,7 @@ wss.on('connection', (ws) => {
     });
 
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: mailErrorMessage(result?.error) });
+      safeSend(player.ws, { type: 'error', message: mailErrorMessage(result?.error), messageKey: mailErrorKey(result?.error) });
       return;
     }
 
@@ -9741,7 +9816,7 @@ wss.on('connection', (ws) => {
 
   async function handlePrivateMessage(player, data) {
     if (isMuted(player)) {
-      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
+      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}`, messageKey: 'g.err.mutedUntil', messageVars: { until: new Date(player.mutedUntil).toLocaleString() } });
       return;
     }
 
@@ -9752,7 +9827,7 @@ wss.on('connection', (ws) => {
     if (text.length === 0) return;
 
     if (containsLink(text)) {
-      safeSend(player.ws, { type: 'error', message: 'Links are not allowed in chat' });
+      safeSend(player.ws, { type: 'error', message: 'Links are not allowed in chat', messageKey: 'g.err.noLinksInChat' });
       return;
     }
 
@@ -9784,6 +9859,17 @@ wss.on('connection', (ws) => {
       text,
       timestamp,
     });
+  }
+
+  function tradePaymentErrorKey(code) {
+    switch (code) {
+      case 'transaction_not_found': return 'g.err.pay.notFound';
+      case 'transaction_failed': return 'g.err.pay.failed';
+      case 'transfer_verification_failed': return 'g.err.pay.verifyFailed';
+      case 'wrong_signer': return 'g.err.pay.wrongSigner';
+      case 'signature_already_used': return 'g.err.pay.signatureUsed';
+      default: return 'g.err.pay.generic';
+    }
   }
 
   function tradePaymentErrorMessage(code) {
@@ -9889,21 +9975,21 @@ wss.on('connection', (ws) => {
       session.priceTnj = null;
     } else {
       if (session.sellerId && session.sellerId !== player.userId) {
-        safeSend(player.ws, { type: 'error', message: 'A seller is already set for this trade' });
+        safeSend(player.ws, { type: 'error', message: 'A seller is already set for this trade', messageKey: 'g.err.sellerAlreadySet' });
         return;
       }
       const item = SHOP_ITEMS[itemId];
       if (!item || !item.tradeable) {
-        safeSend(player.ws, { type: 'error', message: 'This item cannot be traded' });
+        safeSend(player.ws, { type: 'error', message: 'This item cannot be traded', messageKey: 'g.err.itemNotTradeable' });
         return;
       }
       if (!(player.placeables[itemId] > 0)) {
-        safeSend(player.ws, { type: 'error', message: "You don't own that item" });
+        safeSend(player.ws, { type: 'error', message: "You don't own that item", messageKey: 'g.err.dontOwnItem' });
         return;
       }
       const priceTnj = Number.isInteger(data.priceTnj) ? data.priceTnj : null;
       if (!priceTnj || priceTnj <= 0 || priceTnj > 1_000_000_000) {
-        safeSend(player.ws, { type: 'error', message: 'Invalid price' });
+        safeSend(player.ws, { type: 'error', message: 'Invalid price', messageKey: 'g.err.invalidPrice' });
         return;
       }
       session.sellerId = player.userId;
@@ -9923,7 +10009,7 @@ wss.on('connection', (ws) => {
 
     const ready = !!data.ready;
     if (ready && (!session.sellerId || !session.itemId || !session.priceTnj)) {
-      safeSend(player.ws, { type: 'error', message: 'Set an item and price before readying up' });
+      safeSend(player.ws, { type: 'error', message: 'Set an item and price before readying up', messageKey: 'g.err.setItemAndPrice' });
       return;
     }
 
@@ -9934,7 +10020,7 @@ wss.on('connection', (ws) => {
       const seller = userIdToPlayer.get(session.sellerId);
       if (!seller || !(seller.placeables[session.itemId] > 0)) {
         for (const p of Object.values(session.participants)) p.ready = false;
-        sendToTradeParticipants(session, { type: 'error', message: 'Seller no longer has this item' });
+        sendToTradeParticipants(session, { type: 'error', message: 'Seller no longer has this item', messageKey: 'g.err.sellerLostItem' });
         broadcastTradeState(session);
         return;
       }
@@ -9992,7 +10078,7 @@ wss.on('connection', (ws) => {
         return;
       }
       session.phase = 'awaiting_payment';
-      sendToTradeParticipants(session, { type: 'error', message: tradePaymentErrorMessage(errorCode) });
+      sendToTradeParticipants(session, { type: 'error', message: tradePaymentErrorMessage(errorCode), messageKey: tradePaymentErrorKey(errorCode) });
       broadcastTradeState(session);
       return;
     }
@@ -10029,7 +10115,7 @@ wss.on('connection', (ws) => {
     });
 
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: 'Could not look up token' });
+      safeSend(player.ws, { type: 'error', message: 'Could not look up token', messageKey: 'g.err.tokenLookupFailed' });
       return;
     }
 
@@ -10049,7 +10135,7 @@ wss.on('connection', (ws) => {
     });
 
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: 'Could not send message to support' });
+      safeSend(player.ws, { type: 'error', message: 'Could not send message to support', messageKey: 'g.err.supportSendFailed' });
       return;
     }
 
@@ -10226,18 +10312,18 @@ wss.on('connection', (ws) => {
     if (!slot) return;
 
     if (!shopItemEnabled(data.itemId)) {
-      safeSend(player.ws, { type: 'error', message: 'That item is not for sale right now' });
+      safeSend(player.ws, { type: 'error', message: 'That item is not for sale right now', messageKey: 'g.err.itemNotForSale' });
       return;
     }
 
     const cosmeticPrice = shopPriceFor(data.itemId, COSMETIC_PRICE_ASH);
 
     if (player.cosmeticsOwned?.has(data.itemId)) {
-      safeSend(player.ws, { type: 'error', message: 'You already own that' });
+      safeSend(player.ws, { type: 'error', message: 'You already own that', messageKey: 'g.err.alreadyOwned' });
       return;
     }
     if (player.ash < cosmeticPrice) {
-      safeSend(player.ws, { type: 'error', message: `Not enough Ash — this costs ${cosmeticPrice} Ash` });
+      safeSend(player.ws, { type: 'error', message: `Not enough Ash — this costs ${cosmeticPrice} Ash`, messageKey: 'g.err.cosmeticCost', messageVars: { amount: cosmeticPrice } });
       return;
     }
 
@@ -10260,6 +10346,7 @@ wss.on('connection', (ws) => {
       safeSend(player.ws, {
         type: 'error',
         message: result?.error === 'already_owned' ? 'You already own that' : 'Could not buy that right now',
+        messageKey: result?.error === 'already_owned' ? 'g.err.alreadyOwned' : 'g.err.buyFailed',
       });
       safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
       return;
@@ -10288,7 +10375,7 @@ wss.on('connection', (ws) => {
     });
 
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: 'Could not change your outfit right now' });
+      safeSend(player.ws, { type: 'error', message: 'Could not change your outfit right now', messageKey: 'g.err.outfitChangeFailed' });
       return;
     }
 
@@ -10385,11 +10472,11 @@ wss.on('connection', (ws) => {
 
     const state = player.progression;
     if (state.branch !== null) {
-      safeSend(player.ws, { type: 'error', message: 'Specialisation already chosen — respec with Sola to switch' });
+      safeSend(player.ws, { type: 'error', message: 'Specialisation already chosen — respec with Sola to switch', messageKey: 'g.err.specAlreadyChosen' });
       return;
     }
     if (state.level < BRANCH_UNLOCK_LEVEL) {
-      safeSend(player.ws, { type: 'error', message: "Finish Sola's orientation first" });
+      safeSend(player.ws, { type: 'error', message: "Finish Sola's orientation first", messageKey: 'g.err.finishOrientation' });
       return;
     }
 
@@ -10415,7 +10502,7 @@ wss.on('connection', (ws) => {
     } else {
       if (typeof data.abilityId !== 'string') return;
       if (!skills.hasAbility(state.skills, data.abilityId)) {
-        safeSend(player.ws, { type: 'error', message: 'You have not learned that skill' });
+        safeSend(player.ws, { type: 'error', message: 'You have not learned that skill', messageKey: 'g.err.skillNotLearned' });
         return;
       }
 
@@ -10465,7 +10552,7 @@ wss.on('connection', (ws) => {
 
     const cost = progression.respecCostAsh(state.level, state.respecCount);
     if (player.ash < cost) {
-      safeSend(player.ws, { type: 'error', message: `Respec costs ${cost} Ash` });
+      safeSend(player.ws, { type: 'error', message: `Respec costs ${cost} Ash`, messageKey: 'g.err.respecCost', messageVars: { amount: cost } });
       return;
     }
 
@@ -10594,11 +10681,11 @@ wss.on('connection', (ws) => {
 
   function handleDefusalQueue(player) {
     if (player.locationId !== EVENTS_LOBBY_ID) {
-      safeSend(player.ws, { type: 'error', message: 'Queue from the Events Hall.' });
+      safeSend(player.ws, { type: 'error', message: 'Queue from the Events Hall.', messageKey: 'g.err.queueFromEventsHall' });
       return;
     }
     if (!isEventOpen(defusal.DEFUSAL_CONFIG.eventId)) {
-      safeSend(player.ws, { type: 'error', message: 'Dust II is sealed right now.' });
+      safeSend(player.ws, { type: 'error', message: 'Dust II is sealed right now.', messageKey: 'g.err.dust2Sealed' });
       return;
     }
     if (defusal.matchOf(player.id)) return;
@@ -10613,7 +10700,7 @@ wss.on('connection', (ws) => {
 
     const result = defusal.enqueue(ids.length > 0 ? ids : [player.id]);
     if (!result.ok) {
-      safeSend(player.ws, { type: 'error', message: result.error === 'party_too_big' ? 'A party of five is the limit.' : 'Already in the queue.' });
+      safeSend(player.ws, { type: 'error', message: result.error === 'party_too_big' ? 'A party of five is the limit.' : 'Already in the queue.', messageKey: result.error === 'party_too_big' ? 'g.err.queue.partyTooBig' : 'g.err.queue.alreadyQueued' });
       return;
     }
 
@@ -10636,7 +10723,7 @@ wss.on('connection', (ws) => {
     const [x, , z] = player.position;
     const site = defusal.siteAt(x, z);
     if (!site) {
-      safeSend(player.ws, { type: 'error', message: 'You have to be on a bomb site.' });
+      safeSend(player.ws, { type: 'error', message: 'You have to be on a bomb site.', messageKey: 'g.err.mustBeOnBombSite' });
       return;
     }
 
@@ -10662,7 +10749,7 @@ wss.on('connection', (ws) => {
 
     const distance = Math.hypot(player.position[0] - bomb.x, player.position[2] - bomb.z);
     if (distance > defusal.DEFUSAL_CONFIG.defuseReach) {
-      safeSend(player.ws, { type: 'error', message: 'Get closer to the bomb.' });
+      safeSend(player.ws, { type: 'error', message: 'Get closer to the bomb.', messageKey: 'g.err.bombTooFar' });
       return;
     }
 
@@ -10691,7 +10778,14 @@ wss.on('connection', (ws) => {
         grenades_full: 'You are carrying enough grenades.',
         already_owned: 'You already have that.',
       };
-      safeSend(player.ws, { type: 'error', message: messages[result.error] ?? 'Cannot buy that.' });
+      const messageKeys = {
+        buy_closed: 'g.err.defusal.buyClosed',
+        too_poor: 'g.err.notEnoughMoney',
+        wrong_side: 'g.err.wrongSide',
+        grenades_full: 'g.err.grenadesFull',
+        already_owned: 'g.err.alreadyHaveThat',
+      };
+      safeSend(player.ws, { type: 'error', message: messages[result.error] ?? 'Cannot buy that.', messageKey: messageKeys[result.error] ?? 'g.err.cannotBuyThat' });
       return;
     }
 
@@ -10722,7 +10816,7 @@ wss.on('connection', (ws) => {
 
     const grenade = defusal.throwGrenade(match, player.id, itemId, player.position, data.direction, Date.now());
     if (!grenade) {
-      safeSend(player.ws, { type: 'error', message: 'You are not carrying that.' });
+      safeSend(player.ws, { type: 'error', message: 'You are not carrying that.', messageKey: 'g.err.notCarrying' });
       return;
     }
 
@@ -10738,8 +10832,7 @@ wss.on('connection', (ws) => {
     broadcastDefusalState(match);
   }
 
-  // Melee is server-side entirely: reach, arc and a back-strike bonus, no
-  // client-reported hit to trust.
+
   function handleDefusalMelee(player) {
     const grinderMatch = grinder.matchOf(player.id);
     if (grinderMatch) {
@@ -10867,18 +10960,18 @@ wss.on('connection', (ws) => {
 
     const target = walletToPlayer.get(toWallet);
     if (!target || !target.authenticated) {
-      safeSend(player.ws, { type: 'error', message: 'That player is not online' });
+      safeSend(player.ws, { type: 'error', message: 'That player is not online', messageKey: 'g.err.playerOffline' });
       return;
     }
 
     if (target.blockedUserIds?.has(player.userId) || player.blockedUserIds?.has(target.userId)) {
-      safeSend(player.ws, { type: 'error', message: 'That player is not online' });
+      safeSend(player.ws, { type: 'error', message: 'That player is not online', messageKey: 'g.err.playerOffline' });
       return;
     }
 
     const result = party.invite(player.id, target.id);
     if (!result.ok) {
-      safeSend(player.ws, { type: 'error', message: partyErrorMessage(result.error) });
+      safeSend(player.ws, { type: 'error', message: partyErrorMessage(result.error), messageKey: partyErrorKey(result.error), messageVars: { max: party.MAX_PARTY_SIZE } });
       return;
     }
 
@@ -10888,7 +10981,7 @@ wss.on('connection', (ws) => {
       fromNickname: player.nickname,
       expiresAt: result.invite.expiresAt,
     });
-    safeSend(player.ws, { type: 'error', message: `Party invite sent to ${target.nickname}` });
+    safeSend(player.ws, { type: 'error', message: `Party invite sent to ${target.nickname}`, messageKey: 'g.err.partyInviteSent', messageVars: { nickname: target.nickname } });
   }
 
   function handlePartyAccept(player, data) {
@@ -10896,7 +10989,7 @@ wss.on('connection', (ws) => {
 
     const result = party.accept(player.id, data.fromId);
     if (!result.ok) {
-      safeSend(player.ws, { type: 'error', message: partyErrorMessage(result.error) });
+      safeSend(player.ws, { type: 'error', message: partyErrorMessage(result.error), messageKey: partyErrorKey(result.error), messageVars: { max: party.MAX_PARTY_SIZE } });
       return;
     }
 
@@ -10910,7 +11003,7 @@ wss.on('connection', (ws) => {
     if (!result.ok) return;
 
     const inviter = players.get(result.invite.fromId);
-    if (inviter) safeSend(inviter.ws, { type: 'error', message: `${player.nickname} declined your party invite` });
+    if (inviter) safeSend(inviter.ws, { type: 'error', message: `${player.nickname} declined your party invite`, messageKey: 'g.err.partyInviteDeclined', messageVars: { nickname: player.nickname } });
   }
 
   function handlePartyLeave(player) {
@@ -10926,7 +11019,7 @@ wss.on('connection', (ws) => {
 
     const result = party.kick(player.id, data.targetId);
     if (!result.ok) {
-      safeSend(player.ws, { type: 'error', message: partyErrorMessage(result.error) });
+      safeSend(player.ws, { type: 'error', message: partyErrorMessage(result.error), messageKey: partyErrorKey(result.error), messageVars: { max: party.MAX_PARTY_SIZE } });
       return;
     }
 
@@ -10960,7 +11053,7 @@ wss.on('connection', (ws) => {
     safeSend(ws, { type: 'crateLootResult', id: crate.id, moved, remaining });
 
     if (moved === 0) {
-      safeSend(ws, { type: 'error', message: 'Your inventory is full' });
+      safeSend(ws, { type: 'error', message: 'Your inventory is full', messageKey: 'g.err.inventoryFull' });
       return;
     }
 
@@ -10972,13 +11065,13 @@ wss.on('connection', (ws) => {
     if (!player.alive) return;
     if (typeof data.address !== 'string') return;
     if (player.locationId !== 'tower-main-hall') {
-      safeSend(ws, { type: 'error', message: 'You need to be at the vendor in the main hall to sell' });
+      safeSend(ws, { type: 'error', message: 'You need to be at the vendor in the main hall to sell', messageKey: 'g.err.vendorRequired' });
       return;
     }
 
     const entry = player.inventory.find((e) => e.address === data.address);
     if (!entry || entry.quantity <= 0) {
-      safeSend(ws, { type: 'error', message: 'You no longer have that item' });
+      safeSend(ws, { type: 'error', message: 'You no longer have that item', messageKey: 'g.err.itemGone' });
       return;
     }
 
@@ -10988,7 +11081,7 @@ wss.on('connection', (ws) => {
 
     if (!player.sellQueue) player.sellQueue = [];
     if (player.sellQueue.length >= 32) {
-      safeSend(ws, { type: 'error', message: 'Too many pending sells, slow down' });
+      safeSend(ws, { type: 'error', message: 'Too many pending sells, slow down', messageKey: 'g.err.tooManyPendingSells' });
       return;
     }
     player.sellQueue.push({ address: data.address, quantity: sellQty });
@@ -11023,7 +11116,7 @@ wss.on('connection', (ws) => {
       marketCap = Number(json?.mc) || 0;
     } catch (err) {
       console.error('[Vendor] Market cap lookup failed:', err.message);
-      safeSend(ws, { type: 'error', message: 'Could not price token right now' });
+      safeSend(ws, { type: 'error', message: 'Could not price token right now', messageKey: 'g.err.tokenPriceFailed' });
       return;
     }
 
@@ -11056,24 +11149,24 @@ wss.on('connection', (ws) => {
     if (!player.alive) return;
     const item = SHOP_ITEMS[data.itemId];
     if (!item) {
-      safeSend(player.ws, { type: 'error', message: 'Unknown item' });
+      safeSend(player.ws, { type: 'error', message: 'Unknown item', messageKey: 'g.err.unknownItem' });
       return;
     }
 
     if (item.blockedInCombat && isInCombat(player)) {
-      safeSend(player.ws, { type: 'error', message: 'Not while you are in combat' });
+      safeSend(player.ws, { type: 'error', message: 'Not while you are in combat', messageKey: 'g.err.notInCombat' });
       return;
     }
 
     const owned = player.placeables[item.id] || 0;
     const capRemaining = item.maxOwned === null ? Number.MAX_SAFE_INTEGER : item.maxOwned - owned;
     if (capRemaining <= 0) {
-      safeSend(player.ws, { type: 'error', message: `You already own the maximum of ${item.maxOwned}` });
+      safeSend(player.ws, { type: 'error', message: `You already own the maximum of ${item.maxOwned}`, messageKey: 'g.err.ownMaximum', messageVars: { max: item.maxOwned } });
       return;
     }
 
     if (!shopItemEnabled(item.id)) {
-      safeSend(player.ws, { type: 'error', message: 'That item is not for sale right now' });
+      safeSend(player.ws, { type: 'error', message: 'That item is not for sale right now', messageKey: 'g.err.itemNotForSale' });
       return;
     }
 
@@ -11082,7 +11175,7 @@ wss.on('connection', (ws) => {
     const affordableQty = unitPrice > 0 ? Math.floor(player.ash / unitPrice) : requestedQty;
     const qty = Math.max(0, Math.min(requestedQty, capRemaining, affordableQty));
     if (qty <= 0) {
-      safeSend(player.ws, { type: 'error', message: 'Not enough ash' });
+      safeSend(player.ws, { type: 'error', message: 'Not enough ash', messageKey: 'g.err.notEnoughAsh' });
       return;
     }
 
@@ -11097,23 +11190,23 @@ wss.on('connection', (ws) => {
   async function handleSignPlace(player, data) {
     if (!player.alive) return;
     if (player.locationId !== 'main-world') {
-      safeSend(player.ws, { type: 'error', message: 'Signs can only be placed in the open world' });
+      safeSend(player.ws, { type: 'error', message: 'Signs can only be placed in the open world', messageKey: 'g.err.signOpenWorldOnly' });
       return;
     }
     if (isMuted(player)) {
-      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
+      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}`, messageKey: 'g.err.mutedUntil', messageVars: { until: new Date(player.mutedUntil).toLocaleString() } });
       return;
     }
     if (!(player.placeables['sign-on-a-stick'] > 0)) {
-      safeSend(player.ws, { type: 'error', message: "You don't own any signs — buy one from the Shop" });
+      safeSend(player.ws, { type: 'error', message: "You don't own any signs — buy one from the Shop", messageKey: 'g.err.noSignsOwned' });
       return;
     }
     if (Array.from(worldSigns.values()).some((s) => s.ownerId === player.userId)) {
-      safeSend(player.ws, { type: 'error', message: 'You can only have one sign placed at a time' });
+      safeSend(player.ws, { type: 'error', message: 'You can only have one sign placed at a time', messageKey: 'g.err.oneSignOnly' });
       return;
     }
     if (!isValidPositionForLocation(player.locationId, data.position)) {
-      safeSend(player.ws, { type: 'error', message: 'Invalid placement position' });
+      safeSend(player.ws, { type: 'error', message: 'Invalid placement position', messageKey: 'g.err.invalidPlacement' });
       return;
     }
     const rotation = typeof data.rotation === 'number' && isFinite(data.rotation) ? data.rotation : 0;
@@ -11129,7 +11222,7 @@ wss.on('connection', (ws) => {
 
     if (!result || !result.success) {
       player.placeables['sign-on-a-stick'] += 1;
-      safeSend(player.ws, { type: 'error', message: 'Could not place sign right now' });
+      safeSend(player.ws, { type: 'error', message: 'Could not place sign right now', messageKey: 'g.err.signPlaceFailed' });
       return;
     }
 
@@ -11160,11 +11253,11 @@ wss.on('connection', (ws) => {
     const sign = worldSigns.get(data.id);
     if (!sign) return;
     if (sign.ownerId !== player.userId || sign.contentType !== null) {
-      safeSend(player.ws, { type: 'error', message: 'You cannot edit this sign' });
+      safeSend(player.ws, { type: 'error', message: 'You cannot edit this sign', messageKey: 'g.err.signNotYours' });
       return;
     }
     if (isMuted(player)) {
-      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}` });
+      safeSend(player.ws, { type: 'error', message: `You are muted until ${new Date(player.mutedUntil).toLocaleString()}`, messageKey: 'g.err.mutedUntil', messageVars: { until: new Date(player.mutedUntil).toLocaleString() } });
       return;
     }
     if (typeof data.text !== 'string') return;
@@ -11172,7 +11265,7 @@ wss.on('connection', (ws) => {
     const text = sanitizeMessage(data.text.trim().slice(0, 150));
     if (text.length === 0) return;
     if (containsLink(text)) {
-      safeSend(player.ws, { type: 'error', message: 'Links are not allowed on signs' });
+      safeSend(player.ws, { type: 'error', message: 'Links are not allowed on signs', messageKey: 'g.err.noLinksOnSigns' });
       return;
     }
 
@@ -11183,7 +11276,7 @@ wss.on('connection', (ws) => {
       return null;
     });
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: 'Could not save sign right now' });
+      safeSend(player.ws, { type: 'error', message: 'Could not save sign right now', messageKey: 'g.err.signSaveFailed' });
       return;
     }
 
@@ -11196,11 +11289,11 @@ wss.on('connection', (ws) => {
     const sign = worldSigns.get(data.id);
     if (!sign) return;
     if (sign.ownerId !== player.userId || sign.contentType !== null) {
-      safeSend(player.ws, { type: 'error', message: 'You cannot edit this sign' });
+      safeSend(player.ws, { type: 'error', message: 'You cannot edit this sign', messageKey: 'g.err.signNotYours' });
       return;
     }
     if (typeof data.url !== 'string' || !data.url.startsWith('https://') || data.url.length > 512) {
-      safeSend(player.ws, { type: 'error', message: 'Invalid drawing' });
+      safeSend(player.ws, { type: 'error', message: 'Invalid drawing', messageKey: 'g.err.invalidDrawing' });
       return;
     }
 
@@ -11211,7 +11304,7 @@ wss.on('connection', (ws) => {
       return null;
     });
     if (!result || !result.success) {
-      safeSend(player.ws, { type: 'error', message: 'Could not save sign right now' });
+      safeSend(player.ws, { type: 'error', message: 'Could not save sign right now', messageKey: 'g.err.signSaveFailed' });
       return;
     }
 
@@ -11224,13 +11317,13 @@ wss.on('connection', (ws) => {
     const sign = worldSigns.get(data.id);
     if (!sign) return;
     if (sign.ownerId !== player.userId) {
-      safeSend(player.ws, { type: 'error', message: 'You can only remove your own sign' });
+      safeSend(player.ws, { type: 'error', message: 'You can only remove your own sign', messageKey: 'g.err.signRemoveNotYours' });
       return;
     }
 
     const removed = await deleteSign(sign);
     if (!removed) {
-      safeSend(player.ws, { type: 'error', message: 'Could not remove sign right now' });
+      safeSend(player.ws, { type: 'error', message: 'Could not remove sign right now', messageKey: 'g.err.signRemoveFailed' });
       return;
     }
   }
@@ -11258,7 +11351,7 @@ wss.on('connection', (ws) => {
     }
 
     if (SEALED_LOCATIONS.has(data.locationId)) {
-      safeSend(player.ws, { type: 'error', message: 'That place is sealed for now.' });
+      safeSend(player.ws, { type: 'error', message: 'That place is sealed for now.', messageKey: 'g.err.placeSealed' });
       return;
     }
 
@@ -11272,8 +11365,13 @@ wss.on('connection', (ws) => {
         : reason === 'window_closed'
           ? `${name} is over for now.`
           : `${name} is sealed right now.`;
+      const messageKey = reason === 'not_started'
+        ? 'g.err.event.notStarted'
+        : reason === 'window_closed'
+          ? 'g.err.event.over'
+          : 'g.err.event.sealed';
 
-      safeSend(player.ws, { type: 'error', message });
+      safeSend(player.ws, { type: 'error', message, messageKey, messageVars: { name } });
       return;
     }
 
@@ -11340,6 +11438,7 @@ wss.on('connection', (ws) => {
         safeSend(player.ws, {
           type: 'error',
           message: verdict?.reason || 'You cannot enter that room.',
+          messageKey: verdict?.reason ? null : 'g.err.cannotEnterRoom',
         });
         return;
       }

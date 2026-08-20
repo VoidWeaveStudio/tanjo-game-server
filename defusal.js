@@ -35,7 +35,6 @@ const DEFUSAL_CONFIG = {
   tSpawns: [[30, 34], [27, 34], [30, 31], [30, 37], [33, 34]],
   ctSpawns: [[-3, -33], [-6, -33], [-3, -36], [-3, -30], [0, -33]],
 
-  // Skill tree and degen stay out of this mode — the arsenal decides everything.
   baseHealth: 100,
   armorPoints: 100,
   armorAbsorb: 0.5,
@@ -83,7 +82,6 @@ function forgetQueued(playerId) {
   dequeue(playerId);
 }
 
-// Groups stay together: biggest first, always into whichever side has room.
 function splitTeams(entries) {
   const groups = entries.slice().sort((a, b) => b.ids.length - a.ids.length);
   const t = [];
@@ -206,7 +204,6 @@ function aliveOfTeam(match, team) {
   return membersOfTeam(match, team).filter((id) => match.members.get(id).alive);
 }
 
-// Sides swap at half time, so the scoreboard tracks the side a player is on now.
 function sideOf(match, playerId) {
   const base = teamOf(match, playerId);
   if (!base) return null;
@@ -271,7 +268,6 @@ function isHoldingGrenade(member) {
   return member?.held === 'grenade1' || member?.held === 'grenade2';
 }
 
-// A slot you cannot fill falls back to the pistol, which every player always has.
 function selectSlot(member, slot) {
   if (!member || !HELD_SLOTS.includes(slot)) return false;
 
@@ -340,7 +336,6 @@ function applyPurchase(match, playerId, itemId) {
   return { ok: true, member, item };
 }
 
-// Losing streaks pay more, a win resets them — same shape as the game it borrows from.
 function payRound(match, winningSide) {
   const economy = arsenal.DEFUSAL_ECONOMY;
 
@@ -378,7 +373,6 @@ function resetLoadouts(match) {
   }
 }
 
-// Kit and armour survive the round; ammunition and grenades do not.
 function carryLoadout(match) {
   for (const [id, member] of match.members) {
     member.held = member.primary ? 'primary' : 'pistol';
@@ -442,9 +436,7 @@ function throwGrenade(match, playerId, itemId, origin, direction, now = Date.now
   return grenade;
 }
 
-// Grenades bounce off the map, not just the floor: the step is split fine
-// enough that nothing tunnels through a wall, and each hit reflects the axis
-// it came in on while the other two lose speed to friction.
+
 function bounceOffBlockers(grenade) {
   const r = GRENADE_PHYSICS.radius;
 
@@ -529,8 +521,7 @@ function serializeGrenades(match) {
   }));
 }
 
-// A wall between you and the burst saves you outright; otherwise distance and
-// which way you were facing decide how long you are blind for.
+
 function flashStrength(grenade, position, facing) {
   const dx = grenade.x - position[0];
   const dz = grenade.z - position[2];
