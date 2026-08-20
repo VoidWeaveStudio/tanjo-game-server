@@ -1008,12 +1008,17 @@ function generateId() {
   return crypto.randomBytes(16).toString('hex');
 }
 
+const reportedTickErrors = new Set();
+
 function safeInterval(fn, ms) {
   return setInterval(() => {
     try {
       fn();
     } catch (err) {
-      console.error('[!] Interval tick error:', err.message);
+      const key = `${fn.name || 'anonymous'}:${err.message}`;
+      if (reportedTickErrors.has(key)) return;
+      reportedTickErrors.add(key);
+      console.error(`[!] Interval tick error in ${fn.name || 'anonymous'}:`, err.stack || err.message);
     }
   }, ms);
 }
@@ -3185,6 +3190,7 @@ function canyonTick() {
 
   for (const player of players.values()) {
     if (!player.authenticated) continue;
+    if (player.locationId === 'main-world') continue;
 
     const enemies = activeEnemiesFor(player);
     if (!enemies || enemies.size === 0) continue;
