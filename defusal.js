@@ -5,7 +5,7 @@ const geometry = require('./dust2Geometry');
 const DEFUSAL_CONFIG = {
   locationId: 'event-dust2',
   eventId: 'dust2',
-
+ 
   teamSize: 5,
   matchSize: 10,
   minMatchSize: 4,
