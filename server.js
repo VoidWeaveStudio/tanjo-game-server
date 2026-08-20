@@ -4312,6 +4312,7 @@ const SHOP_ITEMS = {
   'home-teleport': { id: 'home-teleport', name: 'g.placeable.home-teleport.name', price: 250, maxOwned: 10 },
   'storage-crate': { id: 'storage-crate', name: 'g.placeable.storage-crate.name', price: 200, maxOwned: null },
   'run-insurance': { id: 'run-insurance', name: 'g.placeable.run-insurance.name', price: 1000, maxOwned: 1, blockedInCombat: true },
+  'pet-dog': { id: 'pet-dog', name: 'g.pet.pet-dog.name', price: 0, maxOwned: 1, ashPurchasable: false, pet: true },
 };
 
 const SHOP_MAX_QTY_PER_PURCHASE = 100;
@@ -4344,6 +4345,26 @@ function shopItemEnabled(itemId) {
 }
 
 const SIGN_LIFETIME_MS = 6 * 60 * 60 * 1000;
+
+const PET_ITEM_ID = 'pet-dog';
+const PET_FETCH_RADIUS = 28;
+const PET_SPEED = 9;
+const PET_FETCH_GRACE_MS = 400;
+const PET_BLOCKED_LOCATION_PREFIX = 'event-';
+
+function hasPet(player) {
+  return (player.placeables?.[PET_ITEM_ID] || 0) > 0;
+}
+
+function petAllowedAt(locationId) {
+  return typeof locationId === 'string' && !locationId.startsWith(PET_BLOCKED_LOCATION_PREFIX);
+}
+
+function petCanFetch(player, loot) {
+  if (!hasPet(player)) return false;
+  if (!petAllowedAt(player.locationId)) return false;
+  return loot.ownerId === player.id;
+}
 
 const LOOT_CONFIG = {
   pollIntervalMs: 10000,
@@ -4875,6 +4896,7 @@ function dropCanyonLoot(player, position, minCount, maxCount, mult = 1) {
     id: loot.id,
     position: loot.position,
     tokens: loot.tokens,
+    owned: true,
   });
 }
 
@@ -10694,7 +10716,16 @@ wss.on('connection', (ws) => {
 
     const [px, , pz] = player.position;
     const dist = Math.sqrt((loot.position[0] - px) ** 2 + (loot.position[2] - pz) ** 2);
-    if (dist > LOOT_CONFIG.pickupRadius) return;
+
+    const byPet = data.byPet === true;
+    if (byPet) {
+      if (!petCanFetch(player, loot)) return;
+      if (dist > PET_FETCH_RADIUS) return;
+      const travelMs = (Math.max(0, dist - LOOT_CONFIG.pickupRadius) / PET_SPEED) * 1000;
+      if (Date.now() - loot.createdAt < travelMs - PET_FETCH_GRACE_MS) return;
+    } else if (dist > LOOT_CONFIG.pickupRadius) {
+      return;
+    }
 
     lootDrops.delete(data.id);
 
@@ -10704,7 +10735,7 @@ wss.on('connection', (ws) => {
     safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
 
     if (loot.ownerId) {
-      safeSend(ws, { type: 'lootDespawn', id: data.id });
+      safeSend(ws, { type: 'lootDespawn', id: data.id, byPet });
     } else {
       broadcastToLocation('main-world', { type: 'lootDespawn', id: data.id }, null, loot.instance);
     }
@@ -11259,6 +11290,11 @@ wss.on('connection', (ws) => {
     const item = SHOP_ITEMS[data.itemId];
     if (!item) {
       safeSend(player.ws, { type: 'error', message: 'Unknown item', messageKey: 'g.err.unknownItem' });
+      return;
+    }
+
+    if (item.ashPurchasable === false) {
+      safeSend(player.ws, { type: 'error', message: 'That item is not sold for ash', messageKey: 'g.err.itemNotForSale' });
       return;
     }
 
