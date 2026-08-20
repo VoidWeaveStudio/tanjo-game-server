@@ -1185,6 +1185,36 @@ function notifyAOILeave(player) {
   player.aoiNeighbors = new Set();
 }
 
+function discardPendingAuth(player) {
+  player.authenticated = false;
+
+  if (player.readyTimer) {
+    clearTimeout(player.readyTimer);
+    player.readyTimer = null;
+  }
+
+  if (player.userId && userIdToPlayer.get(player.userId) === player) {
+    userIdToPlayer.delete(player.userId);
+  }
+  if (player.wallet && walletToPlayer.get(player.wallet) === player) {
+    walletToPlayer.delete(player.wallet);
+  }
+
+  if (players.get(player.id) === player) {
+    players.delete(player.id);
+    notifyAOILeave(player);
+  }
+  removePlayerZone(player);
+
+  if (player.userId) {
+    callInternalApi('/api/internal/game/presence', { userId: player.userId, online: false }).catch((err) => {
+      console.error('[Presence] offline update error:', err.message);
+    });
+  }
+
+  console.log(`[!] Auth aborted (socket closed) for ${player.id} (${player.userId || 'unauth'})`);
+}
+
 function notifyLocationTransition(player, oldLocationId, newLocationId) {
   clearPlayerAbilityBuffs(player, false);
 
@@ -4284,6 +4314,9 @@ const SHOP_ITEMS = {
   'run-insurance': { id: 'run-insurance', name: 'g.placeable.run-insurance.name', price: 1000, maxOwned: 1, blockedInCombat: true },
 };
 
+const SHOP_MAX_QTY_PER_PURCHASE = 100;
+const SHOP_UNCAPPED_MAX_OWNED = 1000;
+
 const shopPriceOverrides = new Map();
 
 async function refreshShopPrices(gameId) {
@@ -4326,6 +4359,59 @@ const lootDrops = new Map();
 let nextLootId = 0;
 
 const activeTrades = new Map();
+const pendingPlaceableRefunds = new Map();
+const TRADE_SETTLING_TIMEOUT_MS = 2 * 60 * 1000;
+
+function refundPlaceable(userId, itemId, quantity) {
+  if (!userId || !itemId || quantity <= 0) return;
+
+  const owner = userIdToPlayer.get(userId);
+  if (owner) {
+    owner.placeables[itemId] = (owner.placeables[itemId] || 0) + quantity;
+    owner.economyChangedAt = Date.now();
+    persistPlayer(owner);
+    safeSend(owner.ws, { type: 'inventoryUpdate', inventory: owner.inventory, ash: owner.ash, placeables: owner.placeables });
+    return;
+  }
+
+  const bucket = pendingPlaceableRefunds.get(userId) || {};
+  bucket[itemId] = (bucket[itemId] || 0) + quantity;
+  pendingPlaceableRefunds.set(userId, bucket);
+  console.error('[Trade] escrow refund deferred, owner offline:', { userId, itemId, quantity });
+}
+
+function applyPendingPlaceableRefunds(player) {
+  const bucket = pendingPlaceableRefunds.get(player.userId);
+  if (!bucket) return;
+  pendingPlaceableRefunds.delete(player.userId);
+
+  for (const [itemId, quantity] of Object.entries(bucket)) {
+    if (!SHOP_ITEMS[itemId] || !(quantity > 0)) continue;
+    player.placeables[itemId] = (player.placeables[itemId] || 0) + quantity;
+  }
+  player.economyChangedAt = Date.now();
+  console.log(`[Trade] delivered deferred escrow refund to ${player.userId}`);
+}
+
+function holdTradeEscrow(session) {
+  if (session.escrowed) return true;
+
+  const seller = userIdToPlayer.get(session.sellerId);
+  if (!seller || !(seller.placeables[session.itemId] > 0)) return false;
+
+  seller.placeables[session.itemId] = Math.max(0, seller.placeables[session.itemId] - 1);
+  seller.economyChangedAt = Date.now();
+  session.escrowed = true;
+  persistPlayer(seller);
+  safeSend(seller.ws, { type: 'inventoryUpdate', inventory: seller.inventory, ash: seller.ash, placeables: seller.placeables });
+  return true;
+}
+
+function releaseTradeEscrow(session) {
+  if (!session.escrowed) return;
+  session.escrowed = false;
+  refundPlaceable(session.sellerId, session.itemId, 1);
+}
 
 function buildTradeSnapshot(session) {
   return {
@@ -4354,6 +4440,7 @@ function broadcastTradeState(session) {
 
 function endTrade(session, phase, extra) {
   session.phase = phase;
+  if (phase !== 'completed') releaseTradeEscrow(session);
   for (const uid of Object.keys(session.participants)) {
     const p = userIdToPlayer.get(uid);
     if (p && p.activeTradeId === session.id) p.activeTradeId = null;
@@ -4365,7 +4452,13 @@ function endTrade(session, phase, extra) {
 safeInterval(() => {
   const now = Date.now();
   for (const session of Array.from(activeTrades.values())) {
-    if (session.phase === 'settling') continue;
+    if (session.phase === 'settling') {
+      if (session.settlingSince && now - session.settlingSince > TRADE_SETTLING_TIMEOUT_MS) {
+        console.error('[Trade] settlement stuck, releasing escrow:', { tradeId: session.id, sellerId: session.sellerId, itemId: session.itemId });
+        endTrade(session, 'failed', { reason: 'settlement_timeout', critical: true });
+      }
+      continue;
+    }
     const awaitingAge = session.awaitingPaymentSince ? now - session.awaitingPaymentSince : 0;
     if (session.phase === 'awaiting_payment' && awaitingAge > 5 * 60 * 1000) {
       endTrade(session, 'expired');
@@ -7609,6 +7702,7 @@ wss.on('connection', (ws) => {
       }
     }, 10000),
     authAttempts: 0,
+    authInFlight: false,
   };
 
   refreshCombatStats(player);
@@ -7621,18 +7715,20 @@ wss.on('connection', (ws) => {
 
       if (!player.authenticated) {
         if (data.type === 'auth') {
+          if (player.authInFlight) return;
           player.authAttempts++;
           if (player.authAttempts > 5) {
             safeSend(ws, { type: 'auth_error', error: 'too_many_attempts' });
             ws.close(4008, 'too_many_auth_attempts');
             return;
           }
+          player.authInFlight = true;
           handleAuth(player, data).catch((err) => {
             console.error(`[!] handleAuth error for ${playerId}:`, err.message);
-            if (player.userId && userIdToPlayer.get(player.userId) === player) {
-              userIdToPlayer.delete(player.userId);
-            }
+            if (!player.authenticated) discardPendingAuth(player);
             try { ws.close(4000, 'auth_error'); } catch (e) { }
+          }).finally(() => {
+            player.authInFlight = false;
           });
           return;
         } else {
@@ -7936,6 +8032,13 @@ wss.on('connection', (ws) => {
       closeCavePortal();
     }
 
+    if (player.activeTradeId) {
+      const tradeSession = activeTrades.get(player.activeTradeId);
+      if (tradeSession && tradeSession.phase !== 'settling') {
+        endTrade(tradeSession, 'cancelled');
+      }
+    }
+
     if (player.authenticated) {
       if (isCombatLogout(player)) dropRunLoot(player);
       persistPlayer(player);
@@ -7949,13 +8052,6 @@ wss.on('connection', (ws) => {
     }
     if (player.wallet && walletToPlayer.get(player.wallet) === player) {
       walletToPlayer.delete(player.wallet);
-    }
-
-    if (player.activeTradeId) {
-      const tradeSession = activeTrades.get(player.activeTradeId);
-     if (tradeSession && tradeSession.phase !== 'settling') {
-        endTrade(tradeSession, 'cancelled');
-      }
     }
 
     players.delete(playerId);
@@ -7975,6 +8071,8 @@ wss.on('connection', (ws) => {
   });
 
   async function handleAuth(player, data) {
+    const aborted = () => ws.readyState !== WebSocket.OPEN;
+
     const token = data.token;
     if (!token || typeof token !== 'string') {
       safeSend(ws, { type: 'auth_error', error: 'invalid_token' });
@@ -7983,6 +8081,7 @@ wss.on('connection', (ws) => {
     }
 
     const verifyResult = await verifyGameToken(token);
+    if (aborted()) return;
 
     if (!verifyResult || !verifyResult.valid) {
       const error = verifyResult?.error || 'invalid_token';
@@ -8029,6 +8128,7 @@ wss.on('connection', (ws) => {
     clearTimeout(player.authTimeout);
 
     const savedProgress = await loadPlayerProgress(player.userId, player.gameId);
+    if (aborted()) return discardPendingAuth(player);
 
     if (savedProgress) {
       if (savedProgress.nickname) {
@@ -8236,6 +8336,9 @@ wss.on('connection', (ws) => {
       return null;
     });
     player.blockedUserIds = new Set((blocksResult?.blocked || []).map((b) => b.userId));
+    if (aborted()) return discardPendingAuth(player);
+
+    applyPendingPlaceableRefunds(player);
 
     player.instance = pickShard(player.locationId, null);
     player.justSpawned = true;
@@ -8291,6 +8394,7 @@ wss.on('connection', (ws) => {
     if (player.locationId === 'main-world') {
       safeSend(ws, { type: 'lootState', loot: serializeLoot(player.instance) });
       await ensureSignsLoaded(player.gameId);
+      if (aborted()) return;
       safeSend(ws, { type: 'signState', signs: serializeSigns(player.instance) });
       sendWorldEnemyState(player);
     }
@@ -8306,6 +8410,7 @@ wss.on('connection', (ws) => {
     sendShardState(player);
 
     await refreshRoomEditRights(player);
+    if (aborted()) return;
 
     safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
     sendProgressionState(player);
@@ -9930,8 +10035,10 @@ wss.on('connection', (ws) => {
       itemId: null,
       itemName: null,
       priceTnj: null,
+      escrowed: false,
       createdAt: Date.now(),
       awaitingPaymentSince: null,
+      settlingSince: null,
     };
     activeTrades.set(tradeId, session);
     player.activeTradeId = tradeId;
@@ -10023,8 +10130,7 @@ wss.on('connection', (ws) => {
 
     const allReady = Object.values(session.participants).every((p) => p.ready);
     if (allReady && session.sellerId) {
-      const seller = userIdToPlayer.get(session.sellerId);
-      if (!seller || !(seller.placeables[session.itemId] > 0)) {
+      if (!holdTradeEscrow(session)) {
         for (const p of Object.values(session.participants)) p.ready = false;
         sendToTradeParticipants(session, { type: 'error', message: 'Seller no longer has this item', messageKey: 'g.err.sellerLostItem' });
         broadcastTradeState(session);
@@ -10054,7 +10160,14 @@ wss.on('connection', (ws) => {
     if (!session.participants[player.userId] || player.userId === session.sellerId) return;
 
     const sellerEntry = session.participants[session.sellerId];
+    if (!session.escrowed) {
+      sendToTradeParticipants(session, { type: 'error', message: 'Seller no longer has this item', messageKey: 'g.err.sellerLostItem' });
+      endTrade(session, 'cancelled');
+      return;
+    }
+
     session.phase = 'settling';
+    session.settlingSince = Date.now();
     broadcastTradeState(session);
 
     const result = await callInternalApi('/api/internal/game/trade/settle', {
@@ -10089,17 +10202,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    const seller = userIdToPlayer.get(session.sellerId);
-    if (seller) {
-      seller.placeables[session.itemId] = Math.max(0, (seller.placeables[session.itemId] || 0) - 1);
-      seller.economyChangedAt = Date.now();
-      persistPlayer(seller);
-      safeSend(seller.ws, { type: 'inventoryUpdate', inventory: seller.inventory, ash: seller.ash, placeables: seller.placeables });
-    } else {
-      console.error('[Trade] Seller offline at settlement — item not deducted in-memory, needs manual reconciliation:', {
-        tradeId: session.id, sellerId: session.sellerId, itemId: session.itemId, dbTradeId: result.tradeId,
-      });
-    }
+    session.escrowed = false;
 
     player.placeables[session.itemId] = (player.placeables[session.itemId] || 0) + 1;
     player.economyChangedAt = Date.now();
@@ -11165,9 +11268,10 @@ wss.on('connection', (ws) => {
     }
 
     const owned = player.placeables[item.id] || 0;
-    const capRemaining = item.maxOwned === null ? Number.MAX_SAFE_INTEGER : item.maxOwned - owned;
+    const maxOwned = item.maxOwned === null ? SHOP_UNCAPPED_MAX_OWNED : item.maxOwned;
+    const capRemaining = maxOwned - owned;
     if (capRemaining <= 0) {
-      safeSend(player.ws, { type: 'error', message: `You already own the maximum of ${item.maxOwned}`, messageKey: 'g.err.ownMaximum', messageVars: { max: item.maxOwned } });
+      safeSend(player.ws, { type: 'error', message: `You already own the maximum of ${maxOwned}`, messageKey: 'g.err.ownMaximum', messageVars: { max: maxOwned } });
       return;
     }
 
@@ -11177,7 +11281,9 @@ wss.on('connection', (ws) => {
     }
 
     const unitPrice = shopPriceFor(item.id, item.price);
-    const requestedQty = Number.isInteger(data.quantity) && data.quantity > 0 ? data.quantity : 1;
+    const requestedQty = Number.isInteger(data.quantity) && data.quantity > 0
+      ? Math.min(data.quantity, SHOP_MAX_QTY_PER_PURCHASE)
+      : 1;
     const affordableQty = unitPrice > 0 ? Math.floor(player.ash / unitPrice) : requestedQty;
     const qty = Math.max(0, Math.min(requestedQty, capRemaining, affordableQty));
     if (qty <= 0) {
@@ -11585,17 +11691,40 @@ function broadcastCount() {
   });
 }
 
-function shutdown(signal) {
+const SHUTDOWN_SAVE_DEADLINE_MS = 8000;
+const FATAL_SAVE_DEADLINE_MS = 3000;
+let shuttingDown = false;
+
+function flushAllSaves(deadlineMs) {
+  const savePromises = [];
+  try {
+    players.forEach((player) => {
+      if (player.authenticated && CONFIG.internalSecret) {
+        savePromises.push(queuePlayerSave(player, buildSavePayload(player)));
+      }
+    });
+  } catch (err) {
+    console.error('[!] Save flush build error:', err.message);
+  }
+
+  return Promise.race([
+    Promise.allSettled(savePromises),
+    new Promise((resolve) => setTimeout(resolve, deadlineMs).unref?.()),
+  ]);
+}
+
+function shutdown(signal, exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log(`\n[!] ${signal} received. Shutting down gracefully...`);
 
-  const savePromises = [];
-  players.forEach((player) => {
-    if (player.authenticated && CONFIG.internalSecret) {
-      savePromises.push(queuePlayerSave(player, buildSavePayload(player)));
-    }
-  });
+  const hardExit = setTimeout(() => {
+    console.error('[!] Shutdown timed out, forcing exit');
+    process.exit(exitCode || 1);
+  }, SHUTDOWN_SAVE_DEADLINE_MS + 6000);
+  hardExit.unref?.();
 
-  Promise.all(savePromises).finally(() => {
+  flushAllSaves(SHUTDOWN_SAVE_DEADLINE_MS).then(() => {
     const msg = getCachedMessage({ type: 'serverShutdown', reason: 'Server restarting' });
     players.forEach((p) => {
       try {
@@ -11608,18 +11737,36 @@ function shutdown(signal) {
       wss.close(() => {
         server.close(() => {
           console.log('[✓] Shutdown complete');
-          process.exit(0);
+          process.exit(exitCode);
         });
       });
     }, 2000);
   });
 }
 
+function fatalShutdown(reason, err) {
+  console.error(`[!] FATAL (${reason}):`, err?.stack || err);
+
+  if (shuttingDown) {
+    process.exit(1);
+    return;
+  }
+  shuttingDown = true;
+
+  const hardExit = setTimeout(() => process.exit(1), FATAL_SAVE_DEADLINE_MS + 2000);
+  hardExit.unref?.();
+
+  flushAllSaves(FATAL_SAVE_DEADLINE_MS).then(() => {
+    console.error('[!] State flushed after fatal error, exiting for restart');
+    process.exit(1);
+  }).catch(() => process.exit(1));
+}
+
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
 process.on('uncaughtException', (err) => {
-  console.error('[!] Uncaught exception:', err);
+  fatalShutdown('uncaughtException', err);
 });
 process.on('unhandledRejection', (reason) => {
   console.error('[!] Unhandled rejection:', reason);
