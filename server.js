@@ -37,6 +37,15 @@ const COSMETIC_SLOTS = {
   scream_robe: 'skin',
   trump_suit: 'skin',
   pepe_frog: 'skin',
+  doge_shiba: 'skin',
+  wojak_hoodie: 'skin',
+  gigachad_marble: 'skin',
+  moon_astronaut: 'skin',
+  bull_market: 'skin',
+  bear_market: 'skin',
+  wif_hat: 'accessory',
+  laser_eyes: 'accessory',
+  deal_shades: 'accessory',
 };
 const COSMETIC_PRICE_ASH = 1;
 
