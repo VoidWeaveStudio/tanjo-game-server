@@ -98,6 +98,7 @@ const CONFIG = {
     factionQuestCreateRateLimit: 3,
     emoteRateLimit: 2,
     cosmeticRateLimit: 5,
+    companionRateLimit: 8,
     tradeRateLimit: 8,
   },
   combat: {
@@ -4353,6 +4354,7 @@ const PET_FETCH_GRACE_MS = 400;
 const PET_BLOCKED_LOCATION_PREFIX = 'event-';
 
 function hasPet(player) {
+  if (player.companions?.equipped) return true;
   return (player.placeables?.[PET_ITEM_ID] || 0) > 0;
 }
 
@@ -7518,6 +7520,19 @@ function applyPlayerStatus(p, status, now) {
     }
   }
 
+  if (now - (p.companionsChangedAt || 0) >= 5000) {
+    if (status.companions && JSON.stringify(status.companions) !== JSON.stringify(p.companions)) {
+      p.companions = status.companions;
+      safeSend(p.ws, {
+        type: 'companionState',
+        owned: p.companions.owned,
+        equipped: p.companions.equipped,
+        fragments: p.companions.fragments,
+        crates: p.companions.crates,
+      });
+    }
+  }
+
   applyHomeFixtures(p, status);
 }
 
@@ -7691,6 +7706,8 @@ wss.on('connection', (ws) => {
     metNpcs: new Set(),
     factions: [],
     cosmeticsOwned: new Set(),
+    companions: { owned: [], equipped: null, fragments: 0, crates: 0 },
+    companionsChangedAt: 0,
     cosmeticSkinId: null,
     cosmeticAccessoryId: null,
     displayedFactionId: null,
@@ -7814,6 +7831,8 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'saveProgress', CONFIG.network.saveProgressRateLimit)) return;
       } else if (data.type === 'cosmeticListRequest' || data.type === 'cosmeticBuy' || data.type === 'cosmeticEquip') {
         if (!checkRateLimit(playerId, 'cosmetic', CONFIG.network.cosmeticRateLimit)) return;
+      } else if (data.type === 'companionListRequest' || data.type === 'companionEquip' || data.type === 'companionDust' || data.type === 'companionCombine' || data.type === 'crateOpen') {
+        if (!checkRateLimit(playerId, 'companion', CONFIG.network.companionRateLimit)) return;
       } else if (data.type === 'emote') {
         if (!checkRateLimit(playerId, 'emote', CONFIG.network.emoteRateLimit)) return;
       } else if (data.type === 'questInteract' || data.type === 'questAccept' || data.type === 'questTurnIn' || data.type === 'npcVisit' || data.type === 'npcMet') {
@@ -7940,6 +7959,11 @@ wss.on('connection', (ws) => {
         case 'cosmeticListRequest': handleCosmeticListRequest(player); break;
         case 'cosmeticBuy': handleCosmeticBuy(player, data); break;
         case 'cosmeticEquip': handleCosmeticEquip(player, data); break;
+        case 'companionListRequest': handleCompanionListRequest(player); break;
+        case 'companionEquip': handleCompanionEquip(player, data); break;
+        case 'companionDust': handleCompanionDust(player, data); break;
+        case 'companionCombine': handleCompanionCombine(player); break;
+        case 'crateOpen': handleCrateOpen(player); break;
         case 'questInteract': handleQuestInteract(player, data); break;
         case 'questAccept': handleQuestAccept(player, data); break;
         case 'questTurnIn': handleQuestTurnIn(player, data); break;
@@ -8348,6 +8372,7 @@ wss.on('connection', (ws) => {
     }
 
     await refreshPlayerCosmetics(player);
+    await refreshPlayerCompanions(player);
     if (shopPriceOverrides.size === 0) await refreshShopPrices(player.gameId);
     if (eventConfigs.size === 0) await refreshEventConfigs(player.gameId);
 
@@ -8408,6 +8433,7 @@ wss.on('connection', (ws) => {
     safeSend(ws, { type: 'factionMyListResult', factions: player.factions });
     safeSend(ws, buildWorldStatusPayload());
     sendCosmeticState(player);
+    sendCompanionState(player);
     sendMetNpcs(player);
     sendActiveZones(player);
     sendStorageState(player);
@@ -10515,6 +10541,136 @@ wss.on('connection', (ws) => {
 
     sendCosmeticState(player);
     broadcastCosmeticChange(player);
+  }
+
+  function sendCompanionState(player) {
+    const state = player.companions || { owned: [], equipped: null, fragments: 0, crates: 0 };
+    safeSend(player.ws, {
+      type: 'companionState',
+      owned: state.owned,
+      equipped: state.equipped,
+      fragments: state.fragments,
+      crates: state.crates,
+    });
+  }
+
+  function applyCompanionState(player, result) {
+    if (!result) return false;
+    player.companionsChangedAt = Date.now();
+    player.companions = {
+      owned: Array.isArray(result.owned) ? result.owned : [],
+      equipped: result.equipped || null,
+      fragments: Math.max(0, Math.floor(Number(result.fragments) || 0)),
+      crates: Math.max(0, Math.floor(Number(result.crates) || 0)),
+    };
+    return true;
+  }
+
+  async function refreshPlayerCompanions(player) {
+    const result = await callInternalApi('/api/internal/game/companions/state', {
+      userId: player.userId,
+      gameId: player.gameId,
+      legacyDogCount: player.placeables?.[PET_ITEM_ID] || 0,
+    }).catch((err) => {
+      console.error('[Companions] state error:', err.message);
+      return null;
+    });
+    applyCompanionState(player, result);
+  }
+
+  function companionErrorKey(code) {
+    if (code === 'no_duplicate') return 'g.err.companionNoDuplicate';
+    if (code === 'not_enough_fragments') return 'g.err.notEnoughFragments';
+    if (code === 'no_crate') return 'g.err.noCrate';
+    if (code === 'not_owned') return 'g.err.companionNotOwned';
+    return 'g.err.companionFailed';
+  }
+
+  function sendCompanionError(player, code) {
+    safeSend(player.ws, {
+      type: 'error',
+      message: 'That companion action could not be completed',
+      messageKey: companionErrorKey(code),
+    });
+  }
+
+  async function handleCompanionListRequest(player) {
+    await refreshPlayerCompanions(player);
+    sendCompanionState(player);
+  }
+
+  async function handleCompanionEquip(player, data) {
+    const companionId = typeof data.companionId === 'string' && data.companionId ? data.companionId : null;
+    const result = await callInternalApi('/api/internal/game/companions/equip', {
+      userId: player.userId, gameId: player.gameId, companionId,
+    }).catch((err) => {
+      console.error('[Companions] equip error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      sendCompanionError(player, result?.error);
+      return;
+    }
+
+    applyCompanionState(player, result);
+    sendCompanionState(player);
+  }
+
+  async function handleCompanionDust(player, data) {
+    const itemId = typeof data.itemId === 'string' ? data.itemId : null;
+    if (!itemId) return;
+
+    const result = await callInternalApi('/api/internal/game/companions/dust', {
+      userId: player.userId, gameId: player.gameId, itemId,
+    }).catch((err) => {
+      console.error('[Companions] dust error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      sendCompanionError(player, result?.error);
+      return;
+    }
+
+    applyCompanionState(player, result);
+    safeSend(player.ws, { type: 'companionDusted', itemId, gained: Math.max(0, Math.floor(Number(result.gained) || 0)) });
+    sendCompanionState(player);
+  }
+
+  async function handleCompanionCombine(player) {
+    const result = await callInternalApi('/api/internal/game/companions/combine', {
+      userId: player.userId, gameId: player.gameId,
+    }).catch((err) => {
+      console.error('[Companions] combine error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      sendCompanionError(player, result?.error);
+      return;
+    }
+
+    applyCompanionState(player, result);
+    sendCompanionState(player);
+  }
+
+  async function handleCrateOpen(player) {
+    const result = await callInternalApi('/api/internal/game/companions/crate-open', {
+      userId: player.userId, gameId: player.gameId,
+    }).catch((err) => {
+      console.error('[Companions] crate open error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      sendCompanionError(player, result?.error);
+      return;
+    }
+
+    applyCompanionState(player, result);
+    safeSend(player.ws, { type: 'crateOpened', itemId: result.itemId, rarity: result.rarity });
+    sendCompanionState(player);
   }
 
   function handleEmote(player, data) {
