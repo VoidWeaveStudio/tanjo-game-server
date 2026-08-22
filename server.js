@@ -62,8 +62,8 @@ const CONFIG = {
   },
   network: {
     heartbeatInterval: 5000,
-    heartbeatTimeout: 15000,
-    staleTimeout: 60000,
+    heartbeatTimeout: 45000,
+    staleTimeout: 90000,
     maxMessageSize: 32 * 1024,
     chatRateLimit: 3,
     updateRateLimit: 25,
