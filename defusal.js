@@ -14,7 +14,7 @@ const DEFUSAL_CONFIG = {
   freezeMs: 8000,
   roundMs: 115000,
   bombMs: 40000,
-  plantMs: 3200,
+  plantMs: 3200, 
   defuseMs: 5000,
   roundEndMs: 6000,
 

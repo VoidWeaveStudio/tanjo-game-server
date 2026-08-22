@@ -12,7 +12,7 @@ const FACTION_QUEST_TYPES = [
     label: 'g.fq.x_post_view.label',
     description: 'g.fq.x_post_view.description',
   },
-];
+]; 
 
 function isValidXPostUrl(url) {
   if (typeof url !== 'string') return false;

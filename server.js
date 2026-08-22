@@ -4859,12 +4859,12 @@ function rollLootTokens(minCount, maxCount, mult = 1) {
   for (let i = 0; i < count; i++) {
     const t = tokenPool[Math.floor(Math.random() * tokenPool.length)];
     tokens.push({
-      address: t.address,
+      address: t.address, 
       name: t.name,
       symbol: t.symbol,
       image: t.image,
     });
-  }
+  } 
   return tokens;
 }
 

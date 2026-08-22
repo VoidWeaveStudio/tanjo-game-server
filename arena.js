@@ -11,7 +11,7 @@ const ARENA_CONFIG = {
   maxLiveEnemies: 30,
   bossEveryWaves: 5,
   biomeCount: 5,
-  wavesPerBiome: 5,
+  wavesPerBiome: 5, 
   ashPerWave: 25,
   ashCap: 1500,
   xpPerWave: 50,
