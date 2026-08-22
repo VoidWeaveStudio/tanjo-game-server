@@ -32,9 +32,7 @@ const MAX_CONNECTIONS = 2000;
 const EMOTE_KEYS = ['laugh', 'fuck_you', 'angry', 'to_the_moon', 'green_candle'];
 
 const COSMETIC_SLOTS = {
-  scream_mask: 'accessory',
   trump_hair: 'accessory',
-  scream_robe: 'skin',
   trump_suit: 'skin',
   pepe_frog: 'skin',
   doge_shiba: 'skin',
@@ -43,7 +41,6 @@ const COSMETIC_SLOTS = {
   moon_astronaut: 'skin',
   bull_market: 'skin',
   bear_market: 'skin',
-  wif_hat: 'accessory',
   laser_eyes: 'accessory',
   deal_shades: 'accessory',
 };
@@ -4283,7 +4280,7 @@ function handleGrinderMelee(player, match) {
   const [px, , pz] = player.position;
   const facing = player.rotation || 0;
   const forwardX = Math.sin(facing);
-  const forwardZ = -Math.cos(facing);
+  const forwardZ = Math.cos(facing);
 
   let best = null;
   let bestDistance = Infinity;
@@ -4309,7 +4306,7 @@ function handleGrinderMelee(player, match) {
   if (!best) return;
 
   const theirFacing = best.rotation || 0;
-  const behind = forwardX * Math.sin(theirFacing) + forwardZ * -Math.cos(theirFacing) > 0.35;
+  const behind = forwardX * Math.sin(theirFacing) + forwardZ * Math.cos(theirFacing) > 0.35;
   const damage = arsenalDamage(player, best, 'chest', bestDistance) * (behind ? 3 : 1);
 
   applyBulletDamage(player, best, Math.round(damage), { point: best.position });
@@ -11164,7 +11161,7 @@ wss.on('connection', (ws) => {
     const [px, , pz] = player.position;
     const facing = player.rotation || 0;
     const forwardX = Math.sin(facing);
-    const forwardZ = -Math.cos(facing);
+    const forwardZ = Math.cos(facing);
 
     let best = null;
     let bestDistance = Infinity;
@@ -11191,7 +11188,7 @@ wss.on('connection', (ws) => {
     if (!best) return;
 
     const theirFacing = best.rotation || 0;
-    const behind = forwardX * Math.sin(theirFacing) + forwardZ * -Math.cos(theirFacing) > 0.35;
+    const behind = forwardX * Math.sin(theirFacing) + forwardZ * Math.cos(theirFacing) > 0.35;
     const damage = arsenalDamage(player, best, 'chest', bestDistance) * (behind ? 3 : 1);
 
     applyBulletDamage(player, best, Math.round(damage), { point: best.position });

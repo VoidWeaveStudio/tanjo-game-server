@@ -532,7 +532,7 @@ function flashStrength(grenade, position, facing) {
   if (!geometry.hasLineOfSight(grenade.x, grenade.y, grenade.z, position[0], eyeY, position[2])) return 0;
 
   const falloff = 1 - distance / GRENADE_PHYSICS.flashRange;
-  const toward = distance > 0.001 ? (dx / distance) * Math.sin(facing) + (dz / distance) * -Math.cos(facing) : 1;
+  const toward = distance > 0.001 ? (dx / distance) * Math.sin(facing) + (dz / distance) * Math.cos(facing) : 1;
   const facingFactor = Math.max(0.12, (toward + 1) / 2);
 
   return Math.round(GRENADE_PHYSICS.flashMaxMs * falloff * facingFactor);
