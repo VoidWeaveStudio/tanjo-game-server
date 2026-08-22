@@ -16,6 +16,7 @@ const {
   isValidXPostUrl,
   questTotalCostAsh,
 } = require('./factionQuests');
+const tournamentRules = require('./tournaments');
 const progression = require('./progression');
 const skills = require('./skills');
 const abilities = require('./abilities');
@@ -105,6 +106,7 @@ const CONFIG = {
     emoteRateLimit: 2,
     cosmeticRateLimit: 5,
     companionRateLimit: 8,
+    tournamentRateLimit: 10,
     tradeRateLimit: 8,
   },
   combat: {
@@ -168,6 +170,9 @@ const ARENA_LOCATION_ID = arena.ARENA_CONFIG.locationId;
 const CANYON_RETURN_PAD_OFFSET = 20;
 const CANYON_RETURN_PAD_REACH = 6;
 const CANYON_REPEAT_LOOT_MULT = 0.3;
+// One meme fragment per boss, on every clear including repeats. 100 fragments
+// combine into one crate, so a farmed segment is still ~100 boss kills per crate.
+const CANYON_BOSS_FRAGMENTS = 1;
 
 const CANYON_HUB_POSITION = [0, 0, 20];
 
@@ -5588,6 +5593,36 @@ function applyKillRewards(player) {
   }
 }
 
+// Every canyon boss drops exactly one meme fragment. Fired and forgotten: a
+// failed grant must never block the kill from resolving, so it only logs.
+async function grantCanyonBossFragments(player, amount) {
+  const result = await callInternalApi('/api/internal/game/companions/grant-fragments', {
+    userId: player.userId, gameId: player.gameId, fragments: amount,
+  }).catch((err) => {
+    console.error('[Canyon] fragment grant error:', err.message);
+    return null;
+  });
+
+  if (!result || !result.success) return;
+
+  player.companions = {
+    owned: Array.isArray(result.owned) ? result.owned : (player.companions?.owned || []),
+    equipped: result.equipped || null,
+    fragments: Math.max(0, Math.floor(Number(result.fragments) || 0)),
+    crates: Math.max(0, Math.floor(Number(result.crates) || 0)),
+  };
+  player.companionsChangedAt = Date.now();
+
+  safeSend(player.ws, {
+    type: 'companionState',
+    owned: player.companions.owned,
+    equipped: player.companions.equipped,
+    fragments: player.companions.fragments,
+    crates: player.companions.crates,
+  });
+  safeSend(player.ws, { type: 'fragmentsGranted', amount: result.granted, source: 'canyon_boss' });
+}
+
 function applyEnemyDamage(player, enemy, amount, options = {}) {
   if (!enemy.alive) return false;
 
@@ -5675,6 +5710,8 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
       player.canyon.maxSegmentReached = nextSegment;
     }
     persistPlayer(player);
+
+    grantCanyonBossFragments(player, CANYON_BOSS_FRAGMENTS);
 
     player.canyon.pendingSegment = nextSegment;
 
@@ -7857,6 +7894,8 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'factionQuestCreate', CONFIG.network.factionQuestCreateRateLimit)) return;
       } else if (data.type === 'factionQuestListRequest' || data.type === 'factionQuestManageListRequest' || data.type === 'factionQuestClaim') {
         if (!checkRateLimit(playerId, 'factionQuest', CONFIG.network.factionQuestRateLimit)) return;
+      } else if (data.type === 'tournamentListRequest' || data.type === 'tournamentEntriesRequest' || data.type === 'tournamentAction') {
+        if (!checkRateLimit(playerId, 'tournament', CONFIG.network.tournamentRateLimit)) return;
       } else if (data.type === 'factionSearch') {
         if (!checkRateLimit(playerId, 'factionSearch', CONFIG.network.factionSearchRateLimit)) return;
       } else if (data.type === 'playerProfileRequest' || data.type === 'leaderboardRequest' || data.type === 'factionLeaderboardRequest') {
@@ -8004,6 +8043,9 @@ wss.on('connection', (ws) => {
         case 'factionQuestListRequest': handleFactionQuestListRequest(player); break;
         case 'factionQuestManageListRequest': handleFactionQuestManageListRequest(player, data); break;
         case 'factionQuestClaim': handleFactionQuestClaim(player, data); break;
+        case 'tournamentListRequest': handleTournamentListRequest(player); break;
+        case 'tournamentEntriesRequest': handleTournamentEntriesRequest(player, data); break;
+        case 'tournamentAction': handleTournamentAction(player, data); break;
         case 'playerProfileRequest': handlePlayerProfileRequest(player, data); break;
         case 'leaderboardRequest': handleLeaderboardRequest(player, data); break;
         case 'factionLeaderboardRequest': handleFactionLeaderboardRequest(player, data); break;
@@ -9744,6 +9786,113 @@ wss.on('connection', (ws) => {
       status: result.status,
     });
     safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+  }
+
+  function sendTournamentList(player, tournaments) {
+    safeSend(player.ws, { type: 'tournamentListResult', tournaments: tournaments || [] });
+  }
+
+  // Cached per viewer, because the board polls this on a timer while the player
+  // stands in the hall and each entry carries that player's own join/vote state.
+  async function handleTournamentListRequest(player) {
+    const result = await cachedInternalCall(
+      `tournaments:${player.gameId}:${player.userId}`,
+      5000,
+      () => callInternalApi('/api/internal/game/tournaments/list', {
+        gameId: player.gameId, viewerUserId: player.userId,
+      })
+    ).catch((err) => {
+      console.error('[Tournament] list error:', err.message);
+      return null;
+    });
+
+    sendTournamentList(player, result?.tournaments);
+  }
+
+  async function handleTournamentEntriesRequest(player, data) {
+    if (!tournamentRules.isUuid(data.tournamentId)) return;
+
+    const result = await cachedInternalCall(
+      `tournamentEntries:${data.tournamentId}:${player.userId}`,
+      4000,
+      () => callInternalApi('/api/internal/game/tournaments/entries', {
+        tournamentId: data.tournamentId, viewerUserId: player.userId,
+      })
+    ).catch((err) => {
+      console.error('[Tournament] entries error:', err.message);
+      return null;
+    });
+
+    safeSend(player.ws, {
+      type: 'tournamentEntriesResult',
+      tournamentId: data.tournamentId,
+      kind: result?.kind || null,
+      entries: result?.entries || [],
+    });
+  }
+
+  function dropTournamentCache(player, tournamentId) {
+    internalCache.delete(`tournaments:${player.gameId}:${player.userId}`);
+    internalCache.forEach((_entry, key) => {
+      if (key.startsWith(`tournamentEntries:${tournamentId}:`)) internalCache.delete(key);
+    });
+  }
+
+  async function handleTournamentAction(player, data) {
+    if (!tournamentRules.isTournamentAction(data.action)) return;
+    if (!tournamentRules.isUuid(data.tournamentId)) return;
+
+    // Cheap client-side-shaped checks first, so an obviously malformed payload
+    // never costs an internal round trip. The Next route validates again.
+    if (data.action === 'submitSkin' && !tournamentRules.isTournamentKind(data.kind)) return;
+    if (data.action === 'like' && !tournamentRules.isUuid(data.entryId)) return;
+    if (data.action === 'setPost') {
+      const clearing = typeof data.postUrl === 'string' && data.postUrl.trim().length === 0;
+      if (!clearing && !tournamentRules.isValidXPostUrl(data.postUrl)) {
+        safeSend(player.ws, {
+          type: 'error',
+          message: 'That is not a valid X post link',
+          messageKey: 'g.err.tournament.invalidUrl',
+        });
+        return;
+      }
+    }
+    if (data.action === 'submitShot' && (typeof data.shotUrl !== 'string' || data.shotUrl.length > tournamentRules.MAX_URL_LENGTH)) {
+      return;
+    }
+
+    const result = await callInternalApi('/api/internal/game/tournaments/action', {
+      action: data.action,
+      gameId: player.gameId,
+      userId: player.userId,
+      tournamentId: data.tournamentId,
+      kind: data.kind,
+      entryId: data.entryId,
+      postUrl: data.postUrl,
+      shotUrl: data.shotUrl,
+    }).catch((err) => {
+      console.error('[Tournament] action error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      safeSend(player.ws, {
+        type: 'error',
+        message: 'That tournament action could not be completed',
+        messageKey: tournamentRules.tournamentErrorKey(result?.error),
+      });
+      return;
+    }
+
+    dropTournamentCache(player, data.tournamentId);
+
+    safeSend(player.ws, {
+      type: 'tournamentActionResult',
+      action: data.action,
+      tournamentId: data.tournamentId,
+      result: result.result || null,
+    });
+    sendTournamentList(player, result.tournaments);
   }
 
   function friendErrorKey(code) {
