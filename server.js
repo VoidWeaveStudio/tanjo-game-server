@@ -173,6 +173,7 @@ const CANYON_REPEAT_LOOT_MULT = 0.3;
 // One meme fragment per boss, on every clear including repeats. 100 fragments
 // combine into one crate, so a farmed segment is still ~100 boss kills per crate.
 const CANYON_BOSS_FRAGMENTS = 1;
+const CANYON_COSMETIC_FRAGMENT_FROM = 6;
 
 const CANYON_HUB_POSITION = [0, 0, 20];
 
@@ -218,6 +219,17 @@ const ENEMY_TYPES = {
       { id: 'spit', windup: 750, cooldown: 2600, minRange: 0, maxRange: 52, speed: 28, radius: 3, damage: 18, shots: 1, spread: 0 },
       { id: 'volley', windup: 1200, cooldown: 7000, minRange: 10, maxRange: 52, speed: 21, radius: 3.2, damage: 12, shots: 4, spread: 6 },
       { id: 'pool', windup: 1500, cooldown: 11000, minRange: 8, maxRange: 46, speed: 15, radius: 5, damage: 8, shots: 1, spread: 0, pool: { duration: 6000, interval: 750, damage: 6 } },
+    ],
+  },
+  slime_seer: {
+    name: 'Rift Seer', maxHealth: 2000, attackDamage: 0, attackRange: 0, aggroRadius: 52, aggroLeash: 999,
+    attackCooldown: 1800, chaseSpeedNear: 3.8, chaseSpeedFar: 8, chaseNearThreshold: 18,
+    patrolSpeed: 1.6, patrolRadius: 12, scale: 3.8, lootMin: 30, lootMax: 55,
+    ranged: true, preferredRange: 18, arenaRadius: 46,
+    attacks: [
+      { id: 'spit', windup: 700, cooldown: 2400, minRange: 0, maxRange: 54, speed: 30, radius: 3.2, damage: 26, shots: 1, spread: 0 },
+      { id: 'volley', windup: 1150, cooldown: 6400, minRange: 10, maxRange: 54, speed: 22, radius: 3.4, damage: 17, shots: 5, spread: 7 },
+      { id: 'pool', windup: 1450, cooldown: 10000, minRange: 8, maxRange: 48, speed: 15, radius: 5.4, damage: 12, shots: 1, spread: 0, pool: { duration: 6500, interval: 700, damage: 10 } },
     ],
   },
   husk: {
@@ -1113,6 +1125,7 @@ function buildPlayerStatePayload(p) {
     position: p.position,
     rotation: p.rotation,
     pitch: p.pitch,
+    headYaw: p.headYaw,
     state: p.state,
     jumping: p.jumping,
     velocityY: p.velocityY,
@@ -1134,6 +1147,7 @@ function buildPlayerJoinPayload(p) {
     position: p.position,
     rotation: p.rotation,
     pitch: p.pitch,
+    headYaw: p.headYaw,
     state: p.state || 'idle',
     jumping: p.jumping || false,
     velocityY: p.velocityY || 0,
@@ -1148,6 +1162,7 @@ function buildPlayerJoinPayload(p) {
     skinTextureUrl: p.skinTextureUrl || null,
     cosmeticSkinId: p.cosmeticSkinId || null,
     cosmeticAccessoryId: p.cosmeticAccessoryId || null,
+    companionId: p.companions?.equipped || null,
     level: p.progression.level,
     tier: progression.tierForLevel(p.progression.level).id,
     branch: p.progression.branch,
@@ -1261,6 +1276,7 @@ function notifyLocationTransition(player, oldLocationId, newLocationId) {
       position: player.position,
       rotation: player.rotation,
       pitch: player.pitch,
+      headYaw: player.headYaw,
       state: player.state || 'idle',
       jumping: player.jumping || false,
       velocityY: player.velocityY || 0,
@@ -1274,6 +1290,7 @@ function notifyLocationTransition(player, oldLocationId, newLocationId) {
       skinTextureUrl: player.skinTextureUrl || null,
       cosmeticSkinId: player.cosmeticSkinId || null,
       cosmeticAccessoryId: player.cosmeticAccessoryId || null,
+      companionId: player.companions?.equipped || null,
     });
     if (other.ready) safeSend(player.ws, {
       type: 'playerJoinLocation',
@@ -1284,6 +1301,7 @@ function notifyLocationTransition(player, oldLocationId, newLocationId) {
       position: other.position,
       rotation: other.rotation,
       pitch: other.pitch,
+      headYaw: other.headYaw,
       state: other.state || 'idle',
       jumping: other.jumping || false,
       velocityY: other.velocityY || 0,
@@ -1294,6 +1312,7 @@ function notifyLocationTransition(player, oldLocationId, newLocationId) {
       locationId: other.locationId,
       isAdmin: !!other.isAdmin,
       isFactionCreator: !!other.isFactionCreator,
+      companionId: other.companions?.equipped || null,
       skinTextureUrl: other.skinTextureUrl || null,
       cosmeticSkinId: other.cosmeticSkinId || null,
       cosmeticAccessoryId: other.cosmeticAccessoryId || null,
@@ -1979,6 +1998,21 @@ safeInterval(pollWorldCommands, WORLD_COMMAND_POLL_MS);
 safeInterval(updatePortalState, WORLD_COMMAND_POLL_MS);
 safeInterval(pollAdminCommands, ADMIN_COMMAND_POLL_MS);
 
+// From this segment the biome boss also walks the combat stretch as an ordinary
+// enemy. Only player.canyon.bossId opens the gate, so these never end the run.
+const CANYON_ROAMING_BOSS_FROM = 6;
+const CANYON_ROAMING_BOSS_MAX = 4;
+const CANYON_RANGED_BOSS_FROM = 6;
+
+function canyonRoamingBossCount(segment) {
+  if (segment < CANYON_ROAMING_BOSS_FROM) return 0;
+  return Math.min(CANYON_ROAMING_BOSS_MAX, 1 + Math.floor((segment - CANYON_ROAMING_BOSS_FROM) / 3));
+}
+
+function canyonSegmentBossType(segment, biome) {
+  return segment >= CANYON_RANGED_BOSS_FROM ? 'slime_seer' : biome.boss;
+}
+
 function getSegmentDifficulty(segment) {
   const beyond = Math.max(0, segment - CANYON_BIOMES.length);
   const healthMult = 1 + beyond * 0.2;
@@ -2063,7 +2097,14 @@ function preparePlayerEnemiesForSegment(player, segment) {
   for (let i = 0; i < mobCount; i++) {
     spawnCanyonEnemy(player, biome.mob, randomCanyonCombatPoint(segment), healthMult, damageMult);
   }
-  player.canyon.bossId = spawnCanyonEnemy(player, biome.boss, randomCanyonBossPoint(segment), healthMult, damageMult);
+
+  const roamingBosses = canyonRoamingBossCount(segment);
+  for (let i = 0; i < roamingBosses; i++) {
+    spawnCanyonEnemy(player, biome.boss, randomCanyonCombatPoint(segment), healthMult, damageMult);
+  }
+
+  const bossType = canyonSegmentBossType(segment, biome);
+  player.canyon.bossId = spawnCanyonEnemy(player, bossType, randomCanyonBossPoint(segment), healthMult, damageMult);
 }
 
 function populateCanyonSegment(player, segment) {
@@ -2756,7 +2797,11 @@ function processBossPools(player, enemy, now) {
 }
 
 function updateRangedBoss(player, enemy, cfg, now) {
-  const arena = cfg.arena;
+  const arena = cfg.arena || {
+    x: enemy.spawnPoint[0],
+    z: enemy.spawnPoint[2],
+    radius: cfg.arenaRadius || 40,
+  };
 
   processBossImpacts(player, enemy, now);
   processBossPools(player, enemy, now);
@@ -5012,6 +5057,7 @@ function spawnDeathCrate(player, position) {
   player.inventory = [];
   deathCrates.set(id, crate);
 
+  safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
   broadcastCrate(crate, { type: 'crateSpawn', crate: serializeCrate(crate) });
   return crate;
 }
@@ -5605,6 +5651,29 @@ function applyKillRewards(player) {
 
 // Every canyon boss drops exactly one meme fragment. Fired and forgotten: a
 // failed grant must never block the kill from resolving, so it only logs.
+async function grantCanyonCosmeticFragments(player, amount) {
+  const result = await callInternalApi('/api/internal/game/cosmetic-crates/grant-fragments', {
+    userId: player.userId, gameId: player.gameId, fragments: amount,
+  }).catch((err) => {
+    console.error('[CosmeticCrates] fragment grant error:', err.message);
+    return null;
+  });
+
+  if (!result || !result.success) return;
+
+  player.cosmeticCrates = {
+    fragments: Math.max(0, Math.floor(Number(result.fragments) || 0)),
+    crates: Math.max(0, Math.floor(Number(result.crates) || 0)),
+  };
+
+  safeSend(player.ws, {
+    type: 'cosmeticCrateState',
+    fragments: player.cosmeticCrates.fragments,
+    crates: player.cosmeticCrates.crates,
+  });
+  safeSend(player.ws, { type: 'fragmentsGranted', amount: result.granted, source: 'canyon_boss_cosmetic' });
+}
+
 async function grantCanyonBossFragments(player, amount) {
   const result = await callInternalApi('/api/internal/game/companions/grant-fragments', {
     userId: player.userId, gameId: player.gameId, fragments: amount,
@@ -5722,6 +5791,9 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
     persistPlayer(player);
 
     grantCanyonBossFragments(player, CANYON_BOSS_FRAGMENTS);
+    if (clearedSegment >= CANYON_COSMETIC_FRAGMENT_FROM) {
+      grantCanyonCosmeticFragments(player, CANYON_BOSS_FRAGMENTS);
+    }
 
     player.canyon.pendingSegment = nextSegment;
 
@@ -7682,6 +7754,7 @@ wss.on('connection', (ws) => {
     position: [0, 0, 0],
     rotation: 0,
     pitch: 0,
+    headYaw: 0,
     animation: 'idle',
     state: 'idle',
     jumping: false,
@@ -7760,6 +7833,7 @@ wss.on('connection', (ws) => {
     factions: [],
     cosmeticsOwned: new Set(),
     companions: { owned: [], equipped: null, fragments: 0, crates: 0 },
+    cosmeticCrates: { fragments: 0, crates: 0 },
     companionsChangedAt: 0,
     cosmeticSkinId: null,
     cosmeticAccessoryId: null,
@@ -7884,7 +7958,7 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'saveProgress', CONFIG.network.saveProgressRateLimit)) return;
       } else if (data.type === 'cosmeticListRequest' || data.type === 'cosmeticBuy' || data.type === 'cosmeticEquip') {
         if (!checkRateLimit(playerId, 'cosmetic', CONFIG.network.cosmeticRateLimit)) return;
-      } else if (data.type === 'companionListRequest' || data.type === 'companionEquip' || data.type === 'companionDust' || data.type === 'companionCombine' || data.type === 'crateOpen') {
+      } else if (data.type === 'companionListRequest' || data.type === 'companionEquip' || data.type === 'companionDust' || data.type === 'companionCombine' || data.type === 'crateOpen' || data.type === 'cosmeticCrateRequest' || data.type === 'cosmeticCombine' || data.type === 'cosmeticCrateOpen') {
         if (!checkRateLimit(playerId, 'companion', CONFIG.network.companionRateLimit)) return;
       } else if (data.type === 'emote') {
         if (!checkRateLimit(playerId, 'emote', CONFIG.network.emoteRateLimit)) return;
@@ -8019,6 +8093,9 @@ wss.on('connection', (ws) => {
         case 'companionDust': handleCompanionDust(player, data); break;
         case 'companionCombine': handleCompanionCombine(player); break;
         case 'crateOpen': handleCrateOpen(player); break;
+        case 'cosmeticCrateRequest': handleCosmeticCrateRequest(player); break;
+        case 'cosmeticCombine': handleCosmeticCombine(player); break;
+        case 'cosmeticCrateOpen': handleCosmeticCrateOpen(player); break;
         case 'questInteract': handleQuestInteract(player, data); break;
         case 'questAccept': handleQuestAccept(player, data); break;
         case 'questTurnIn': handleQuestTurnIn(player, data); break;
@@ -8424,6 +8501,7 @@ wss.on('connection', (ws) => {
 
     await refreshPlayerCosmetics(player);
     await refreshPlayerCompanions(player);
+    await refreshPlayerCosmeticCrates(player);
     if (shopPriceOverrides.size === 0) await refreshShopPrices(player.gameId);
     if (eventConfigs.size === 0) await refreshEventConfigs(player.gameId);
 
@@ -8580,6 +8658,7 @@ wss.on('connection', (ws) => {
     player.position = data.position;
     player.rotation = typeof data.rotation === 'number' ? data.rotation : 0;
     player.pitch = typeof data.pitch === 'number' ? data.pitch : 0;
+    player.headYaw = typeof data.headYaw === 'number' ? data.headYaw : 0;
 
     player.state = VALID_STATES.has(data.state) ? data.state : 'idle';
 
@@ -10776,6 +10855,11 @@ wss.on('connection', (ws) => {
 
     applyCompanionState(player, result);
     sendCompanionState(player);
+    broadcastToLocation(player.locationId, {
+      type: 'playerCompanion',
+      playerId: player.id,
+      companionId: player.companions?.equipped || null,
+    }, player.id);
   }
 
   async function handleCompanionDust(player, data) {
@@ -10832,6 +10916,85 @@ wss.on('connection', (ws) => {
     applyCompanionState(player, result);
     safeSend(player.ws, { type: 'crateOpened', itemId: result.itemId, rarity: result.rarity });
     sendCompanionState(player);
+  }
+
+  function sendCosmeticCrateState(player) {
+    const state = player.cosmeticCrates || { fragments: 0, crates: 0 };
+    safeSend(player.ws, {
+      type: 'cosmeticCrateState',
+      fragments: state.fragments,
+      crates: state.crates,
+    });
+  }
+
+  function applyCosmeticCrateState(player, result) {
+    if (!result) return false;
+    player.cosmeticCrates = {
+      fragments: Math.max(0, Math.floor(Number(result.fragments) || 0)),
+      crates: Math.max(0, Math.floor(Number(result.crates) || 0)),
+    };
+    return true;
+  }
+
+  function sendCosmeticCrateError(player, error) {
+    safeSend(player.ws, {
+      type: 'error',
+      message: 'That did not work',
+      messageKey: `g.err.cosmeticCrate.${error || 'failed'}`,
+    });
+  }
+
+  async function refreshPlayerCosmeticCrates(player) {
+    const result = await callInternalApi('/api/internal/game/cosmetic-crates/state', {
+      userId: player.userId, gameId: player.gameId,
+    }).catch((err) => {
+      console.error('[CosmeticCrates] state error:', err.message);
+      return null;
+    });
+
+    applyCosmeticCrateState(player, result);
+  }
+
+  async function handleCosmeticCrateRequest(player) {
+    await refreshPlayerCosmeticCrates(player);
+    sendCosmeticCrateState(player);
+  }
+
+  async function handleCosmeticCombine(player) {
+    const result = await callInternalApi('/api/internal/game/cosmetic-crates/combine', {
+      userId: player.userId, gameId: player.gameId,
+    }).catch((err) => {
+      console.error('[CosmeticCrates] combine error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      sendCosmeticCrateError(player, result?.error);
+      return;
+    }
+
+    applyCosmeticCrateState(player, result);
+    sendCosmeticCrateState(player);
+  }
+
+  async function handleCosmeticCrateOpen(player) {
+    const result = await callInternalApi('/api/internal/game/cosmetic-crates/crate-open', {
+      userId: player.userId, gameId: player.gameId,
+    }).catch((err) => {
+      console.error('[CosmeticCrates] crate open error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) {
+      sendCosmeticCrateError(player, result?.error);
+      return;
+    }
+
+    applyCosmeticCrateState(player, result);
+    await refreshPlayerCosmetics(player);
+    safeSend(player.ws, { type: 'cosmeticCrateOpened', itemId: result.itemId, rarity: result.rarity });
+    sendCosmeticCrateState(player);
+    sendCosmeticState(player);
   }
 
   function handleEmote(player, data) {
