@@ -462,6 +462,7 @@ function isKnownLocationId(locationId) {
 
 const GALAXY_LOCATION_ID = 'tower-basement';
 const SEALED_LOCATIONS = new Set(['tower-token-gates']);
+const DEFAULT_SPAWN_LOCATION_ID = 'tower-main-hall';
 const PRIVATE_LOCATION_PREFIXES = ['faction-gate-', 'player-room-'];
 const SHARD_CAPACITY = 50;
 const SHARD_FRIEND_GRACE = 5;
@@ -1472,6 +1473,15 @@ function pickShard(locationId, requestedInstance) {
     if ((counts.get(i) || 0) < SHARD_CAPACITY) return i;
   }
   return MAX_SHARDS;
+}
+
+function sendLocationSync(player) {
+  safeSend(player.ws, {
+    type: 'locationSync',
+    locationId: player.locationId,
+    instance: player.instance,
+    position: player.position,
+  });
 }
 
 function sendShardState(player) {
@@ -8232,19 +8242,12 @@ wss.on('connection', (ws) => {
       }
 
       if (savedProgress.progress) {
-        player.position = savedProgress.progress.position || [0, 0, 0];
         player.rotation = savedProgress.progress.rotation || 0;
         player.health = savedProgress.progress.health || 100;
-        const savedLocation = savedProgress.progress.locationId;
-        if (isKnownLocationId(savedLocation) && !SEALED_LOCATIONS.has(savedLocation)) {
-          player.locationId = savedLocation;
-        } else {
-          player.locationId = 'tower-main-hall';
-          spawnInSafeZone(player, player.locationId);
-        }
-      } else {
-        spawnInSafeZone(player);
       }
+
+      player.locationId = DEFAULT_SPAWN_LOCATION_ID;
+      spawnInSafeZone(player, player.locationId);
 
       if (savedProgress.statistics) {
         player.stats.kills = savedProgress.statistics.kills || 0;
@@ -8463,6 +8466,9 @@ wss.on('connection', (ws) => {
       userId: player.userId,
       wallet: player.wallet,
       gameId: player.gameId,
+      locationId: player.locationId,
+      instance: player.instance,
+      position: player.position,
       daySyncEpoch: dayNightEpoch,
       dayDurationMs: DAY_NIGHT_CONFIG.dayDurationMs,
       nightDurationMs: DAY_NIGHT_CONFIG.nightDurationMs,
@@ -11801,16 +11807,22 @@ wss.on('connection', (ws) => {
   }
 
   async function handleLocationChange(player, data) {
-    if (!player.alive) return;
     if (typeof data.locationId !== 'string') return;
+
+    if (!player.alive) {
+      sendLocationSync(player);
+      return;
+    }
 
     if (!isKnownLocationId(data.locationId)) {
       console.log(`[!] Invalid location: ${data.locationId} from ${player.id}`);
+      sendLocationSync(player);
       return;
     }
 
     if (SEALED_LOCATIONS.has(data.locationId)) {
       safeSend(player.ws, { type: 'error', message: 'That place is sealed for now.', messageKey: 'g.err.placeSealed' });
+      sendLocationSync(player);
       return;
     }
 
@@ -11831,6 +11843,7 @@ wss.on('connection', (ws) => {
           : 'g.err.event.sealed';
 
       safeSend(player.ws, { type: 'error', message, messageKey, messageVars: { name } });
+      sendLocationSync(player);
       return;
     }
 
@@ -11865,6 +11878,7 @@ wss.on('connection', (ws) => {
       sendActiveZones(player);
       recomputeAOI(player);
       broadcastShardState(oldLocation);
+      broadcastCount();
       return;
     }
 
@@ -11899,6 +11913,7 @@ wss.on('connection', (ws) => {
           message: verdict?.reason || 'You cannot enter that room.',
           messageKey: verdict?.reason ? null : 'g.err.cannotEnterRoom',
         });
+        sendLocationSync(player);
         return;
       }
     }
@@ -11932,6 +11947,8 @@ wss.on('connection', (ws) => {
 
     setPlayerLoading(player);
     notifyLocationTransition(player, oldLocation, data.locationId);
+    sendLocationSync(player);
+    broadcastCount();
 
     if (isShardedLocation(oldLocation) && oldLocation !== data.locationId) {
       broadcastShardState(oldLocation);
@@ -12026,16 +12043,37 @@ function broadcast(data, excludeId = null, useAOI = false, senderPlayer = null, 
   });
 }
 
+function countBucketKey(player) {
+  const shard = isShardedLocation(player.locationId) ? player.instance : 0;
+  return `${player.locationId}|${shard}`;
+}
+
 function broadcastCount() {
-  const count = Array.from(players.values()).filter(p => p.authenticated).length;
-  const msg = getCachedMessage({ type: 'count', count });
-  players.forEach((p) => {
-    if (p.authenticated && p.ws.readyState === WebSocket.OPEN) {
-      try {
-        p.ws.send(msg);
-      } catch (err) { }
+  const authenticated = Array.from(players.values()).filter((p) => p.authenticated);
+  const count = authenticated.length;
+
+  const buckets = new Map();
+  for (const p of authenticated) {
+    const key = countBucketKey(p);
+    buckets.set(key, (buckets.get(key) || 0) + 1);
+  }
+
+  const encoded = new Map();
+
+  for (const p of authenticated) {
+    if (p.ws.readyState !== WebSocket.OPEN) continue;
+
+    const here = buckets.get(countBucketKey(p)) || 1;
+    let msg = encoded.get(here);
+    if (!msg) {
+      msg = JSON.stringify({ type: 'count', count, here });
+      encoded.set(here, msg);
     }
-  });
+
+    try {
+      p.ws.send(msg);
+    } catch (err) { }
+  }
 }
 
 const SHUTDOWN_SAVE_DEADLINE_MS = 8000;
