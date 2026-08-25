@@ -4402,7 +4402,8 @@ async function refreshShopPrices(gameId) {
 
 function shopPriceFor(itemId, fallbackPrice) {
   const override = shopPriceOverrides.get(itemId);
-  if (!override || override.currency !== 'ash') return fallbackPrice;
+  if (!override) return fallbackPrice;
+  if (override.currency !== 'ash') return null;
   return Math.max(0, Math.floor(Number(override.priceAsh) || 0));
 }
 
@@ -10714,6 +10715,10 @@ wss.on('connection', (ws) => {
     }
 
     const cosmeticPrice = shopPriceFor(data.itemId, COSMETIC_PRICE_ASH);
+    if (cosmeticPrice === null) {
+      safeSend(player.ws, { type: 'error', message: 'That one is sold for TNJ in the Shop', messageKey: 'g.err.tnjShopOnly' });
+      return;
+    }
 
     if (player.cosmeticsOwned?.has(data.itemId)) {
       safeSend(player.ws, { type: 'error', message: 'You already own that', messageKey: 'g.err.alreadyOwned' });
@@ -10742,8 +10747,12 @@ wss.on('connection', (ws) => {
       persistPlayer(player);
       safeSend(player.ws, {
         type: 'error',
-        message: result?.error === 'already_owned' ? 'You already own that' : 'Could not buy that right now',
-        messageKey: result?.error === 'already_owned' ? 'g.err.alreadyOwned' : 'g.err.buyFailed',
+        message: result?.error === 'already_owned'
+          ? 'You already own that'
+          : result?.error === 'tnj_only' ? 'That one is sold for TNJ in the Shop' : 'Could not buy that right now',
+        messageKey: result?.error === 'already_owned'
+          ? 'g.err.alreadyOwned'
+          : result?.error === 'tnj_only' ? 'g.err.tnjShopOnly' : 'g.err.buyFailed',
       });
       safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
       return;
@@ -11797,6 +11806,11 @@ wss.on('connection', (ws) => {
     }
 
     const unitPrice = shopPriceFor(item.id, item.price);
+    if (unitPrice === null) {
+      safeSend(player.ws, { type: 'error', message: 'That one is sold for TNJ in the Shop', messageKey: 'g.err.tnjShopOnly' });
+      return;
+    }
+
     const requestedQty = Number.isInteger(data.quantity) && data.quantity > 0
       ? Math.min(data.quantity, SHOP_MAX_QTY_PER_PURCHASE)
       : 1;
