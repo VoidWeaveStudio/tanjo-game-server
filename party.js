@@ -1,5 +1,5 @@
 // game-server/party.js
-const MAX_PARTY_SIZE = 4;
+const MAX_PARTY_SIZE = 5;
 const INVITE_TTL_MS = 60000;
 
 const parties = new Map();

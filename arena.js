@@ -17,6 +17,7 @@ const ARENA_CONFIG = {
   xpPerWave: 50,
   xpCap: 3000,
   cooldownMs: 60 * 60 * 1000,
+  maxParty: 4,
   spawnGates: [
     [32.5, 0, -32.5],
     [32.5, 0, 32.5],

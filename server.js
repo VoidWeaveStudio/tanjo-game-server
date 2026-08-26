@@ -26,6 +26,7 @@ const eventSchedule = require('./eventSchedule');
 const defusal = require('./defusal');
 const defusalArsenal = require('./defusalArsenal');
 const grinder = require('./grinder');
+const caveGeometry = require('./caveGeometry');
 
 const PORT = process.env.PORT || 3001;
 const MAX_CONNECTIONS = 2000;
@@ -186,7 +187,7 @@ function canyonSegmentName(segment) {
   return segment <= CANYON_BIOMES.length ? biome.name : `${biome.name} — Segment ${segment}`;
 }
 
-const CAVE_BOSS_ARENA = { x: 24, z: -252, radius: 30 };
+const CAVE_BOSS_ARENA = caveGeometry.BOSS_ARENA;
 
 const ENEMY_TYPES = {
   slime: {
@@ -200,10 +201,12 @@ const ENEMY_TYPES = {
     patrolSpeed: 1.2, patrolRadius: 10, scale: 3, lootMin: 10, lootMax: 20,
   },
   cave_warden: {
-    name: 'The Hollow Warden', maxHealth: 2400, attackDamage: 0, attackRange: 0, aggroRadius: 42, aggroLeash: 999,
+    name: 'The Hollow Warden', maxHealth: 24000, attackDamage: 0, attackRange: 0, aggroRadius: 42, aggroLeash: 999,
     attackCooldown: 2400, chaseSpeedNear: 2.2, chaseSpeedFar: 4.6, chaseNearThreshold: 22,
     patrolSpeed: 1.4, patrolRadius: 8, scale: 5, lootMin: 40, lootMax: 70,
     ranged: true, preferredRange: 17, arena: CAVE_BOSS_ARENA,
+    wave: { windup: 3000, cooldown: 30000, damage: 50 },
+    regenPerSecond: 400, regenIdleMs: 8000,
     attacks: [
       { id: 'spit', windup: 700, cooldown: 2400, minRange: 0, maxRange: 46, speed: 30, radius: 3, damage: 22, shots: 1, spread: 0 },
       { id: 'volley', windup: 1150, cooldown: 6200, minRange: 8, maxRange: 46, speed: 22, radius: 3.4, damage: 15, shots: 5, spread: 7 },
@@ -494,7 +497,7 @@ const LOCATION_MAX_RADIUS = {
   'tower-token-gates': 80,
   'tower-basement': GALAXY_MAX_RADIUS,
   [EVENTS_LOBBY_ID]: 58,
-  cave: 360,
+  cave: caveGeometry.OUTER_RADIUS + 12,
   'open-world-canyon': 150,
 };
 
@@ -503,86 +506,49 @@ for (const [locationId, room] of Object.entries(EVENT_ROOMS)) {
 }
 const CAVE_LOCATION_ID = 'cave';
 const CAVE_CHEST_REWARD = 1000;
-const CAVE_CHEST_COOLDOWN_MS = 60 * 60 * 1000;
 const CAVE_CHEST_REACH = 5;
-const CAVE_CHESTS = {
-  crack: [-86, 0, -31],
-  lever: [89, 0, -79],
-  vault: [24, 0, -318],
-};
-const CAVE_BOSS_SPAWN = [24, 0, -262];
-const CAVE_ENEMY_SPAWNS = [
-  { type: 'voidling', position: [-46, 0, -14] },
-  { type: 'voidling', position: [-52, 0, -46] },
-  { type: 'voidling', position: [-58, 0, -62] },
-  { type: 'husk', position: [-50, 0, -68] },
-  { type: 'voidling', position: [2, 0, -80] },
-  { type: 'husk', position: [8, 0, -84] },
-  { type: 'voidling', position: [44, 0, -44] },
-  { type: 'voidling', position: [62, 0, -66] },
-  { type: 'husk', position: [-10, 0, -126] },
-  { type: 'husk', position: [-4, 0, -120] },
-  { type: 'voidling', position: [40, 0, -134] },
-  { type: 'husk', position: [-56, 0, -160] },
-  { type: 'voidling', position: [-48, 0, -154] },
-  { type: 'husk', position: [-16, 0, -206] },
-  { type: 'voidling', position: [-24, 0, -200] },
-];
+const CAVE_CHESTS = Object.fromEntries(
+  caveGeometry.CHESTS.map((chest) => [chest.id, [chest.x, caveGeometry.FLOOR_Y, chest.z]])
+);
+const CAVE_BOSS_SPAWN = [caveGeometry.BOSS_SPAWN.x, caveGeometry.FLOOR_Y, caveGeometry.BOSS_SPAWN.z];
+const CAVE_ENEMY_SPAWNS = caveGeometry.ENEMY_SPAWNS.map((s) => ({ type: s.type, position: [s.x, caveGeometry.FLOOR_Y, s.z] }));
 
-const CAVE_CHAMBERS = [
-  [0, 6, 14], [-46, -14, 12], [-58, -62, 15], [2, -80, 13],
-  [44, -44, 11], [62, -66, 10], [-10, -126, 14], [-56, -160, 12],
-  [-16, -206, 10], [24, -252, 38], [-102, -56, 7], [40, -134, 8],
-  [-98, -178, 7], [-84, -30, 9], [88, -80, 9], [24, -316, 11],
-];
-
-const CAVE_TUNNELS = [
-  [0, 6, -34, -2, 3.6], [-34, -2, -46, -14, 3.6], [-46, -14, -52, -46, 4],
-  [-52, -46, -58, -62, 4], [-58, -62, -14, -74, 3.8], [-14, -74, 2, -80, 3.8],
-  [2, -80, 44, -44, 3.4], [44, -44, 12, -2, 3.4], [2, -80, 46, -70, 3.4],
-  [46, -70, 62, -66, 3.4], [2, -80, -6, -112, 4.2], [-6, -112, -10, -126, 4.2],
-  [-10, -126, -44, -146, 3.6], [-44, -146, -56, -160, 3.6], [-56, -160, -30, -196, 4],
-  [-30, -196, -16, -206, 4], [-16, -206, 4, -230, 5], [4, -230, 18, -240, 5],
-  [-58, -62, -92, -58, 2.8], [-92, -58, -102, -56, 2.8], [-10, -126, 26, -132, 3],
-  [26, -132, 40, -134, 3], [-56, -160, -88, -172, 2.8], [-88, -172, -98, -178, 2.8],
-  [-46, -14, -70, -24, 3], [-70, -24, -84, -30, 3], [62, -66, 78, -74, 3],
-  [78, -74, 88, -80, 3], [24, -288, 24, -316, 3.4],
-];
+const CAVE_CHAMBERS = caveGeometry.CHAMBERS;
+const CAVE_TUNNELS = caveGeometry.TUNNELS;
 
 const CAVE_ENEMY_CLEARANCE = 1.1;
+const CAVE_PLAYER_SLACK = 3;
+const CAVE_SHARD_CAPACITY = 10;
+const CAVE_PARTY_RESERVATION_MS = 45000;
+const CAVE_EMPTY_DISPOSE_MS = 60000;
+const CAVE_CRATE_ROOMS = 3;
+const CAVE_CRATE_REVEAL = 34;
+const BOSS_PROVOKE_MS = 12000;
+const CAVE_BOSS_CHEST_ID = 'boss';
+const CAVE_SLIME_ID = 'pet-slime';
+const CAVE_SLIME_CHANCE_PERCENT = 10;
+const CAVE_SLIME_BONUS_FRAGMENTS = 20;
+const CAVE_CHEST_FRAGMENTS_MIN = 30;
+const CAVE_CHEST_FRAGMENTS_MAX = 50;
+const CAVE_BOSS_CHEST_ASH = 500;
+const COMPANION_ATTACK_RANGE = 18;
+const COMPANION_ATTACK_DAMAGE = 12;
+const COMPANION_ATTACK_COOLDOWN_MS = 2000;
+const COMPANION_PROJECTILE_SPEED = 26;
+const BOSS_TARGET_STICKINESS = 6;
 const CAVE_DIRECT_SIGHT = 45;
 const CAVE_STEER_REFRESH_MS = 400;
 const CAVE_STEER_ANGLES = [0, 0.45, -0.45, 0.9, -0.9, 1.4, -1.4, 1.95, -1.95];
 
-function segmentDistance2D(px, pz, ax, az, bx, bz) {
-  const dx = bx - ax;
-  const dz = bz - az;
-  const lengthSquared = dx * dx + dz * dz;
-
-  let t = lengthSquared > 0 ? ((px - ax) * dx + (pz - az) * dz) / lengthSquared : 0;
-  t = Math.max(0, Math.min(1, t));
-
-  return Math.hypot(px - (ax + dx * t), pz - (az + dz * t));
-}
-
-function caveDistance(x, z) {
-  let distance = Infinity;
-
-  for (const [cx, cz, radius] of CAVE_CHAMBERS) {
-    const d = Math.hypot(x - cx, z - cz) - radius;
-    if (d < distance) distance = d;
-  }
-
-  for (const [ax, az, bx, bz, halfWidth] of CAVE_TUNNELS) {
-    const d = segmentDistance2D(x, z, ax, az, bx, bz) - halfWidth;
-    if (d < distance) distance = d;
-  }
-
-  return distance;
-}
+const segmentDistance2D = caveGeometry.segmentDistance2D;
+const caveDistance = caveGeometry.caveDistance;
 
 function caveWalkable(x, z) {
-  return caveDistance(x, z) <= -CAVE_ENEMY_CLEARANCE;
+  return caveGeometry.caveWalkable(x, z, CAVE_ENEMY_CLEARANCE);
+}
+
+function cavePlayerPositionSane(x, z) {
+  return caveDistance(x, z) <= CAVE_PLAYER_SLACK;
 }
 
 function nudgeIntoCave(position) {
@@ -638,19 +604,19 @@ const CAVE_EDGES = [];
     return id;
   };
 
-  for (const [ax, az, bx, bz] of CAVE_TUNNELS) {
-    const a = nodeFor(ax, az);
-    const b = nodeFor(bx, bz);
+  for (const tunnel of CAVE_TUNNELS) {
+    const a = nodeFor(tunnel.ax, tunnel.az);
+    const b = nodeFor(tunnel.bx, tunnel.bz);
     if (!CAVE_EDGES[a].includes(b)) CAVE_EDGES[a].push(b);
     if (!CAVE_EDGES[b].includes(a)) CAVE_EDGES[b].push(a);
   }
 
-  for (const [cx, cz, radius] of CAVE_CHAMBERS) {
-    const centre = nodeFor(cx, cz);
+  for (const chamber of CAVE_CHAMBERS) {
+    const centre = nodeFor(chamber.x, chamber.z);
     for (let i = 0; i < CAVE_NODES.length; i++) {
       if (i === centre) continue;
       const [nx, nz] = CAVE_NODES[i];
-      if (Math.hypot(nx - cx, nz - cz) > radius) continue;
+      if (Math.hypot(nx - chamber.x, nz - chamber.z) > chamber.radius) continue;
       if (!CAVE_EDGES[centre].includes(i)) CAVE_EDGES[centre].push(i);
       if (!CAVE_EDGES[i].includes(centre)) CAVE_EDGES[i].push(centre);
     }
@@ -812,9 +778,12 @@ function isValidPositionForLocation(locationId, pos) {
   }
 
   const maxRadius = getLocationMaxRadius(locationId);
-  if (maxRadius == null) return true;
   const [x, , z] = pos;
-  return Math.sqrt(x * x + z * z) <= maxRadius;
+  if (maxRadius != null && Math.sqrt(x * x + z * z) > maxRadius) return false;
+
+  if (locationId === CAVE_LOCATION_ID && !cavePlayerPositionSane(x, z)) return false;
+
+  return true;
 }
 
 function getCachedMessage(data) {
@@ -1479,17 +1448,94 @@ function partyShardFor(player, locationId) {
   return null;
 }
 
-function pickShard(locationId, requestedInstance) {
+const caveSeatReservations = new Map();
+
+function shardCapacityFor(locationId) {
+  return locationId === CAVE_LOCATION_ID ? CAVE_SHARD_CAPACITY : SHARD_CAPACITY;
+}
+
+function caveReservedSeats(instance, partyId) {
+  const held = caveSeatReservations.get(instance);
+  if (!held) return 0;
+  if (held.until < Date.now()) {
+    caveSeatReservations.delete(instance);
+    return 0;
+  }
+  return held.partyId === partyId ? 0 : held.seats;
+}
+
+function consumeCaveSeat(player) {
+  const held = caveSeatReservations.get(player.instance);
+  if (!held) return;
+
+  const group = party.partyOf(player.id);
+  if (!group || held.partyId !== group.id) return;
+
+  held.seats -= 1;
+  if (held.seats <= 0) caveSeatReservations.delete(player.instance);
+}
+
+function cavePartyPending(player) {
+  const group = party.partyOf(player.id);
+  if (!group) return 0;
+
+  return group.memberIds.filter((id) => {
+    if (id === player.id) return false;
+    const member = players.get(id);
+    return member && member.authenticated && member.locationId !== CAVE_LOCATION_ID;
+  }).length;
+}
+
+function caveSeatsNeeded(player, instance, partyId) {
+  const held = caveSeatReservations.get(instance);
+  if (held && held.until >= Date.now() && partyId && held.partyId === partyId) return 1;
+  return 1 + cavePartyPending(player);
+}
+
+function reserveCaveSeats(player) {
+  const group = party.partyOf(player.id);
+  if (!group) return;
+
+  const pending = cavePartyPending(player);
+
+  if (pending <= 0) {
+    const held = caveSeatReservations.get(player.instance);
+    if (held && held.partyId === group.id) caveSeatReservations.delete(player.instance);
+    return;
+  }
+
+  caveSeatReservations.set(player.instance, {
+    partyId: group.id,
+    seats: pending,
+    until: Date.now() + CAVE_PARTY_RESERVATION_MS,
+  });
+}
+
+function pickShard(locationId, requestedInstance, player = null) {
   if (!isShardedLocation(locationId)) return 1;
 
   const counts = shardOccupancy(locationId);
+  const capacity = shardCapacityFor(locationId);
+  const hardCap = locationId === CAVE_LOCATION_ID;
+  const partyId = player ? party.partyOf(player.id)?.id ?? null : null;
+  const taken = (instance) =>
+    (counts.get(instance) || 0) + (hardCap ? caveReservedSeats(instance, partyId) : 0);
+
+  const fits = (instance) =>
+    hardCap
+      ? taken(instance) + caveSeatsNeeded(player, instance, partyId) <= capacity
+      : taken(instance) < capacity;
 
   if (Number.isInteger(requestedInstance) && requestedInstance >= 1 && requestedInstance <= MAX_SHARDS) {
-    if ((counts.get(requestedInstance) || 0) < SHARD_CAPACITY + SHARD_FRIEND_GRACE) return requestedInstance;
+    if (hardCap) {
+      if (fits(requestedInstance)) return requestedInstance;
+    } else if (taken(requestedInstance) < capacity + SHARD_FRIEND_GRACE) {
+      return requestedInstance;
+    }
   }
 
   for (let i = 1; i <= MAX_SHARDS; i++) {
-    if ((counts.get(i) || 0) < SHARD_CAPACITY) return i;
+    if (fits(i)) return i;
   }
   return MAX_SHARDS;
 }
@@ -2082,6 +2128,11 @@ function spawnCanyonEnemy(player, type, position, healthMult = 1, damageMult = 1
     attackCooldowns: {},
     pendingImpacts: [],
     pools: [],
+    wave: null,
+    waveStartedAt: 0,
+    provokedBy: null,
+    provokedUntil: 0,
+    lastHitAt: 0,
   });
   return id;
 }
@@ -2151,7 +2202,7 @@ function enterCanyonHub(player) {
 function activeEnemiesFor(player) {
   if (player.locationId === ARENA_LOCATION_ID) return arena.runForPlayer(player.id)?.enemies ?? null;
   if (player.locationId === 'tower-first-floor') return player.canyon?.enemies ?? null;
-  if (player.locationId === CAVE_LOCATION_ID) return player.cave?.enemies ?? null;
+  if (player.locationId === CAVE_LOCATION_ID) return caveInstances.get(player.instance)?.enemies ?? null;
   if (player.locationId === 'main-world') return worldEnemies.get(player.instance) ?? null;
   return null;
 }
@@ -2197,39 +2248,107 @@ function spawnEnemyInto(container, idPrefix, seq, type, position, healthMult = 1
   return id;
 }
 
-function enterCave(player) {
-  player.cave = {
+const caveInstances = new Map();
+
+function rollCaveCrateRooms() {
+  const pool = caveGeometry.CHESTS.map((chest) => chest.id);
+  const picked = new Set();
+
+  while (picked.size < CAVE_CRATE_ROOMS && pool.length > 0) {
+    picked.add(pool.splice(crypto.randomInt(0, pool.length), 1)[0]);
+  }
+
+  return picked;
+}
+
+function revealCaveCrates(cave, occupants) {
+  for (const player of occupants) {
+    if (!player.caveKnownCrates) player.caveKnownCrates = new Set();
+
+    for (const roomId of cave.crateRooms) {
+      if (player.caveKnownCrates.has(roomId)) continue;
+      if (cave.openedRooms.has(roomId)) continue;
+
+      const spot = CAVE_CHESTS[roomId];
+      if (!spot) continue;
+
+      const dx = spot[0] - player.position[0];
+      const dz = spot[2] - player.position[2];
+      if (dx * dx + dz * dz > CAVE_CRATE_REVEAL * CAVE_CRATE_REVEAL) continue;
+
+      player.caveKnownCrates.add(roomId);
+      safeSend(player.ws, { type: 'caveChestSpawn', chestId: roomId, x: spot[0], z: spot[2] });
+    }
+  }
+}
+
+function cavePlayersIn(instance, excludeId = null) {
+  const list = [];
+  players.forEach((p) => {
+    if (!p.authenticated) return;
+    if (p.locationId !== CAVE_LOCATION_ID || p.instance !== instance) return;
+    if (excludeId !== null && p.id === excludeId) return;
+    list.push(p);
+  });
+  return list;
+}
+
+function ensureCaveInstance(instance) {
+  const existing = caveInstances.get(instance);
+  if (existing) return existing;
+
+  const cave = {
+    instance,
     enemies: new Map(),
     nextEnemySeq: 1,
     bossId: null,
     bossDefeated: false,
-    portalDoomed: false,
+    crateRooms: rollCaveCrateRooms(),
+    openedRooms: new Set(),
+    createdAt: Date.now(),
   };
 
   for (const spawn of CAVE_ENEMY_SPAWNS) {
-    spawnEnemyInto(player.cave.enemies, `cave-${player.id}`, player.cave.nextEnemySeq++, spawn.type, spawn.position);
+    spawnEnemyInto(cave.enemies, `cave-${instance}`, cave.nextEnemySeq++, spawn.type, spawn.position);
   }
 
-  player.cave.bossId = spawnEnemyInto(
-    player.cave.enemies,
-    `cave-${player.id}`,
-    player.cave.nextEnemySeq++,
+  cave.bossId = spawnEnemyInto(
+    cave.enemies,
+    `cave-${instance}`,
+    cave.nextEnemySeq++,
     'cave_warden',
     CAVE_BOSS_SPAWN
   );
 
-  safeSend(player.ws, { type: 'enemyState', enemies: serializeEnemies(player.cave.enemies) });
-  safeSend(player.ws, { type: 'caveBossState', defeated: false });
+  caveInstances.set(instance, cave);
+  return cave;
 }
 
-function leaveCave(player) {
-  if (!player.cave) return;
+function caveInstanceOf(player) {
+  if (player.locationId !== CAVE_LOCATION_ID) return null;
+  return caveInstances.get(player.instance) || null;
+}
 
-  const collapsed = player.cave.portalDoomed === true;
-  player.cave = null;
+function enterCave(player) {
+  const cave = ensureCaveInstance(player.instance);
+  consumeCaveSeat(player);
+  reserveCaveSeats(player);
+  player.caveKnownCrates = new Set();
+
+  safeSend(player.ws, { type: 'enemyState', enemies: serializeEnemies(cave.enemies) });
+  safeSend(player.ws, { type: 'caveBossState', defeated: cave.bossDefeated });
+}
+
+function leaveCave(player, previousInstance) {
+  const instance = Number.isInteger(previousInstance) ? previousInstance : player.instance;
   safeSend(player.ws, { type: 'enemyState', enemies: [] });
 
-  if (collapsed) closeCavePortal();
+  const cave = caveInstances.get(instance);
+  if (!cave) return;
+  if (cavePlayersIn(instance, player.id).length > 0) return;
+
+  caveInstances.delete(instance);
+  if (cave.bossDefeated) closeCavePortal();
 }
 
 function serializeCanyonEnemies(player) {
@@ -2698,7 +2817,7 @@ function pickBossAttack(enemy, cfg, dist, now) {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
-function resolveBossCast(player, enemy, cast, now) {
+function resolveBossCast(targets, enemy, cast, now) {
   const attack = cast.attack;
   const origin = [enemy.position[0], enemy.position[1] + 2.4, enemy.position[2]];
 
@@ -2716,7 +2835,7 @@ function resolveBossCast(player, enemy, cast, now) {
     const dz = target[2] - origin[2];
     const travel = Math.max(160, (Math.sqrt(dx * dx + dz * dz) / attack.speed) * 1000);
 
-    safeSend(player.ws, {
+    const projectileMessage = {
       type: 'bossProjectile',
       enemyId: enemy.id,
       attack: attack.id,
@@ -2724,7 +2843,8 @@ function resolveBossCast(player, enemy, cast, now) {
       target,
       travel,
       radius: attack.radius,
-    });
+    };
+    for (const spectator of targets) safeSend(spectator.ws, projectileMessage);
 
     enemy.pendingImpacts.push({
       at: now + travel,
@@ -2737,7 +2857,7 @@ function resolveBossCast(player, enemy, cast, now) {
   }
 }
 
-function processBossImpacts(player, enemy, now) {
+function processBossImpacts(targets, enemy, now) {
   if (enemy.pendingImpacts.length === 0) return;
 
   const remaining = [];
@@ -2748,10 +2868,13 @@ function processBossImpacts(player, enemy, now) {
       continue;
     }
 
-    const dx = player.position[0] - impact.x;
-    const dz = player.position[2] - impact.z;
-    if (Math.sqrt(dx * dx + dz * dz) <= impact.radius) {
-      damagePlayerFromZone(player, enemy, impact.damage);
+    for (const target of targets) {
+      if (!target.alive) continue;
+      const dx = target.position[0] - impact.x;
+      const dz = target.position[2] - impact.z;
+      if (Math.sqrt(dx * dx + dz * dz) <= impact.radius) {
+        damagePlayerFromZone(target, enemy, impact.damage);
+      }
     }
 
     if (impact.pool) {
@@ -2765,21 +2888,22 @@ function processBossImpacts(player, enemy, now) {
         nextTickAt: now + impact.pool.interval,
       });
 
-      safeSend(player.ws, {
+      const poolMessage = {
         type: 'bossPool',
         enemyId: enemy.id,
         x: impact.x,
         z: impact.z,
         radius: impact.radius,
         duration: impact.pool.duration,
-      });
+      };
+      for (const target of targets) safeSend(target.ws, poolMessage);
     }
   }
 
   enemy.pendingImpacts = remaining;
 }
 
-function processBossPools(player, enemy, now) {
+function processBossPools(targets, enemy, now) {
   if (enemy.pools.length === 0) return;
 
   enemy.pools = enemy.pools.filter((pool) => pool.expiresAt > now);
@@ -2788,38 +2912,123 @@ function processBossPools(player, enemy, now) {
     if (now < pool.nextTickAt) continue;
     pool.nextTickAt = now + pool.interval;
 
-    const dx = player.position[0] - pool.x;
-    const dz = player.position[2] - pool.z;
-    if (Math.sqrt(dx * dx + dz * dz) <= pool.radius) {
-      damagePlayerFromZone(player, enemy, pool.damage);
+    for (const target of targets) {
+      if (!target.alive) continue;
+      const dx = target.position[0] - pool.x;
+      const dz = target.position[2] - pool.z;
+      if (Math.sqrt(dx * dx + dz * dz) <= pool.radius) {
+        damagePlayerFromZone(target, enemy, pool.damage);
+      }
     }
   }
 }
 
-function updateRangedBoss(player, enemy, cfg, now) {
+function bossWaveRadius(cfg, arena) {
+  return Math.min(cfg.wave.radius ?? Infinity, arena.radius);
+}
+
+function startBossWave(targets, enemy, cfg, arena, now) {
+  enemy.wave = { resolveAt: now + cfg.wave.windup };
+  enemy.waveStartedAt = now;
+  enemy.lastAttackTime = now;
+
+  const message = {
+    type: 'bossWave',
+    enemyId: enemy.id,
+    x: enemy.position[0],
+    z: enemy.position[2],
+    radius: bossWaveRadius(cfg, arena),
+    windup: cfg.wave.windup,
+  };
+
+  for (const spectator of targets) safeSend(spectator.ws, message);
+}
+
+function resolveBossWave(targets, enemy, cfg, arena) {
+  const radius = bossWaveRadius(cfg, arena);
+
+  for (const target of targets) {
+    if (!target.alive) continue;
+
+    const dx = target.position[0] - enemy.position[0];
+    const dz = target.position[2] - enemy.position[2];
+    if (Math.sqrt(dx * dx + dz * dz) > radius) continue;
+
+    const arenaDx = target.position[0] - arena.x;
+    const arenaDz = target.position[2] - arena.z;
+    if (Math.sqrt(arenaDx * arenaDx + arenaDz * arenaDz) > arena.radius) continue;
+
+    const sheltered = caveGeometry.caveCoverBetween(
+      enemy.position[0],
+      enemy.position[2],
+      target.position[0],
+      target.position[2]
+    );
+    if (sheltered) continue;
+
+    damagePlayerFromZone(target, enemy, cfg.wave.damage);
+  }
+}
+
+function bossTargetAmong(targets, enemy, cfg, arena, now) {
+  let best = null;
+  let bestDist = Infinity;
+
+  const provoked = enemy.provokedUntil > now ? enemy.provokedBy : null;
+
+  for (const candidate of targets) {
+    if (!candidate.alive) continue;
+
+    const dx = candidate.position[0] - enemy.position[0];
+    const dz = candidate.position[2] - enemy.position[2];
+    const dist = Math.sqrt(dx * dx + dz * dz);
+
+    const isProvoker = candidate.id === provoked;
+    if (!isProvoker && dist > cfg.aggroRadius) continue;
+
+    const arenaDx = candidate.position[0] - arena.x;
+    const arenaDz = candidate.position[2] - arena.z;
+    if (!isProvoker && Math.sqrt(arenaDx * arenaDx + arenaDz * arenaDz) > arena.radius + 10) continue;
+
+    const sticky = candidate.id === enemy.targetId ? dist - BOSS_TARGET_STICKINESS : dist;
+    if (sticky < bestDist) {
+      bestDist = sticky;
+      best = { player: candidate, dist };
+    }
+  }
+
+  return best;
+}
+
+function updateRangedBoss(targets, enemy, cfg, now) {
   const arena = cfg.arena || {
     x: enemy.spawnPoint[0],
     z: enemy.spawnPoint[2],
     radius: cfg.arenaRadius || 40,
   };
 
-  processBossImpacts(player, enemy, now);
-  processBossPools(player, enemy, now);
+  processBossImpacts(targets, enemy, now);
+  processBossPools(targets, enemy, now);
 
-  const dx = player.position[0] - enemy.position[0];
-  const dz = player.position[2] - enemy.position[2];
-  const dist = Math.sqrt(dx * dx + dz * dz);
-
-  const playerDx = player.position[0] - arena.x;
-  const playerDz = player.position[2] - arena.z;
-  const playerInArena = Math.sqrt(playerDx * playerDx + playerDz * playerDz) <= arena.radius + 10;
-  const engaged = player.alive && playerInArena && dist <= cfg.aggroRadius;
+  const chosen = bossTargetAmong(targets, enemy, cfg, arena, now);
+  const player = chosen ? chosen.player : null;
+  const dist = chosen ? chosen.dist : Infinity;
+  const engaged = chosen !== null;
 
   enemy.targetId = engaged ? player.id : null;
 
+  if (enemy.wave) {
+    if (now >= enemy.wave.resolveAt) {
+      resolveBossWave(targets, enemy, cfg, arena);
+      enemy.wave = null;
+    }
+    clampToArena(enemy.position, arena);
+    return;
+  }
+
   if (enemy.cast) {
     if (now >= enemy.cast.resolveAt) {
-      resolveBossCast(player, enemy, enemy.cast, now);
+      resolveBossCast(targets, enemy, enemy.cast, now);
       enemy.attackCooldowns[enemy.cast.attack.id] = now;
       enemy.cast = null;
     }
@@ -2828,6 +3037,8 @@ function updateRangedBoss(player, enemy, cfg, now) {
   }
 
   if (!engaged) {
+    enemy.waveStartedAt = now;
+
     const homeDx = arena.x - enemy.position[0];
     const homeDz = arena.z - enemy.position[2];
     const homeDist = Math.sqrt(homeDx * homeDx + homeDz * homeDz);
@@ -2847,14 +3058,20 @@ function updateRangedBoss(player, enemy, cfg, now) {
     const speed = Math.abs(drift) > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear;
     const step = speed * (CANYON_CONFIG.tickRate / 1000) * Math.sign(drift) * enemySpeedMult(enemy, now);
     const len = dist || 1;
-    enemy.position[0] += (dx / len) * step;
-    enemy.position[2] += (dz / len) * step;
+    enemy.position[0] += ((player.position[0] - enemy.position[0]) / len) * step;
+    enemy.position[2] += ((player.position[2] - enemy.position[2]) / len) * step;
   }
 
   clampToArena(enemy.position, arena);
 
-  if (now - enemy.lastAttackTime < cfg.attackCooldown) return;
   if (abilities.isStunned(enemy, now)) return;
+
+  if (cfg.wave && now - (enemy.waveStartedAt || 0) >= cfg.wave.cooldown) {
+    startBossWave(targets, enemy, cfg, arena, now);
+    return;
+  }
+
+  if (now - enemy.lastAttackTime < cfg.attackCooldown) return;
 
   const attack = pickBossAttack(enemy, cfg, dist, now);
   if (!attack) return;
@@ -2866,14 +3083,15 @@ function updateRangedBoss(player, enemy, cfg, now) {
     aim: [player.position[0], 0, player.position[2]],
   };
 
-  safeSend(player.ws, {
+  const castMessage = {
     type: 'bossCast',
     enemyId: enemy.id,
     attack: attack.id,
     windup: attack.windup,
     aim: enemy.cast.aim,
     radius: attack.radius,
-  });
+  };
+  for (const spectator of targets) safeSend(spectator.ws, castMessage);
 }
 
 const WORLD_ENEMY_TICK_MS = 100;
@@ -3288,65 +3506,25 @@ function canyonTick() {
   for (const player of players.values()) {
     if (!player.authenticated) continue;
     if (player.locationId === 'main-world') continue;
+    if (player.locationId === CAVE_LOCATION_ID) continue;
 
     const enemies = activeEnemiesFor(player);
     if (!enemies || enemies.size === 0) continue;
 
-    const inCave = player.locationId === CAVE_LOCATION_ID;
+    const inCave = false;
 
     for (const enemy of enemies.values()) {
       if (!enemy.alive) continue;
       const cfg = ENEMY_TYPES[enemy.type];
 
       if (cfg.ranged) {
-        updateRangedBoss(player, enemy, cfg, now);
+        updateRangedBoss([player], enemy, cfg, now);
         enemy.positionHistory.push({ position: [...enemy.position], time: now });
         enemy.positionHistory = enemy.positionHistory.filter((p) => now - p.time < 1000);
         continue;
       }
 
-      let hasTarget = enemy.targetId === player.id;
-      if (player.alive) {
-        const dx = player.position[0] - enemy.position[0];
-        const dz = player.position[2] - enemy.position[2];
-        const dist = Math.sqrt(dx * dx + dz * dz);
-        if (!hasTarget) {
-          if (dist <= cfg.aggroRadius) {
-            enemy.targetId = player.id;
-            hasTarget = true;
-          }
-        } else if (dist > cfg.aggroLeash) {
-          enemy.targetId = null;
-          hasTarget = false;
-        }
-      } else {
-        enemy.targetId = null;
-        hasTarget = false;
-      }
-
-      if (hasTarget) {
-        enemy.patrolTarget = null;
-
-        const dx = player.position[0] - enemy.position[0];
-        const dz = player.position[2] - enemy.position[2];
-        const dist = Math.sqrt(dx * dx + dz * dz);
-
-        if (dist > cfg.attackRange) {
-          const speed = dist > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear;
-          const step = speed * (CANYON_CONFIG.tickRate / 1000) * enemySpeedMult(enemy, now);
-          const [steerX, steerZ] = inCave
-            ? caveChaseDirection(enemy, player.position[0], player.position[2], now)
-            : [dx, dz];
-          stepEnemy(enemy, steerX, steerZ, step, inCave);
-        } else if (now - enemy.lastAttackTime >= cfg.attackCooldown && !abilities.isStunned(enemy, now)) {
-          enemy.lastAttackTime = now;
-          damagePlayerByCanyonEnemy(player, enemy);
-        }
-      } else {
-        updateCanyonPatrol(enemy, cfg, now, inCave);
-      }
-
-      if (inCave) nudgeIntoCave(enemy.position);
+      driveMeleeEnemy([player], enemy, cfg, now, inCave);
 
       enemy.positionHistory.push({ position: [...enemy.position], time: now });
       enemy.positionHistory = enemy.positionHistory.filter((p) => now - p.time < 1000);
@@ -3356,7 +3534,252 @@ function canyonTick() {
   }
 }
 
+function pickMeleeTarget(candidates, enemy, cfg) {
+  const held = enemy.targetId
+    ? candidates.find((candidate) => candidate.id === enemy.targetId && candidate.alive)
+    : null;
+
+  if (held) {
+    const dx = held.position[0] - enemy.position[0];
+    const dz = held.position[2] - enemy.position[2];
+    if (Math.sqrt(dx * dx + dz * dz) <= cfg.aggroLeash) return held;
+  }
+
+  let best = null;
+  let bestDist = Infinity;
+
+  for (const candidate of candidates) {
+    if (!candidate.alive) continue;
+    const dx = candidate.position[0] - enemy.position[0];
+    const dz = candidate.position[2] - enemy.position[2];
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    if (dist > cfg.aggroRadius) continue;
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = candidate;
+    }
+  }
+
+  return best;
+}
+
+function driveMeleeEnemy(candidates, enemy, cfg, now, inCave) {
+  const target = pickMeleeTarget(candidates, enemy, cfg);
+  enemy.targetId = target ? target.id : null;
+
+  if (target) {
+    enemy.patrolTarget = null;
+
+    const dx = target.position[0] - enemy.position[0];
+    const dz = target.position[2] - enemy.position[2];
+    const dist = Math.sqrt(dx * dx + dz * dz);
+
+    if (dist > cfg.attackRange) {
+      const speed = dist > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear;
+      const step = speed * (CANYON_CONFIG.tickRate / 1000) * enemySpeedMult(enemy, now);
+      const [steerX, steerZ] = inCave
+        ? caveChaseDirection(enemy, target.position[0], target.position[2], now)
+        : [dx, dz];
+      stepEnemy(enemy, steerX, steerZ, step, inCave);
+    } else if (now - enemy.lastAttackTime >= cfg.attackCooldown && !abilities.isStunned(enemy, now)) {
+      enemy.lastAttackTime = now;
+      damagePlayerByCanyonEnemy(target, enemy);
+    }
+  } else {
+    updateCanyonPatrol(enemy, cfg, now, inCave);
+  }
+
+  if (inCave) nudgeIntoCave(enemy.position);
+}
+
+async function grantSlimeCompanion(player) {
+  const result = await callInternalApi('/api/internal/game/companions/grant', {
+    userId: player.userId, gameId: player.gameId, itemId: CAVE_SLIME_ID, quantity: 1,
+  }).catch((err) => {
+    console.error('[Cave] slime grant error:', err.message);
+    return null;
+  });
+
+  if (!result || !result.success) return false;
+
+  player.companions = {
+    owned: Array.isArray(result.owned) ? result.owned : (player.companions?.owned || []),
+    equipped: result.equipped || null,
+    fragments: Math.max(0, Math.floor(Number(result.fragments) || 0)),
+    crates: Math.max(0, Math.floor(Number(result.crates) || 0)),
+  };
+  player.companionsChangedAt = Date.now();
+  return true;
+}
+
+async function openBossChest(player, cave) {
+  const chest = cave.bossChest;
+  if (!chest) return;
+  if (chest.looted.has(player.userId)) {
+    safeSend(player.ws, { type: 'error', message: 'You already took your share', messageKey: 'g.err.chestEmpty' });
+    return;
+  }
+
+  const dx = chest.x - player.position[0];
+  const dz = chest.z - player.position[2];
+  if (Math.sqrt(dx * dx + dz * dz) > CAVE_CHEST_REACH) return;
+
+  chest.looted.add(player.userId);
+
+  const slime = crypto.randomInt(0, 100) < CAVE_SLIME_CHANCE_PERCENT;
+
+  const companionFragments = slime
+    ? CAVE_SLIME_BONUS_FRAGMENTS
+    : CAVE_CHEST_FRAGMENTS_MIN + crypto.randomInt(0, CAVE_CHEST_FRAGMENTS_MAX - CAVE_CHEST_FRAGMENTS_MIN + 1);
+  const cosmeticFragments = slime
+    ? CAVE_SLIME_BONUS_FRAGMENTS
+    : CAVE_CHEST_FRAGMENTS_MIN + crypto.randomInt(0, CAVE_CHEST_FRAGMENTS_MAX - CAVE_CHEST_FRAGMENTS_MIN + 1);
+
+  if (slime) await grantSlimeCompanion(player);
+
+  await grantCanyonBossFragments(player, companionFragments);
+  await grantCanyonCosmeticFragments(player, cosmeticFragments);
+
+  const ash = slime ? 0 : CAVE_BOSS_CHEST_ASH;
+  if (ash > 0) {
+    player.ash += ash;
+    player.economyChangedAt = Date.now();
+    persistPlayer(player);
+  }
+
+  safeSend(player.ws, {
+    type: 'caveBossReward',
+    slime,
+    companionFragments,
+    cosmeticFragments,
+    ash,
+  });
+  safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+}
+
+function companionCombatTick() {
+  const now = Date.now();
+
+  for (const player of players.values()) {
+    if (!player.authenticated || !player.alive) continue;
+    if (player.companions?.equipped !== CAVE_SLIME_ID) continue;
+    if (!petAllowedAt(player.locationId)) continue;
+    if (!isInCombat(player)) continue;
+    if (player.homeTeleportCastUntil > 0) continue;
+    if (now - (player.companionShotAt || 0) < COMPANION_ATTACK_COOLDOWN_MS) continue;
+
+    const enemies = activeEnemiesFor(player);
+    if (!enemies || enemies.size === 0) continue;
+
+    let best = null;
+    let bestDist = COMPANION_ATTACK_RANGE;
+
+    for (const enemy of enemies.values()) {
+      if (!enemy.alive) continue;
+      const dx = enemy.position[0] - player.position[0];
+      const dz = enemy.position[2] - player.position[2];
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = enemy;
+      }
+    }
+
+    if (!best) continue;
+
+    player.companionShotAt = now;
+
+    const message = {
+      type: 'companionShot',
+      ownerId: player.id,
+      enemyId: best.id,
+      origin: [player.position[0], player.position[1] + 0.6, player.position[2]],
+      target: [best.position[0], best.position[1] + 0.8, best.position[2]],
+      travel: Math.max(120, (bestDist / COMPANION_PROJECTILE_SPEED) * 1000),
+    };
+
+    if (player.locationId === 'main-world' || player.locationId === CAVE_LOCATION_ID) {
+      broadcastToLocation(player.locationId, message, null, player.instance);
+    } else {
+      safeSend(player.ws, message);
+    }
+
+    applyEnemyDamage(player, best, COMPANION_ATTACK_DAMAGE, { keepTarget: false });
+  }
+}
+
+safeInterval(companionCombatTick, 250);
+
+function regenerateArenaBoss(enemy, cfg, occupants, now, instance) {
+  if (enemy.health >= enemy.maxHealth) return;
+  if (now - (enemy.lastHitAt || 0) < cfg.regenIdleMs) return;
+
+  const arena = cfg.arena;
+  for (const player of occupants) {
+    if (!player.alive) continue;
+    const dx = player.position[0] - arena.x;
+    const dz = player.position[2] - arena.z;
+    if (Math.sqrt(dx * dx + dz * dz) <= arena.radius) return;
+  }
+
+  const healed = Math.min(
+    enemy.maxHealth - enemy.health,
+    Math.ceil((cfg.regenPerSecond * CANYON_CONFIG.tickRate) / 1000)
+  );
+  if (healed <= 0) return;
+
+  enemy.health += healed;
+  enemy.provokedBy = null;
+  enemy.provokedUntil = 0;
+
+  broadcastToLocation(
+    CAVE_LOCATION_ID,
+    { type: 'enemyDamaged', id: enemy.id, health: enemy.health, attackerId: null, point: enemy.position, abilityId: null },
+    null,
+    instance
+  );
+}
+
+function caveTick() {
+  const now = Date.now();
+
+  for (const [instance, cave] of Array.from(caveInstances.entries())) {
+    const occupants = cavePlayersIn(instance);
+
+    if (occupants.length === 0) {
+      if (now - cave.createdAt > CAVE_EMPTY_DISPOSE_MS) caveInstances.delete(instance);
+      continue;
+    }
+
+    revealCaveCrates(cave, occupants);
+
+    for (const enemy of cave.enemies.values()) {
+      if (!enemy.alive) continue;
+      const cfg = ENEMY_TYPES[enemy.type];
+
+      if (cfg.regenPerSecond && cfg.arena) regenerateArenaBoss(enemy, cfg, occupants, now, instance);
+
+      if (cfg.ranged) {
+        updateRangedBoss(occupants, enemy, cfg, now);
+      } else {
+        driveMeleeEnemy(occupants, enemy, cfg, now, true);
+      }
+
+      enemy.positionHistory.push({ position: [...enemy.position], time: now });
+      enemy.positionHistory = enemy.positionHistory.filter((p) => now - p.time < 1000);
+    }
+
+    broadcastToLocation(
+      CAVE_LOCATION_ID,
+      { type: 'enemyState', enemies: serializeEnemies(cave.enemies) },
+      null,
+      instance
+    );
+  }
+}
+
 safeInterval(canyonTick, CANYON_CONFIG.tickRate);
+safeInterval(caveTick, CANYON_CONFIG.tickRate);
 
 function isArenaMemberPresent(run, member) {
   if (!member || !member.authenticated) return false;
@@ -4483,8 +4906,41 @@ function applyPendingPlaceableRefunds(player) {
   console.log(`[Trade] delivered deferred escrow refund to ${player.userId}`);
 }
 
-function holdTradeEscrow(session) {
+async function companionEscrowCall(session, action, userId) {
+  const result = await callInternalApi('/api/internal/game/companions/escrow', {
+    action,
+    userId,
+    gameId: session.gameId,
+    itemId: session.itemId,
+  }).catch((err) => {
+    console.error('[Trade] companion escrow error:', { action, itemId: session.itemId, message: err.message });
+    return null;
+  });
+
+  if (result && result.success) {
+    const holder = userIdToPlayer.get(userId);
+    if (holder) {
+      holder.companions = {
+        owned: Array.isArray(result.owned) ? result.owned : (holder.companions?.owned || []),
+        equipped: result.equipped || null,
+        fragments: Math.max(0, Math.floor(Number(result.fragments) || 0)),
+        crates: Math.max(0, Math.floor(Number(result.crates) || 0)),
+      };
+      holder.companionsChangedAt = Date.now();
+    }
+  }
+
+  return !!(result && result.success);
+}
+
+async function holdTradeEscrow(session) {
   if (session.escrowed) return true;
+
+  if (session.itemKind === 'companion') {
+    const held = await companionEscrowCall(session, 'hold', session.sellerId);
+    if (held) session.escrowed = true;
+    return held;
+  }
 
   const seller = userIdToPlayer.get(session.sellerId);
   if (!seller || !(seller.placeables[session.itemId] > 0)) return false;
@@ -4500,6 +4956,18 @@ function holdTradeEscrow(session) {
 function releaseTradeEscrow(session) {
   if (!session.escrowed) return;
   session.escrowed = false;
+
+  if (session.itemKind === 'companion') {
+    companionEscrowCall(session, 'release', session.sellerId).then((ok) => {
+      if (!ok) {
+        console.error('[Trade] CRITICAL: companion escrow not returned to seller:', {
+          tradeId: session.id, sellerId: session.sellerId, itemId: session.itemId,
+        });
+      }
+    });
+    return;
+  }
+
   refundPlaceable(session.sellerId, session.itemId, 1);
 }
 
@@ -5713,6 +6181,8 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
   enemy.health = Math.max(0, enemy.health - damage);
 
   const shared = player.locationId === 'main-world';
+  const inCave = player.locationId === CAVE_LOCATION_ID;
+  const broadcastShared = shared || inCave;
   const arenaRun = player.locationId === ARENA_LOCATION_ID ? arena.runForPlayer(player.id) : null;
   const damagedMessage = {
     type: 'enemyDamaged',
@@ -5724,8 +6194,17 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
   };
 
   if (arenaRun) broadcastArena(arenaRun, damagedMessage);
-  else if (shared) broadcastToLocation('main-world', damagedMessage, null, player.instance);
+  else if (broadcastShared) broadcastToLocation(player.locationId, damagedMessage, null, player.instance);
   else safeSend(player.ws, damagedMessage);
+
+  if (inCave) {
+    enemy.lastHitAt = now;
+    const cfg = ENEMY_TYPES[enemy.type];
+    if (cfg.arena) {
+      enemy.provokedBy = player.id;
+      enemy.provokedUntil = now + BOSS_PROVOKE_MS;
+    }
+  }
 
   if (enemy.health > 0) {
     if (options.keepTarget !== false) enemy.targetId = player.id;
@@ -5738,7 +6217,7 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
 
   const deathMessage = { type: 'enemyDeath', id: enemy.id, killerId: player.id };
   if (arenaRun) broadcastArena(arenaRun, deathMessage);
-  else if (shared) broadcastToLocation('main-world', deathMessage, null, player.instance);
+  else if (broadcastShared) broadcastToLocation(player.locationId, deathMessage, null, player.instance);
   else safeSend(player.ws, deathMessage);
 
   incrementKillQuests(player);
@@ -5759,12 +6238,32 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
     return true;
   }
 
-  if (player.locationId === CAVE_LOCATION_ID) {
-    if (player.cave && enemy.id === player.cave.bossId) {
-      player.cave.bossDefeated = true;
-      player.cave.portalDoomed = true;
-      grantXp(player, progression.XP_SOURCES.caveBossXp, 'cave_boss');
-      safeSend(player.ws, { type: 'caveBossState', defeated: true });
+  if (inCave) {
+    const cave = caveInstances.get(player.instance);
+    if (cave && enemy.id === cave.bossId && !cave.bossDefeated) {
+      cave.bossDefeated = true;
+      cave.bossChest = {
+        x: enemy.position[0],
+        z: enemy.position[2],
+        looted: new Set(),
+      };
+
+      for (const occupant of cavePlayersIn(player.instance)) {
+        grantXp(occupant, progression.XP_SOURCES.caveBossXp, 'cave_boss');
+      }
+
+      broadcastToLocation(
+        CAVE_LOCATION_ID,
+        { type: 'caveBossState', defeated: true },
+        null,
+        player.instance
+      );
+      broadcastToLocation(
+        CAVE_LOCATION_ID,
+        { type: 'caveChestSpawn', chestId: CAVE_BOSS_CHEST_ID, x: cave.bossChest.x, z: cave.bossChest.z },
+        null,
+        player.instance
+      );
     }
     return true;
   }
@@ -7495,7 +7994,6 @@ function buildSavePayload(player) {
           clearedSegments: Array.from(player.canyon.clearedSegments),
         },
         skinTextureUrl: player.skinTextureUrl || null,
-        caveChests: player.caveChests || {},
         stuckUsedAt: player.stuckUsedAt || 0,
         arenaCooldownUntil: player.arenaCooldownUntil || 0,
         arenaBestWave: player.arenaBestWave || 0,
@@ -7780,8 +8278,7 @@ wss.on('connection', (ws) => {
     lastLocationChangeAt: 0,
     pendingLocationChange: null,
     invulnerableUntil: 0,
-    cave: null,
-    caveChests: {},
+    caveKnownCrates: new Set(),
     ready: false,
     readyTimer: null,
     wantsSnapshots: false,
@@ -8209,9 +8706,8 @@ wss.on('connection', (ws) => {
       else broadcastGrinderState(leavingGrinder);
     }
 
-    if (player.cave?.portalDoomed) {
-      player.cave = null;
-      closeCavePortal();
+    if (player.locationId === CAVE_LOCATION_ID) {
+      leaveCave(player, player.instance);
     }
 
     if (player.activeTradeId) {
@@ -8411,13 +8907,6 @@ wss.on('connection', (ws) => {
         }
       }
 
-      const savedCaveChests = savedProgress.progress?.data?.caveChests;
-      if (savedCaveChests && typeof savedCaveChests === 'object') {
-        for (const [chestId, at] of Object.entries(savedCaveChests)) {
-          const timestamp = Math.floor(Number(at));
-          if (CAVE_CHESTS[chestId] && Number.isFinite(timestamp)) player.caveChests[chestId] = timestamp;
-        }
-      }
 
       const savedStuckUsedAt = Math.floor(Number(savedProgress.progress?.data?.stuckUsedAt));
       if (Number.isFinite(savedStuckUsedAt) && savedStuckUsedAt > 0) {
@@ -9121,35 +9610,45 @@ wss.on('connection', (ws) => {
     applyShotPassives(player, matchedShot, { kind: 'enemy', entity: enemy }, historicalPos);
   }
 
-  function handleCaveChestOpen(player, data) {
+  async function handleCaveChestOpen(player, data) {
     if (!player.alive) return;
-    if (player.locationId !== CAVE_LOCATION_ID || !player.cave) return;
+    const cave = caveInstanceOf(player);
+    if (!cave) return;
     if (typeof data.chestId !== 'string') return;
+
+    if (data.chestId === CAVE_BOSS_CHEST_ID) {
+      await openBossChest(player, cave);
+      return;
+    }
 
     const chest = CAVE_CHESTS[data.chestId];
     if (!chest) return;
 
-    if (data.chestId === 'vault' && !player.cave.bossDefeated) return;
+    if (!cave.crateRooms.has(data.chestId)) return;
+
+    if (cave.openedRooms.has(data.chestId)) {
+      safeSend(player.ws, { type: 'error', message: 'This crate is already empty', messageKey: 'g.err.chestEmpty' });
+      return;
+    }
 
     const [px, , pz] = player.position;
     const distance = Math.sqrt((chest[0] - px) ** 2 + (chest[2] - pz) ** 2);
     if (distance > CAVE_CHEST_REACH) return;
 
     const now = Date.now();
-    if (!player.caveChests) player.caveChests = {};
+    cave.openedRooms.add(data.chestId);
 
-    const lootedAt = player.caveChests[data.chestId] || 0;
-    if (now - lootedAt < CAVE_CHEST_COOLDOWN_MS) {
-      safeSend(player.ws, { type: 'error', message: 'This chest is still empty — come back later', messageKey: 'g.err.chestEmpty' });
-      return;
-    }
-
-    player.caveChests[data.chestId] = now;
     player.ash += CAVE_CHEST_REWARD;
     player.economyChangedAt = now;
     grantXp(player, progression.XP_SOURCES.caveChestXp, 'cave_chest');
     persistPlayer(player);
 
+    broadcastToLocation(
+      CAVE_LOCATION_ID,
+      { type: 'caveChestOpened', chestId: data.chestId, ash: 0 },
+      player.id,
+      player.instance
+    );
     safeSend(player.ws, { type: 'caveChestOpened', chestId: data.chestId, ash: CAVE_CHEST_REWARD });
     safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
   }
@@ -10322,6 +10821,7 @@ wss.on('connection', (ws) => {
       },
       sellerId: null,
       itemId: null,
+      itemKind: 'placeable',
       itemName: null,
       priceTnj: null,
       escrowed: false,
@@ -10373,6 +10873,7 @@ wss.on('connection', (ws) => {
       if (session.sellerId && session.sellerId !== player.userId) return;
       session.sellerId = null;
       session.itemId = null;
+      session.itemKind = 'placeable';
       session.itemName = null;
       session.priceTnj = null;
     } else {
@@ -10380,12 +10881,19 @@ wss.on('connection', (ws) => {
         safeSend(player.ws, { type: 'error', message: 'A seller is already set for this trade', messageKey: 'g.err.sellerAlreadySet' });
         return;
       }
-      const item = SHOP_ITEMS[itemId];
-      if (!item || !item.tradeable) {
-        safeSend(player.ws, { type: 'error', message: 'This item cannot be traded', messageKey: 'g.err.itemNotTradeable' });
-        return;
-      }
-      if (!(player.placeables[itemId] > 0)) {
+      const companionStack = (player.companions?.owned || []).find((stack) => stack.itemId === itemId);
+      const item = companionStack ? null : SHOP_ITEMS[itemId];
+
+      if (!companionStack) {
+        if (!item || !item.tradeable) {
+          safeSend(player.ws, { type: 'error', message: 'This item cannot be traded', messageKey: 'g.err.itemNotTradeable' });
+          return;
+        }
+        if (!(player.placeables[itemId] > 0)) {
+          safeSend(player.ws, { type: 'error', message: "You don't own that item", messageKey: 'g.err.dontOwnItem' });
+          return;
+        }
+      } else if (!(companionStack.quantity > 0)) {
         safeSend(player.ws, { type: 'error', message: "You don't own that item", messageKey: 'g.err.dontOwnItem' });
         return;
       }
@@ -10396,7 +10904,8 @@ wss.on('connection', (ws) => {
       }
       session.sellerId = player.userId;
       session.itemId = itemId;
-      session.itemName = item.name;
+      session.itemKind = companionStack ? 'companion' : 'placeable';
+      session.itemName = companionStack ? `g.pet.${itemId}.name` : item.name;
       session.priceTnj = priceTnj;
     }
 
@@ -10404,7 +10913,7 @@ wss.on('connection', (ws) => {
     broadcastTradeState(session);
   }
 
-  function handleTradeSetReady(player, data) {
+  async function handleTradeSetReady(player, data) {
     const tradeId = typeof data.tradeId === 'string' ? data.tradeId : null;
     const session = tradeId ? activeTrades.get(tradeId) : null;
     if (!session || session.phase !== 'negotiating' || !session.participants[player.userId]) return;
@@ -10419,7 +10928,7 @@ wss.on('connection', (ws) => {
 
     const allReady = Object.values(session.participants).every((p) => p.ready);
     if (allReady && session.sellerId) {
-      if (!holdTradeEscrow(session)) {
+      if (!(await holdTradeEscrow(session))) {
         for (const p of Object.values(session.participants)) p.ready = false;
         sendToTradeParticipants(session, { type: 'error', message: 'Seller no longer has this item', messageKey: 'g.err.sellerLostItem' });
         broadcastTradeState(session);
@@ -10493,10 +11002,22 @@ wss.on('connection', (ws) => {
 
     session.escrowed = false;
 
-    player.placeables[session.itemId] = (player.placeables[session.itemId] || 0) + 1;
-    player.economyChangedAt = Date.now();
-    persistPlayer(player);
-    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+    if (session.itemKind === 'companion') {
+      const delivered = await companionEscrowCall(session, 'deliver', player.userId);
+      if (!delivered) {
+        console.error('[Trade] CRITICAL: payment settled but companion not delivered:', {
+          tradeId: session.id, buyerId: player.userId, itemId: session.itemId,
+        });
+        endTrade(session, 'failed', { reason: 'delivery_failed', critical: true });
+        return;
+      }
+      sendCompanionState(player);
+    } else {
+      player.placeables[session.itemId] = (player.placeables[session.itemId] || 0) + 1;
+      player.economyChangedAt = Date.now();
+      persistPlayer(player);
+      safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+    }
 
     endTrade(session, 'completed');
   }
@@ -11234,6 +11755,11 @@ wss.on('connection', (ws) => {
     safeSend(player.ws, { type: 'arenaStartResult', ok: false, reason, cooldownUntil: player.arenaCooldownUntil || 0 });
   }
 
+  function arenaPartyLimit() {
+    const configured = eventConfigFor('arena')?.maxParty ?? arena.ARENA_CONFIG.maxParty;
+    return Math.max(1, Math.min(party.MAX_PARTY_SIZE, configured));
+  }
+
   function handleArenaStart(player) {
     const now = Date.now();
 
@@ -11245,7 +11771,7 @@ wss.on('connection', (ws) => {
     if (arena.runForInstance(player.instance)) return arenaRefusal(player, 'instance_busy');
     if (now < (player.arenaCooldownUntil || 0)) return arenaRefusal(player, 'cooldown');
 
-    const maxParty = Math.max(1, Math.min(party.MAX_PARTY_SIZE, eventConfigFor('arena')?.maxParty ?? party.MAX_PARTY_SIZE));
+    const maxParty = arenaPartyLimit();
     const group = party.partyOf(player.id);
     const memberIds = [player.id];
 
@@ -11277,7 +11803,7 @@ wss.on('connection', (ws) => {
     if (player.locationId !== ARENA_LOCATION_ID) return arenaRefusal(player, 'wrong_place');
     if (arena.runForPlayer(player.id)) return arenaRefusal(player, 'already_running');
     if (Date.now() < (player.arenaCooldownUntil || 0)) return arenaRefusal(player, 'cooldown');
-    if (arena.activeMembers(run).length >= party.MAX_PARTY_SIZE) return arenaRefusal(player, 'full');
+    if (arena.activeMembers(run).length >= arenaPartyLimit()) return arenaRefusal(player, 'full');
     if (!run.memberIds.some((id) => party.areAllies(player.id, id))) return arenaRefusal(player, 'not_invited');
 
     run.memberIds.push(player.id);
@@ -12107,7 +12633,7 @@ wss.on('connection', (ws) => {
       ? data.instance
       : partyShardFor(player, data.locationId);
     player.instance = isShardedLocation(data.locationId)
-      ? pickShard(data.locationId, requestedInstance)
+      ? pickShard(data.locationId, requestedInstance, player)
       : 1;
 
     if (player.locationId === 'tower-main-hall' && player.weaponEquipped) {
@@ -12151,7 +12677,7 @@ wss.on('connection', (ws) => {
     }
 
     if (oldLocation === CAVE_LOCATION_ID) {
-      leaveCave(player);
+      leaveCave(player, previousInstance);
     }
 
     if (data.locationId === CAVE_LOCATION_ID) {

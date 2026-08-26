@@ -111,6 +111,7 @@ function shouldFormMatch(now) {
   const total = queuedCount();
   if (total >= DEFUSAL_CONFIG.matchSize) return true;
   if (total < DEFUSAL_CONFIG.minMatchSize) return false;
+  if (queue.length < 2) return false;
 
   const oldest = queue.reduce((min, entry) => Math.min(min, entry.joinedAt), Infinity);
   return now - oldest >= DEFUSAL_CONFIG.queueGraceMs;
