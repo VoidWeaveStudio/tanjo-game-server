@@ -1831,6 +1831,20 @@ function playerByUserId(userId) {
   return null;
 }
 
+function touchAdminEconomy(player) {
+  player.economyChangedAt = Date.now();
+  safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+
+  if (!CONFIG.internalSecret) return;
+
+  // Re-stamping once the row is written keeps the periodic status pull from
+  // reading a value the save had not reached yet and undoing the change.
+  const saved = queuePlayerSave(player, buildSavePayload(player));
+  if (saved && typeof saved.then === 'function') {
+    saved.then(() => { player.economyChangedAt = Date.now(); }).catch(() => { });
+  }
+}
+
 function applyAdminLevel(player, level, totalXp) {
   const state = player.progression;
   const previousLevel = state.level;
@@ -1860,32 +1874,219 @@ function applyAdminInventoryRemoval(player, slot) {
   console.log(`[Admin] ${player.nickname} lost ${removed?.symbol || 'item'} from slot ${slot} by admin command`);
 }
 
-function applyAdminCommand(command) {
-  const player = playerByUserId(command.userId);
-  if (!player) return;
+function applyAdminProgressionReset(player) {
+  const state = player.progression;
+  const previousLevel = state.level;
 
-  if (command.type === 'setLevel') applyAdminLevel(player, command.level, command.totalXp);
-  else if (command.type === 'removeInventorySlot') applyAdminInventoryRemoval(player, command.slot);
+  state.totalXp = 0;
+  state.level = 1;
+  state.branch = null;
+  state.skills = {};
+  state.loadout = {};
+  state.respecCount = 0;
+
+  refreshCombatStats(player);
+  sendProgressionState(player);
+  if (previousLevel !== 1) broadcastPlayerLevel(player);
+  persistPlayer(player);
+}
+
+function applyAdminStatisticsReset(player) {
+  player.stats.kills = 0;
+  player.stats.deaths = 0;
+  player.stats.shotsFired = 0;
+  player.stats.buildingsPlaced = 0;
+  player.stats.playtimeSeconds = 0;
+  player.sessionStart = Date.now();
+  persistPlayer(player);
+}
+
+function applyAdminSkinReset(player) {
+  if (!player.skinTextureUrl) return;
+
+  player.skinTextureUrl = null;
+  player.skinTextureUrlChangedAt = Date.now();
+  broadcast({ type: 'skinUpdate', playerId: player.id, url: null }, null, true, player);
+  safeSend(player.ws, { type: 'skinUpdate', playerId: player.id, url: null });
+  persistPlayer(player);
+}
+
+const ADMIN_COMMAND_PROTOCOL = 2;
+const ADMIN_APPLIED_TTL_MS = 10 * 60 * 1000;
+const appliedAdminCommands = new Map();
+
+function rememberAdminCommand(id) {
+  const now = Date.now();
+  appliedAdminCommands.set(id, now);
+  if (appliedAdminCommands.size > 500) {
+    appliedAdminCommands.forEach((at, key) => {
+      if (now - at > ADMIN_APPLIED_TTL_MS) appliedAdminCommands.delete(key);
+    });
+  }
+}
+
+// Deltas are applied to the live copy and saved straight away. The website never
+// writes these fields while the session owns them, so nothing here can be undone
+// by the next autosave and nothing the player earned is rolled back.
+function applyAdminCommand(command) {
+  const op = command && command.op;
+  if (!op || typeof op.kind !== 'string') return 'skipped';
+
+  if (appliedAdminCommands.has(command.id)) return 'applied';
+
+  const player = playerByUserId(command.userId);
+  if (!player || !player.authenticated) return 'skipped';
+
+  const int = (value) => {
+    const parsed = Math.trunc(Number(value));
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+
+  switch (op.kind) {
+    case 'ashDelta': {
+      player.ash = Math.max(0, player.ash + int(op.delta));
+      touchAdminEconomy(player);
+      break;
+    }
+    case 'ashSet': {
+      player.ash = Math.max(0, int(op.value));
+      touchAdminEconomy(player);
+      break;
+    }
+    case 'placeableDelta': {
+      const itemId = String(op.itemId || '');
+      if (!itemId) return 'skipped';
+      const current = Math.max(0, int(player.placeables[itemId]));
+      const next = Math.max(0, current + int(op.delta));
+      if (next > 0) player.placeables[itemId] = next;
+      else delete player.placeables[itemId];
+      touchAdminEconomy(player);
+      break;
+    }
+    case 'placeablesSet': {
+      const source = op.placeables && typeof op.placeables === 'object' ? op.placeables : {};
+      const next = {};
+      for (const [itemId, amount] of Object.entries(source)) {
+        const value = Math.max(0, int(amount));
+        if (value > 0) next[itemId] = value;
+      }
+      player.placeables = next;
+      touchAdminEconomy(player);
+      break;
+    }
+    case 'placeablesEnsure': {
+      const minimums = op.minimums && typeof op.minimums === 'object' ? op.minimums : {};
+      for (const [itemId, minimum] of Object.entries(minimums)) {
+        const target = Math.max(0, int(minimum));
+        if (target <= 0) continue;
+        const current = Math.max(0, int(player.placeables[itemId]));
+        if (target > current) player.placeables[itemId] = target;
+      }
+      touchAdminEconomy(player);
+      break;
+    }
+    case 'storageClear': {
+      player.storage = {};
+      player.storageOrphan = [];
+      touchAdminEconomy(player);
+      break;
+    }
+    case 'inventoryClear': {
+      player.inventory = [];
+      touchAdminEconomy(player);
+      break;
+    }
+    case 'inventoryRemoveSlot': {
+      applyAdminInventoryRemoval(player, int(op.slot));
+      break;
+    }
+    case 'progressionSet': {
+      applyAdminLevel(player, int(op.level), int(op.totalXp));
+      break;
+    }
+    case 'progressionReset': {
+      applyAdminProgressionReset(player);
+      break;
+    }
+    case 'statisticsReset': {
+      applyAdminStatisticsReset(player);
+      break;
+    }
+    case 'skinReset': {
+      applyAdminSkinReset(player);
+      break;
+    }
+    default:
+      return 'skipped';
+  }
+
+  rememberAdminCommand(command.id);
+  console.log(`[Admin] ${player.nickname || player.userId} <- ${op.kind}`);
+  return 'applied';
+}
+
+function onlineUserIds() {
+  const ids = [];
+  players.forEach((player) => {
+    if (player.authenticated && player.userId) ids.push(player.userId);
+  });
+  return ids;
 }
 
 async function pollAdminCommands() {
   if (!CONFIG.internalSecret) return;
   if (players.size === 0) return;
 
-  const result = await callInternalApi('/api/internal/game/admin-commands', {}).catch((err) => {
+  const result = await callInternalApi('/api/internal/game/admin-commands', {
+    protocol: ADMIN_COMMAND_PROTOCOL,
+    onlineUserIds: onlineUserIds(),
+  }).catch((err) => {
     console.error('[Admin] Command poll failed:', err.message);
     return null;
   });
 
-  if (!Array.isArray(result?.commands)) return;
+  if (!Array.isArray(result?.commands) || result.commands.length === 0) return;
+
+  const ack = [];
+  const skipped = [];
+  const touched = new Set();
 
   for (const command of result.commands) {
+    if (!command || typeof command.id !== 'string') continue;
     try {
-      applyAdminCommand(command);
+      if (applyAdminCommand(command) === 'applied') {
+        ack.push(command.id);
+        touched.add(command.userId);
+      } else {
+        skipped.push(command.id);
+      }
     } catch (err) {
       console.error('[Admin] Command failed:', err.message);
+      skipped.push(command.id);
     }
   }
+
+  if (ack.length === 0 && skipped.length === 0) return;
+
+  // Acknowledging only once the row is written means a crash between applying
+  // and saving leaves the command queued, so it is replayed rather than lost.
+  const writes = [];
+  touched.forEach((userId) => {
+    const target = playerByUserId(userId);
+    if (target && target.saveQueue && typeof target.saveQueue.then === 'function') {
+      writes.push(target.saveQueue.catch(() => { }));
+    }
+  });
+  if (writes.length > 0) await Promise.all(writes);
+
+  // Anything this server could not place lands back on the website so it can be
+  // written to the row instead of waiting for a session that is already gone.
+  await callInternalApi('/api/internal/game/admin-commands', {
+    protocol: ADMIN_COMMAND_PROTOCOL,
+    ackOnly: true,
+    ack,
+    skipped,
+  }).catch((err) => console.error('[Admin] Command ack failed:', err.message));
 }
 
 async function pollWorldCommands() {
