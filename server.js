@@ -27,6 +27,8 @@ const defusal = require('./defusal');
 const defusalArsenal = require('./defusalArsenal');
 const grinder = require('./grinder');
 const caveGeometry = require('./caveGeometry');
+const influenceGeometry = require('./influenceGeometry');
+const influence = require('./influence');
 
 const PORT = process.env.PORT || 3001;
 const MAX_CONNECTIONS = 2000;
@@ -275,6 +277,61 @@ const ENEMY_TYPES = {
     attackCooldown: 1200, chaseSpeedNear: 5, chaseSpeedFar: 14, chaseNearThreshold: 14,
     patrolSpeed: 1.6, patrolRadius: 14, scale: 4.2, lootMin: 30, lootMax: 55,
   },
+  ward_walker: {
+    name: 'Ward Walker', maxHealth: 280, attackDamage: 19, attackRange: 2, aggroRadius: 24, aggroLeash: 9999,
+    attackCooldown: 1250, chaseSpeedNear: 2.5, chaseSpeedFar: 3.6, chaseNearThreshold: 9,
+    patrolSpeed: 1.1, patrolRadius: 16, scale: 1, lootMin: 3, lootMax: 7,
+    ward: true,
+  },
+  ward_runner: {
+    name: 'Ward Stalker', maxHealth: 190, attackDamage: 27, attackRange: 2.2, aggroRadius: 34, aggroLeash: 9999,
+    attackCooldown: 850, chaseSpeedNear: 9.5, chaseSpeedFar: 16, chaseNearThreshold: 8,
+    patrolSpeed: 0.9, patrolRadius: 8, scale: 0.98, lootMin: 5, lootMax: 10,
+    ward: true,
+    ambush: { hideRadius: 26, wakeRadius: 15, lungeSpeed: 22, lungeMs: 850, recoverMs: 1500 },
+  },
+  ward_brute: {
+    name: 'Ward Gorger', maxHealth: 3200, attackDamage: 54, attackRange: 3.6, aggroRadius: 32, aggroLeash: 9999,
+    attackCooldown: 2100, chaseSpeedNear: 2.3, chaseSpeedFar: 4.4, chaseNearThreshold: 13,
+    patrolSpeed: 0.8, patrolRadius: 11, scale: 1.55, lootMin: 20, lootMax: 38,
+    ward: true,
+    slam: { windup: 1100, cooldown: 6500, radius: 8, damage: 48, range: 9 },
+  },
+  ward_herald: {
+    name: 'Ward Herald', maxHealth: 11000, attackDamage: 0, attackRange: 0, aggroRadius: 46, aggroLeash: 9999,
+    attackCooldown: 2000, chaseSpeedNear: 3, chaseSpeedFar: 6.2, chaseNearThreshold: 18,
+    patrolSpeed: 1.4, patrolRadius: 10, scale: 1.75, lootMin: 60, lootMax: 110,
+    ward: true, ranged: true, preferredRange: 16, arenaRadius: 999, cover: 'city', crystalDamage: 70,
+    attacks: [
+      { id: 'spit', windup: 700, cooldown: 2400, minRange: 0, maxRange: 44, speed: 30, radius: 3.2, damage: 26, shots: 1, spread: 0 },
+      { id: 'volley', windup: 1150, cooldown: 6800, minRange: 8, maxRange: 44, speed: 22, radius: 3.6, damage: 18, shots: 5, spread: 8 },
+      { id: 'pool', windup: 1400, cooldown: 10000, minRange: 6, maxRange: 40, speed: 15, radius: 5.6, damage: 13, shots: 1, spread: 0, pool: { duration: 6500, interval: 700, damage: 11 } },
+    ],
+  },
+  ward_confessor: {
+    name: 'The Pale Confessor', maxHealth: 46000, attackDamage: 0, attackRange: 0, aggroRadius: 48, aggroLeash: 9999,
+    attackCooldown: 1900, chaseSpeedNear: 2.6, chaseSpeedFar: 5.4, chaseNearThreshold: 20,
+    patrolSpeed: 1.2, patrolRadius: 7, scale: 1, lootMin: 220, lootMax: 340,
+    ward: true, ranged: true, preferredRange: 15,
+    arena: { x: influenceGeometry.BOSS_ARENA.x, z: influenceGeometry.BOSS_ARENA.z, radius: influenceGeometry.BOSS_ARENA.radius },
+    cover: 'city',
+    regenPerSecond: 900, regenIdleMs: 12000,
+    wave: { windup: 3200, cooldown: 34000, damage: 62 },
+    phases: [
+      { key: 'litany', from: 1, summon: { walkers: 4, runners: 0, everyMs: 16000 } },
+      { key: 'procession', from: 0.7, summon: { walkers: 4, runners: 2, everyMs: 14000 } },
+      { key: 'toll', from: 0.4, summon: { walkers: 3, runners: 4, everyMs: 11000 } },
+      { key: 'rapture', from: 0.15, summon: { walkers: 4, runners: 5, everyMs: 8000 }, speedMult: 1.35, damageMult: 1.3 },
+    ],
+    attacks: [
+      { id: 'spit', phase: 1, windup: 640, cooldown: 2100, minRange: 0, maxRange: 48, speed: 32, radius: 3.2, damage: 30, shots: 1, spread: 0 },
+      { id: 'volley', phase: 1, windup: 1100, cooldown: 6000, minRange: 8, maxRange: 48, speed: 24, radius: 3.6, damage: 21, shots: 5, spread: 8 },
+      { id: 'censer', phase: 0.7, windup: 1350, cooldown: 8200, minRange: 4, maxRange: 46, speed: 19, radius: 6, damage: 26, shots: 3, spread: 11 },
+      { id: 'pool', phase: 0.7, windup: 1450, cooldown: 9500, minRange: 6, maxRange: 44, speed: 16, radius: 5.8, damage: 16, shots: 1, spread: 0, pool: { duration: 7000, interval: 650, damage: 14 } },
+      { id: 'grasp', phase: 0.4, windup: 1250, cooldown: 11000, minRange: 0, maxRange: 44, speed: 20, radius: 4.6, damage: 18, shots: 4, spread: 14, pool: { duration: 8000, interval: 900, damage: 12 } },
+      { id: 'rapture', phase: 0.15, windup: 1600, cooldown: 9000, minRange: 0, maxRange: 52, speed: 26, radius: 4.2, damage: 34, shots: 7, spread: 16 },
+    ],
+  },
 };
 
 const CANYON_BIOMES = [
@@ -457,6 +514,7 @@ function eventSealedReason(eventId) {
 const VALID_LOCATIONS = new Set([
   'main-world',
   'cave',
+  influence.INFLUENCE_LOCATION_ID,
   'tower-main-hall',
   'tower-first-floor',
   'tower-token-gates',
@@ -499,6 +557,7 @@ const LOCATION_MAX_RADIUS = {
   [EVENTS_LOBBY_ID]: 58,
   cave: caveGeometry.OUTER_RADIUS + 12,
   'open-world-canyon': 150,
+  [influence.INFLUENCE_LOCATION_ID]: influenceGeometry.OUTER_RADIUS + 6,
 };
 
 for (const [locationId, room] of Object.entries(EVENT_ROOMS)) {
@@ -782,6 +841,8 @@ function isValidPositionForLocation(locationId, pos) {
   if (maxRadius != null && Math.sqrt(x * x + z * z) > maxRadius) return false;
 
   if (locationId === CAVE_LOCATION_ID && !cavePlayerPositionSane(x, z)) return false;
+
+  if (locationId === influence.INFLUENCE_LOCATION_ID && !influenceGeometry.insideCity(x, z, -6)) return false;
 
   return true;
 }
@@ -1375,6 +1436,11 @@ function spawnInSafeZone(player, locationId) {
     player.position = [0, 0, 2];
     return;
   }
+  if (target === INFLUENCE_LOCATION_ID) {
+    const spot = pickInfluenceSpawn(player);
+    player.position = [spot[0], influenceGeometry.FLOOR_Y, spot[2]];
+    return;
+  }
   const eventRoom = EVENT_ROOMS[target];
   if (eventRoom) {
     const spread = 5;
@@ -1409,6 +1475,7 @@ function broadcastToLocation(locationId, data, excludeId = null, instance = null
 
 function isShardedLocation(locationId) {
   if (typeof locationId !== 'string') return false;
+  if (locationId === influence.INFLUENCE_LOCATION_ID) return false;
   return !PRIVATE_LOCATION_PREFIXES.some((prefix) => locationId.startsWith(prefix));
 }
 
@@ -1451,7 +1518,9 @@ function partyShardFor(player, locationId) {
 const caveSeatReservations = new Map();
 
 function shardCapacityFor(locationId) {
-  return locationId === CAVE_LOCATION_ID ? CAVE_SHARD_CAPACITY : SHARD_CAPACITY;
+  if (locationId === CAVE_LOCATION_ID) return CAVE_SHARD_CAPACITY;
+  if (locationId === INFLUENCE_LOCATION_ID) return influence.INFLUENCE_CONFIG.capacity;
+  return SHARD_CAPACITY;
 }
 
 function caveReservedSeats(instance, partyId) {
@@ -2240,6 +2309,10 @@ loadWorldState().then(() => {
   return pollMarketCap();
 });
 
+setTimeout(() => {
+  loadInfluenceState().catch((err) => console.error('[Influence] load error:', err.message));
+}, 0);
+
 safeInterval(pollMarketCap, WORLD_MC_POLL_MS);
 safeInterval(pollWorldCommands, WORLD_COMMAND_POLL_MS);
 safeInterval(updatePortalState, WORLD_COMMAND_POLL_MS);
@@ -2404,6 +2477,7 @@ function activeEnemiesFor(player) {
   if (player.locationId === ARENA_LOCATION_ID) return arena.runForPlayer(player.id)?.enemies ?? null;
   if (player.locationId === 'tower-first-floor') return player.canyon?.enemies ?? null;
   if (player.locationId === CAVE_LOCATION_ID) return caveInstances.get(player.instance)?.enemies ?? null;
+  if (player.locationId === INFLUENCE_LOCATION_ID) return influenceRun?.enemies ?? null;
   if (player.locationId === 'main-world') return worldEnemies.get(player.instance) ?? null;
   return null;
 }
@@ -2900,6 +2974,8 @@ function respawnPlayer(target, requested) {
   const destination = respawnDestinationFor(target, requested);
   const oldLocation = target.locationId;
 
+  if (oldLocation === INFLUENCE_LOCATION_ID) leaveInfluence(target);
+
   target.health = target.maxHealth;
   target.alive = true;
   clearPlayerAbilityBuffs(target, true);
@@ -3006,7 +3082,10 @@ function clampToArena(position, arena) {
 }
 
 function pickBossAttack(enemy, cfg, dist, now) {
+  const fraction = enemy.maxHealth > 0 ? enemy.health / enemy.maxHealth : 1;
+
   const usable = cfg.attacks.filter((attack) => {
+    if (attack.phase !== undefined && fraction > attack.phase) return false;
     if (dist < attack.minRange || dist > attack.maxRange) return false;
     return now - (enemy.attackCooldowns[attack.id] || 0) >= attack.cooldown;
   });
@@ -3159,12 +3238,19 @@ function resolveBossWave(targets, enemy, cfg, arena) {
     const arenaDz = target.position[2] - arena.z;
     if (Math.sqrt(arenaDx * arenaDx + arenaDz * arenaDz) > arena.radius) continue;
 
-    const sheltered = caveGeometry.caveCoverBetween(
-      enemy.position[0],
-      enemy.position[2],
-      target.position[0],
-      target.position[2]
-    );
+    const sheltered = cfg.cover === 'city'
+      ? influenceGeometry.citySightBlocked(
+        enemy.position[0],
+        enemy.position[2],
+        target.position[0],
+        target.position[2]
+      )
+      : caveGeometry.caveCoverBetween(
+        enemy.position[0],
+        enemy.position[2],
+        target.position[0],
+        target.position[2]
+      );
     if (sheltered) continue;
 
     damagePlayerFromZone(target, enemy, cfg.wave.damage);
@@ -3899,7 +3985,7 @@ function companionCombatTick() {
       travel: Math.max(120, (bestDist / COMPANION_PROJECTILE_SPEED) * 1000),
     };
 
-    if (player.locationId === 'main-world' || player.locationId === CAVE_LOCATION_ID) {
+    if (player.locationId === 'main-world' || player.locationId === CAVE_LOCATION_ID || player.locationId === INFLUENCE_LOCATION_ID) {
       broadcastToLocation(player.locationId, message, null, player.instance);
     } else {
       safeSend(player.ws, message);
@@ -3981,6 +4067,1762 @@ function caveTick() {
 
 safeInterval(canyonTick, CANYON_CONFIG.tickRate);
 safeInterval(caveTick, CANYON_CONFIG.tickRate);
+
+const INFLUENCE_LOCATION_ID = influence.INFLUENCE_LOCATION_ID;
+const INFLUENCE_CONFIG = influence.INFLUENCE_CONFIG;
+const INFLUENCE_CRYSTAL = influenceGeometry.CRYSTAL;
+const INFLUENCE_STEER_ANGLES = [0, 0.5, -0.5, 1.05, -1.05, 1.6, -1.6, 2.2, -2.2];
+const INFLUENCE_STEER_REFRESH_MS = 350;
+const INFLUENCE_DIRECT_SIGHT = 44;
+const INFLUENCE_CRYSTAL_REACH = 6.5;
+const INFLUENCE_CRYSTAL_HIT_MULT = 1.5;
+const INFLUENCE_SIEGE_HOLD_MS = 4000;
+const INFLUENCE_FIELD_REBUILD_MS = 1500;
+const INFLUENCE_LEASH = 70;
+const INFLUENCE_PERSIST_DEBOUNCE_MS = 2000;
+const INFLUENCE_COMMAND_POLL_MS = 15000;
+const INFLUENCE_TICK_MS = 100;
+const INFLUENCE_COLLAPSE_MAX_MS = 10 * 60 * 1000;
+const INFLUENCE_AOI_RADIUS = 105;
+const INFLUENCE_TELEGRAPH_RANGE = 46;
+const CRYSTAL_BROADCAST_MS = 300;
+const BREACH_MIN_RADIUS = 150;
+const BREACH_MAX_RADIUS = 900;
+const BREACH_MIN_Y = -220;
+const BREACH_MAX_Y = 220;
+const BREACH_INTERACT_RANGE = 14;
+
+const influenceState = influence.defaultState();
+influenceState.loaded = false;
+
+let influenceRun = null;
+let influencePersistTimer = null;
+
+function influenceOpen() {
+  return influenceState.status === 'open' || influenceState.status === 'collapsing';
+}
+
+function influencePlayersIn(excludeId = null) {
+  const list = [];
+  players.forEach((p) => {
+    if (!p.authenticated) return;
+    if (p.locationId !== INFLUENCE_LOCATION_ID) return;
+    if (excludeId !== null && p.id === excludeId) return;
+    list.push(p);
+  });
+  return list;
+}
+
+function influenceOwnerCount() {
+  if (!influenceState.ownerFactionId) return 0;
+  let count = 0;
+  for (const player of influencePlayersIn()) {
+    if (player.influenceFactionId === influenceState.ownerFactionId) count++;
+  }
+  return count;
+}
+
+function buildInfluenceStatePayload() {
+  return {
+    type: 'influenceState',
+    status: influenceState.status,
+    phase: influenceState.phase,
+    breach: {
+      x: influenceState.breach.x,
+      y: influenceState.breach.y,
+      z: influenceState.breach.z,
+      spawnedAt: influenceState.breach.spawnedAt,
+    },
+    ownerFactionId: influenceState.ownerFactionId,
+    ownerFactionName: influenceState.ownerFactionName,
+    ownerFactionSymbol: influenceState.ownerFactionSymbol,
+    ownerFactionImage: influenceState.ownerFactionImage,
+    feeCurrency: influenceState.feeCurrency,
+    feeAmount: influenceState.feeAmount,
+    bossDefeated: influenceState.bossDefeated,
+    crystalHealth: influenceState.crystalHealth,
+    crystalMaxHealth: INFLUENCE_CONFIG.crystalMaxHealth,
+    nextSiegeAt: influenceState.nextSiegeAt,
+    occupants: influencePlayersIn().length,
+    capacity: INFLUENCE_CONFIG.capacity,
+    siegeWave: influenceRun?.siege?.wave ?? 0,
+  };
+}
+
+function broadcastInfluenceState() {
+  const message = getCachedMessage(buildInfluenceStatePayload());
+
+  players.forEach((p) => {
+    if (!p.authenticated || p.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      p.ws.send(message);
+    } catch (err) {
+      console.error('[!] Influence state send error:', err.message);
+    }
+  });
+}
+
+function persistInfluenceState(immediate = false) {
+  if (!CONFIG.internalSecret) return;
+  if (influencePersistTimer) {
+    if (!immediate) return;
+    clearTimeout(influencePersistTimer);
+  }
+
+  influencePersistTimer = setTimeout(() => {
+    influencePersistTimer = null;
+    callInternalApi('/api/internal/game/influence-state', {
+      action: 'patch',
+      state: {
+        status: influenceState.status,
+        breach: influenceState.breach,
+        phase: influenceState.phase,
+        ownerFactionId: influenceState.ownerFactionId,
+        ownerFactionName: influenceState.ownerFactionName,
+        ownerFactionSymbol: influenceState.ownerFactionSymbol,
+        ownerFactionImage: influenceState.ownerFactionImage,
+        feeCurrency: influenceState.feeCurrency,
+        feeAmount: influenceState.feeAmount,
+        feeTokenCa: influenceState.feeTokenCa,
+        feeWallet: influenceState.feeWallet,
+        bossDefeated: influenceState.bossDefeated,
+        crystalHealth: influenceState.crystalHealth,
+        nextSiegeAt: influenceState.nextSiegeAt,
+        capturedAt: influenceState.capturedAt,
+        lastCommandId: influenceState.lastCommandId,
+      },
+    }).catch((err) => console.error('[Influence] Persist failed:', err.message));
+  }, immediate ? 0 : INFLUENCE_PERSIST_DEBOUNCE_MS);
+}
+
+function applyInfluenceState(raw) {
+  const next = influence.normalizeState(raw);
+  for (const key of Object.keys(next)) influenceState[key] = next[key];
+}
+
+async function loadInfluenceState() {
+  if (!CONFIG.internalSecret) {
+    influenceState.loaded = true;
+    return;
+  }
+
+  const result = await callInternalApi('/api/internal/game/influence-state', { action: 'get' }).catch((err) => {
+    console.error('[Influence] Load failed:', err.message);
+    return null;
+  });
+
+  if (result?.state) applyInfluenceState(result.state);
+  influenceState.loaded = true;
+
+  if (influenceOpen() && influenceState.nextSiegeAt <= 0) {
+    influenceState.nextSiegeAt = influence.scheduleFirstSiege(Date.now());
+  }
+
+  console.log(`[Influence] Loaded: ${influenceState.status}/${influenceState.phase}, owner ${influenceState.ownerFactionId || 'none'}`);
+}
+
+async function pollInfluenceCommands() {
+  if (!CONFIG.internalSecret) return;
+
+  const result = await callInternalApi('/api/internal/game/influence-state', { action: 'get' }).catch((err) => {
+    console.error('[Influence] Command poll failed:', err.message);
+    return null;
+  });
+
+  const command = result?.state?.command;
+  if (!command || typeof command.id !== 'string') return;
+  if (command.id === influenceState.lastCommandId) return;
+
+  influenceState.lastCommandId = command.id;
+  applyInfluenceCommand(command);
+}
+
+function pickBreachSpot() {
+  const angle = Math.random() * Math.PI * 2;
+  const radius = BREACH_MIN_RADIUS + Math.sqrt(Math.random()) * (BREACH_MAX_RADIUS - BREACH_MIN_RADIUS);
+  const x = Math.cos(angle) * radius;
+  const z = Math.sin(angle) * radius;
+  const y = BREACH_MIN_Y + Math.random() * (BREACH_MAX_Y - BREACH_MIN_Y);
+
+  return [Math.round(x * 100) / 100, Math.round(y * 100) / 100, Math.round(z * 100) / 100];
+}
+
+function openBreach(force) {
+  const wasOpen = influenceOpen();
+  if (wasOpen && !force) return false;
+
+  const spot = pickBreachSpot();
+  const now = Date.now();
+
+  influenceState.status = 'open';
+  influenceState.breach = { x: spot[0], y: spot[1], z: spot[2], spawnedAt: now };
+
+  if (!wasOpen) {
+    influenceState.phase = influenceState.bossDefeated
+      ? (influenceState.ownerFactionId ? 'owned' : 'claimable')
+      : 'sealed';
+    influenceState.crystalHealth = INFLUENCE_CONFIG.crystalMaxHealth;
+    influenceState.nextSiegeAt = influence.scheduleNextSiege(influenceState.nextSiegeAt, now);
+  }
+
+  console.log(`[Influence] Breach ${wasOpen ? 'moved' : 'opened'} at ${spot[0]}, ${spot[1]}, ${spot[2]}`);
+  persistInfluenceState(true);
+  broadcastInfluenceState();
+  return true;
+}
+
+function closeBreach(reason) {
+  if (influenceState.status === 'closed') return;
+
+  for (const player of influencePlayersIn()) {
+    safeSend(player.ws, { type: 'forceTeleport', locationId: GALAXY_LOCATION_ID });
+  }
+
+  influenceState.status = 'closed';
+  influenceState.phase = influenceState.bossDefeated
+    ? (influenceState.ownerFactionId ? 'owned' : 'claimable')
+    : 'sealed';
+
+  disposeInfluenceRun();
+  console.log(`[Influence] Breach closed (${reason})`);
+  persistInfluenceState(true);
+  broadcastInfluenceState();
+}
+
+function resetInfluencePoint() {
+  influenceState.ownerFactionId = null;
+  influenceState.ownerFactionName = null;
+  influenceState.ownerFactionSymbol = null;
+  influenceState.ownerFactionImage = null;
+  influenceState.feeCurrency = 'none';
+  influenceState.feeAmount = 0;
+  influenceState.feeTokenCa = null;
+  influenceState.feeWallet = null;
+  influenceState.bossDefeated = false;
+  influenceState.crystalHealth = INFLUENCE_CONFIG.crystalMaxHealth;
+  influenceState.capturedAt = 0;
+  influenceState.phase = 'sealed';
+  influenceState.nextSiegeAt = 0;
+}
+
+function applyInfluenceCommand(command) {
+  if (command.type === 'spawn_breach') {
+    console.log('[Influence] Admin opened a breach');
+    openBreach(true);
+    return;
+  }
+
+  if (command.type === 'close_breach') {
+    closeBreach('admin');
+    return;
+  }
+
+  if (command.type === 'reset_point') {
+    console.log('[Influence] Admin reset the influence point');
+    closeBreach('reset');
+    resetInfluencePoint();
+    persistInfluenceState(true);
+    broadcastInfluenceState();
+    return;
+  }
+
+  if (command.type === 'force_siege') {
+    influenceState.nextSiegeAt = Date.now();
+    persistInfluenceState(true);
+    broadcastInfluenceState();
+  }
+}
+
+function pickInfluenceSpawn(player) {
+  const spawns = influenceGeometry.SPAWNS;
+  const hostiles = influencePlayersIn(player?.id ?? null).filter((other) => {
+    if (!other.alive) return false;
+    if (!player) return true;
+    return other.influenceFactionId !== player.influenceFactionId;
+  });
+
+  let best = spawns[0];
+  let bestScore = -Infinity;
+
+  for (const spawn of spawns) {
+    let nearest = Infinity;
+    for (const hostile of hostiles) {
+      const distance = Math.hypot(hostile.position[0] - spawn.x, hostile.position[2] - spawn.z);
+      if (distance < nearest) nearest = distance;
+    }
+
+    const score = nearest + Math.random() * 12;
+    if (score > bestScore) {
+      bestScore = score;
+      best = spawn;
+    }
+  }
+
+  return [best.x, influenceGeometry.FLOOR_Y, best.z];
+}
+
+function ensureInfluenceRun() {
+  if (influenceRun) return influenceRun;
+
+  influenceRun = {
+    enemies: new Map(),
+    nextEnemySeq: 1,
+    bossId: null,
+    containers: new Map(),
+    capture: null,
+    siege: null,
+    fields: new Map(),
+    lastFieldBuildAt: 0,
+    createdAt: Date.now(),
+    collapseStartedAt: 0,
+    emptySince: 0,
+  };
+
+  for (const container of influenceGeometry.LOOT) {
+    influenceRun.containers.set(container.id, { openedBy: new Set(), reopenAt: 0 });
+  }
+
+  if (!influenceState.bossDefeated) {
+    influenceRun.bossId = spawnWardEnemy(
+      'ward_confessor',
+      [influenceGeometry.BOSS_SPAWN.x, influenceGeometry.FLOOR_Y, influenceGeometry.BOSS_SPAWN.z],
+      1,
+      1,
+      'boss'
+    );
+  }
+
+  for (const spawn of influenceGeometry.ZOMBIE_SPAWNS) {
+    spawnWardEnemy(spawn.type, [spawn.x, influenceGeometry.FLOOR_Y, spawn.z], 1, 1, 'ambient');
+  }
+
+  return influenceRun;
+}
+
+function disposeInfluenceRun() {
+  influenceRun = null;
+}
+
+function spawnWardEnemy(type, position, healthMult, damageMult, role) {
+  const run = influenceRun;
+  if (!run) return null;
+
+  const id = spawnEnemyInto(run.enemies, 'ward', run.nextEnemySeq++, type, position, healthMult, damageMult);
+  const enemy = run.enemies.get(id);
+
+  enemy.role = role;
+  enemy.respawnAt = 0;
+  enemy.holdTargetUntil = 0;
+  enemy.summonAt = 0;
+  enemy.phaseKey = null;
+  enemy.ambush = role === 'ambient' && ENEMY_TYPES[type].ambush ? 'hidden' : null;
+  enemy.lungeUntil = 0;
+  enemy.slamAt = 0;
+  enemy.slamResolveAt = 0;
+
+  return id;
+}
+
+function influenceFieldFor(targetId, x, z, now) {
+  const run = influenceRun;
+  if (!run) return null;
+
+  const existing = run.fields.get(targetId);
+  if (existing && now - existing.builtAt < 4000) return existing.field;
+
+  if (now - run.lastFieldBuildAt < INFLUENCE_FIELD_REBUILD_MS) return existing?.field ?? null;
+
+  run.lastFieldBuildAt = now;
+  const field = influence.buildFlowField(x, z);
+  if (!field.ok) return existing?.field ?? null;
+
+  run.fields.set(targetId, { field, builtAt: now });
+
+  if (run.fields.size > 3) {
+    let oldestKey = null;
+    let oldestAt = Infinity;
+    for (const [key, entry] of run.fields) {
+      if (entry.builtAt < oldestAt) {
+        oldestAt = entry.builtAt;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey !== null) run.fields.delete(oldestKey);
+  }
+
+  return field;
+}
+
+function cityStepEnemy(enemy, dirX, dirZ, step) {
+  const length = Math.hypot(dirX, dirZ) || 1;
+  const nx = dirX / length;
+  const nz = dirZ / length;
+
+  for (const angle of INFLUENCE_STEER_ANGLES) {
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const sx = nx * cos - nz * sin;
+    const sz = nx * sin + nz * cos;
+    const x = enemy.position[0] + sx * step;
+    const z = enemy.position[2] + sz * step;
+
+    if (influenceGeometry.cityWalkable(x, z, influence.FLOW_CLEARANCE + 0.05)) {
+      enemy.position[0] = x;
+      enemy.position[2] = z;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function nudgeIntoCity(position) {
+  if (influenceGeometry.cityWalkable(position[0], position[2], 0.5)) return;
+
+  influenceGeometry.pushOutOfBlockers(position, 0.8);
+  influenceGeometry.clampIntoCity(position, 2.5);
+
+  if (influenceGeometry.cityWalkable(position[0], position[2], 0.5)) return;
+
+  for (let ring = 1; ring <= 6; ring++) {
+    const radius = ring * 1.6;
+    for (let i = 0; i < 10; i++) {
+      const angle = (i / 10) * Math.PI * 2;
+      const x = position[0] + Math.cos(angle) * radius;
+      const z = position[2] + Math.sin(angle) * radius;
+      if (!influenceGeometry.cityWalkable(x, z, 0.6)) continue;
+      position[0] = x;
+      position[2] = z;
+      return;
+    }
+  }
+}
+
+function cityChaseDirection(enemy, target, now) {
+  const targetX = target.position[0];
+  const targetZ = target.position[2];
+  const dx = targetX - enemy.position[0];
+  const dz = targetZ - enemy.position[2];
+  const direct = Math.hypot(dx, dz);
+
+  if (direct <= INFLUENCE_DIRECT_SIGHT
+    && !influenceGeometry.citySightBlocked(enemy.position[0], enemy.position[2], targetX, targetZ)) {
+    return [dx, dz];
+  }
+
+  const field = influenceFieldFor(target.id, targetX, targetZ, now);
+  if (field) {
+    const step = influence.flowDirection(field, enemy.position[0], enemy.position[2]);
+    if (step) return step;
+
+    const escape = influence.flowEscapeDirection(field, enemy.position[0], enemy.position[2]);
+    if (escape) return escape;
+  }
+
+  return [dx, dz];
+}
+
+function crystalDirection(enemy) {
+  const field = influence.crystalFlowField();
+
+  const step = influence.flowDirection(field, enemy.position[0], enemy.position[2]);
+  if (step) return step;
+
+  const escape = influence.flowEscapeDirection(field, enemy.position[0], enemy.position[2]);
+  if (escape) return escape;
+
+  return [INFLUENCE_CRYSTAL.x - enemy.position[0], INFLUENCE_CRYSTAL.z - enemy.position[2]];
+}
+
+function wardTargetFor(candidates, enemy, cfg, now) {
+  let best = null;
+  let bestScore = Infinity;
+
+  const provoked = enemy.provokedUntil > now ? enemy.provokedBy : null;
+
+  for (const candidate of candidates) {
+    if (!candidate.alive) continue;
+    if (candidate.invulnerableUntil && now < candidate.invulnerableUntil) continue;
+
+    const dx = candidate.position[0] - enemy.position[0];
+    const dz = candidate.position[2] - enemy.position[2];
+    const distance = Math.hypot(dx, dz);
+
+    const isProvoker = candidate.id === provoked;
+    let reach = cfg.aggroRadius;
+
+    if (enemy.role === 'siege') reach = Math.min(cfg.aggroRadius, 18);
+    if (enemy.role === 'add') reach = Math.max(cfg.aggroRadius, 60);
+    if (enemy.targetId === candidate.id) reach += 14;
+
+    if (!isProvoker && distance > reach) continue;
+
+    const blocked = distance > 6
+      && influenceGeometry.citySightBlocked(enemy.position[0], enemy.position[2], candidate.position[0], candidate.position[2]);
+    const score = distance + (blocked ? 22 : 0) + (isProvoker ? -40 : 0);
+
+    if (score < bestScore) {
+      bestScore = score;
+      best = { player: candidate, dist: distance };
+    }
+  }
+
+  return best;
+}
+
+function wardAmbushCheck(enemy, cfg, candidates, now) {
+  if (enemy.ambush !== 'hidden') return true;
+
+  const wake = cfg.ambush.wakeRadius;
+  for (const candidate of candidates) {
+    if (!candidate.alive) continue;
+    const distance = Math.hypot(candidate.position[0] - enemy.position[0], candidate.position[2] - enemy.position[2]);
+    if (distance > wake) continue;
+
+    enemy.ambush = 'lunging';
+    enemy.lungeUntil = now + cfg.ambush.lungeMs;
+
+    const ambush = {
+      type: 'wardAmbush',
+      enemyId: enemy.id,
+      x: enemy.position[0],
+      z: enemy.position[2],
+    };
+
+    for (const spectator of candidates) {
+      const reach = Math.hypot(spectator.position[0] - enemy.position[0], spectator.position[2] - enemy.position[2]);
+      if (reach <= INFLUENCE_TELEGRAPH_RANGE) safeSend(spectator.ws, ambush);
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+function wardBruteSlam(enemy, cfg, target, distance, now) {
+  if (!cfg.slam) return false;
+
+  if (enemy.slamResolveAt > 0) {
+    if (now < enemy.slamResolveAt) return true;
+
+    enemy.slamResolveAt = 0;
+    const occupants = influencePlayersIn();
+
+    for (const player of occupants) {
+      if (!player.alive) continue;
+      const reach = Math.hypot(player.position[0] - enemy.position[0], player.position[2] - enemy.position[2]);
+      if (reach > cfg.slam.radius) continue;
+      damagePlayerFromZone(player, enemy, cfg.slam.damage);
+    }
+
+    return true;
+  }
+
+  if (!target || distance > cfg.slam.range) return false;
+  if (now - enemy.slamAt < cfg.slam.cooldown) return false;
+
+  enemy.slamAt = now;
+  enemy.slamResolveAt = now + cfg.slam.windup;
+
+  const telegraph = {
+    type: 'bossWave',
+    enemyId: enemy.id,
+    x: enemy.position[0],
+    z: enemy.position[2],
+    radius: cfg.slam.radius,
+    windup: cfg.slam.windup,
+    silent: true,
+  };
+
+  for (const spectator of influencePlayersIn()) {
+    const reach = Math.hypot(spectator.position[0] - enemy.position[0], spectator.position[2] - enemy.position[2]);
+    if (reach <= INFLUENCE_TELEGRAPH_RANGE) safeSend(spectator.ws, telegraph);
+  }
+
+  return true;
+}
+
+function attackCrystal(enemy, cfg, now) {
+  if (now - enemy.lastAttackTime < cfg.attackCooldown) return;
+  enemy.lastAttackTime = now;
+
+  const base = cfg.crystalDamage ?? enemy.attackDamage;
+  damageCrystal(Math.round(base * INFLUENCE_CRYSTAL_HIT_MULT), enemy.id);
+}
+
+function driveWardEnemy(candidates, enemy, cfg, now) {
+  if (enemy.role === 'ambient' && cfg.ambush && !wardAmbushCheck(enemy, cfg, candidates, now)) {
+    enemy.targetId = null;
+    return;
+  }
+
+  const chosen = wardTargetFor(candidates, enemy, cfg, now);
+  const target = chosen ? chosen.player : null;
+  const distance = chosen ? chosen.dist : Infinity;
+
+  if (target) {
+    enemy.targetId = target.id;
+    enemy.holdTargetUntil = now + INFLUENCE_SIEGE_HOLD_MS;
+  } else if (now > enemy.holdTargetUntil) {
+    enemy.targetId = null;
+  }
+
+  if (abilities.isStunned(enemy, now)) return;
+
+  if (wardBruteSlam(enemy, cfg, target, distance, now)) {
+    nudgeIntoCity(enemy.position);
+    return;
+  }
+
+  const lunging = enemy.ambush === 'lunging' && now < enemy.lungeUntil;
+  if (enemy.ambush === 'lunging' && now >= enemy.lungeUntil) enemy.ambush = 'awake';
+
+  if (target) {
+    if (distance <= cfg.attackRange) {
+      if (now - enemy.lastAttackTime >= cfg.attackCooldown) {
+        enemy.lastAttackTime = now;
+        damagePlayerByCanyonEnemy(target, enemy);
+      }
+      nudgeIntoCity(enemy.position);
+      return;
+    }
+
+    const base = lunging
+      ? cfg.ambush.lungeSpeed
+      : distance > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear;
+    const step = base * (INFLUENCE_TICK_MS / 1000) * enemySpeedMult(enemy, now);
+
+    let dir;
+    if (enemy.citySteer && now < enemy.citySteerUntil) {
+      dir = enemy.citySteer;
+    } else {
+      dir = cityChaseDirection(enemy, target, now);
+      enemy.citySteer = dir;
+      enemy.citySteerUntil = now + INFLUENCE_STEER_REFRESH_MS;
+    }
+
+    if (!cityStepEnemy(enemy, dir[0], dir[1], step)) {
+      enemy.citySteerUntil = 0;
+      cityStepEnemy(enemy, target.position[0] - enemy.position[0], target.position[2] - enemy.position[2], step);
+    }
+
+    nudgeIntoCity(enemy.position);
+    return;
+  }
+
+  if (enemy.role === 'siege') {
+    const crystalDistance = Math.hypot(
+      INFLUENCE_CRYSTAL.x - enemy.position[0],
+      INFLUENCE_CRYSTAL.z - enemy.position[2]
+    );
+
+    if (crystalDistance <= INFLUENCE_CRYSTAL_REACH) {
+      attackCrystal(enemy, cfg, now);
+      return;
+    }
+
+    const step = cfg.chaseSpeedFar * (INFLUENCE_TICK_MS / 1000) * enemySpeedMult(enemy, now);
+    const dir = crystalDirection(enemy);
+    if (!cityStepEnemy(enemy, dir[0], dir[1], step)) {
+      cityStepEnemy(enemy, INFLUENCE_CRYSTAL.x - enemy.position[0], INFLUENCE_CRYSTAL.z - enemy.position[2], step);
+    }
+    nudgeIntoCity(enemy.position);
+    return;
+  }
+
+  if (enemy.ambush === 'hidden') return;
+
+  wardPatrol(enemy, cfg, now);
+}
+
+function wardPatrol(enemy, cfg, now) {
+  if (cfg.patrolSpeed <= 0) return;
+
+  const home = enemy.spawnPoint;
+  const drift = Math.hypot(enemy.position[0] - home[0], enemy.position[2] - home[2]);
+
+  if (drift > INFLUENCE_LEASH) {
+    const step = cfg.chaseSpeedNear * (INFLUENCE_TICK_MS / 1000);
+    cityStepEnemy(enemy, home[0] - enemy.position[0], home[2] - enemy.position[2], step);
+    nudgeIntoCity(enemy.position);
+    return;
+  }
+
+  if (!enemy.patrolTarget) {
+    if (now < enemy.patrolWaitUntil) return;
+
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const angle = Math.random() * Math.PI * 2;
+      const radius = Math.random() * cfg.patrolRadius;
+      const x = home[0] + Math.cos(angle) * radius;
+      const z = home[2] + Math.sin(angle) * radius;
+      if (!influenceGeometry.cityWalkable(x, z, 0.8)) continue;
+      enemy.patrolTarget = [x, z];
+      break;
+    }
+
+    if (!enemy.patrolTarget) {
+      enemy.patrolWaitUntil = now + 2500;
+      return;
+    }
+  }
+
+  const dx = enemy.patrolTarget[0] - enemy.position[0];
+  const dz = enemy.patrolTarget[1] - enemy.position[2];
+
+  if (Math.hypot(dx, dz) < 1.2) {
+    enemy.patrolTarget = null;
+    enemy.patrolWaitUntil = now + 1500 + Math.random() * 4000;
+    return;
+  }
+
+  const step = cfg.patrolSpeed * (INFLUENCE_TICK_MS / 1000);
+  if (!cityStepEnemy(enemy, dx, dz, step)) enemy.patrolTarget = null;
+  nudgeIntoCity(enemy.position);
+}
+
+function confessorPhase(enemy, cfg) {
+  const fraction = enemy.maxHealth > 0 ? enemy.health / enemy.maxHealth : 1;
+  let active = cfg.phases[0];
+  for (const phase of cfg.phases) {
+    if (fraction <= phase.from) active = phase;
+  }
+  return active;
+}
+
+function driveConfessor(candidates, enemy, cfg, now) {
+  const phase = confessorPhase(enemy, cfg);
+
+  if (enemy.phaseKey !== phase.key) {
+    enemy.phaseKey = phase.key;
+    enemy.summonAt = now;
+    broadcastToLocation(INFLUENCE_LOCATION_ID, {
+      type: 'wardBossPhase',
+      enemyId: enemy.id,
+      phase: phase.key,
+      health: enemy.health,
+      maxHealth: enemy.maxHealth,
+    });
+  }
+
+  if (phase.summon && now - enemy.summonAt >= phase.summon.everyMs) {
+    enemy.summonAt = now;
+    summonConfessorAdds(phase.summon);
+  }
+
+  updateRangedBoss(candidates, enemy, cfg, now);
+  nudgeIntoCity(enemy.position);
+}
+
+function summonConfessorAdds(summon) {
+  const run = influenceRun;
+  if (!run) return;
+
+  const arena = INFLUENCE_CONFIG.bossArena;
+  let live = 0;
+  for (const enemy of run.enemies.values()) {
+    if (enemy.alive && enemy.role === 'add') live++;
+  }
+  if (live >= 22) return;
+
+  const place = () => {
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const angle = Math.random() * Math.PI * 2;
+      const radius = 12 + Math.random() * (arena.radius - 14);
+      const x = arena.x + Math.cos(angle) * radius;
+      const z = arena.z + Math.sin(angle) * radius;
+      if (influenceGeometry.cityWalkable(x, z, 0.8)) return [x, influenceGeometry.FLOOR_Y, z];
+    }
+    return [arena.x, influenceGeometry.FLOOR_Y, arena.z + 12];
+  };
+
+  for (let i = 0; i < summon.walkers; i++) spawnWardEnemy('ward_walker', place(), 1.1, 1, 'add');
+  for (let i = 0; i < summon.runners; i++) spawnWardEnemy('ward_runner', place(), 1.1, 1, 'add');
+}
+
+let crystalBroadcastAt = 0;
+
+function broadcastCrystalHealth(sourceId) {
+  crystalBroadcastAt = Date.now();
+
+  broadcastToLocation(INFLUENCE_LOCATION_ID, {
+    type: 'influenceCrystal',
+    health: influenceState.crystalHealth,
+    maxHealth: INFLUENCE_CONFIG.crystalMaxHealth,
+    sourceId: sourceId ?? null,
+  });
+}
+
+function damageCrystal(amount, sourceId) {
+  if (amount <= 0) return;
+  if (influenceState.crystalHealth <= 0) return;
+
+  influenceState.crystalHealth = Math.max(0, influenceState.crystalHealth - amount);
+
+  if (influenceState.crystalHealth <= 0) {
+    broadcastCrystalHealth(sourceId);
+    breakCrystal();
+    return;
+  }
+
+  if (Date.now() - crystalBroadcastAt >= CRYSTAL_BROADCAST_MS) {
+    broadcastCrystalHealth(sourceId);
+    persistInfluenceState();
+  }
+}
+
+function breakCrystal() {
+  const occupants = influencePlayersIn();
+  const lostFaction = influenceState.ownerFactionName;
+
+  influenceState.ownerFactionId = null;
+  influenceState.ownerFactionName = null;
+  influenceState.ownerFactionSymbol = null;
+  influenceState.ownerFactionImage = null;
+  influenceState.feeCurrency = 'none';
+  influenceState.feeAmount = 0;
+  influenceState.feeTokenCa = null;
+  influenceState.feeWallet = null;
+  influenceState.capturedAt = 0;
+
+  if (influenceRun) {
+    influenceRun.capture = null;
+    influenceRun.siege = null;
+  }
+
+  if (occupants.length === 0) {
+    influenceState.phase = 'claimable';
+    influenceState.crystalHealth = Math.round(INFLUENCE_CONFIG.crystalMaxHealth * 0.4);
+    influenceState.nextSiegeAt = influence.scheduleNextSiege(influenceState.nextSiegeAt, Date.now());
+    console.log(`[Influence] Crystal fell with nobody inside (${lostFaction || 'unowned'})`);
+    persistInfluenceState(true);
+    broadcastInfluenceState();
+    return;
+  }
+
+  influenceState.status = 'collapsing';
+  influenceState.phase = 'collapse';
+
+  if (influenceRun) {
+    influenceRun.collapseStartedAt = Date.now();
+    influenceRun.siege = {
+      mode: 'collapse',
+      wave: 0,
+      nextWaveAt: Date.now() + INFLUENCE_CONFIG.collapseGraceMs,
+    };
+  }
+
+  console.log(`[Influence] Crystal broken — the ward is collapsing (${occupants.length} inside)`);
+  persistInfluenceState(true);
+  broadcastInfluenceState();
+}
+
+function influenceSiegeGate(index) {
+  const gates = influenceGeometry.SIEGE_GATES;
+  const gate = gates[index % gates.length];
+  const spread = 5;
+
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const x = gate.x + (Math.random() * 2 - 1) * spread;
+    const z = gate.z + (Math.random() * 2 - 1) * spread;
+    if (influenceGeometry.cityWalkable(x, z, 0.8)) return [x, influenceGeometry.FLOOR_Y, z];
+  }
+
+  return [gate.x, influenceGeometry.FLOOR_Y, gate.z];
+}
+
+function liveSiegeEnemies(run) {
+  let count = 0;
+  for (const enemy of run.enemies.values()) {
+    if (enemy.alive && enemy.role === 'siege') count++;
+  }
+  return count;
+}
+
+function startSiegeWave(run, now) {
+  const collapse = run.siege.mode === 'collapse';
+  run.siege.wave += 1;
+
+  const plan = collapse
+    ? influence.collapseWaveComposition(run.siege.wave)
+    : influence.siegeWaveComposition(run.siege.wave);
+
+  const cap = collapse ? INFLUENCE_CONFIG.collapseMaxLive : INFLUENCE_CONFIG.siegeMaxLive;
+  let budget = Math.max(0, cap - liveSiegeEnemies(run));
+  let gate = Math.floor(Math.random() * influenceGeometry.SIEGE_GATES.length);
+
+  const push = (type, count) => {
+    for (let i = 0; i < count && budget > 0; i++) {
+      spawnWardEnemy(type, influenceSiegeGate(gate++), plan.healthMult, plan.damageMult, 'siege');
+      budget--;
+    }
+  };
+
+  push('ward_brute', plan.brutes);
+  push('ward_herald', plan.heralds);
+  push('ward_runner', plan.runners);
+  push('ward_walker', plan.walkers);
+
+  run.siege.nextWaveAt = now + (collapse ? INFLUENCE_CONFIG.collapseWaveGapMs : INFLUENCE_CONFIG.siegeWaveGapMs);
+
+  broadcastToLocation(INFLUENCE_LOCATION_ID, {
+    type: 'influenceWave',
+    wave: run.siege.wave,
+    collapse,
+    total: collapse ? 0 : INFLUENCE_CONFIG.siegeWaves,
+  });
+}
+
+function beginSiege(now) {
+  const occupants = influencePlayersIn();
+
+  influenceState.nextSiegeAt = influence.scheduleNextSiege(influenceState.nextSiegeAt, now);
+
+  if (!influenceState.ownerFactionId) {
+    persistInfluenceState(true);
+    broadcastInfluenceState();
+    return;
+  }
+
+  if (occupants.length === 0) {
+    console.log('[Influence] Siege resolved offline — the crystal falls');
+    influenceState.crystalHealth = 0;
+    breakCrystal();
+    return;
+  }
+
+  const run = ensureInfluenceRun();
+  run.siege = { mode: 'siege', wave: 0, nextWaveAt: now };
+  influenceState.phase = 'siege';
+
+  console.log(`[Influence] Siege begins against ${influenceState.ownerFactionName}`);
+  persistInfluenceState(true);
+  broadcastInfluenceState();
+}
+
+function endSiege(run) {
+  run.siege = null;
+  influenceState.phase = influenceState.ownerFactionId ? 'owned' : 'claimable';
+
+  for (const [id, enemy] of Array.from(run.enemies.entries())) {
+    if (enemy.role !== 'siege') continue;
+
+    if (enemy.alive) {
+      broadcastToLocation(INFLUENCE_LOCATION_ID, { type: 'enemyDeath', id, killerId: null });
+    }
+    run.enemies.delete(id);
+  }
+
+  broadcastToLocation(INFLUENCE_LOCATION_ID, { type: 'influenceWave', wave: 0, collapse: false, total: 0 });
+  persistInfluenceState(true);
+  broadcastInfluenceState();
+}
+
+function updateInfluenceCapture(run, occupants, now) {
+  if (!influenceState.bossDefeated) {
+    if (run.capture) {
+      run.capture = null;
+      broadcastCaptureState(null);
+    }
+    return;
+  }
+  if (influenceState.phase === 'collapse') return;
+
+  const near = [];
+  for (const player of occupants) {
+    if (!player.alive) continue;
+    const distance = Math.hypot(
+      player.position[0] - INFLUENCE_CRYSTAL.x,
+      player.position[2] - INFLUENCE_CRYSTAL.z
+    );
+    if (distance <= INFLUENCE_CONFIG.contestRadius) near.push({ player, distance });
+  }
+
+  const capture = run.capture;
+  if (!capture) return;
+
+  const holder = players.get(capture.playerId);
+  const stillHere = holder
+    && holder.authenticated
+    && holder.alive
+    && holder.locationId === INFLUENCE_LOCATION_ID
+    && Math.hypot(holder.position[0] - INFLUENCE_CRYSTAL.x, holder.position[2] - INFLUENCE_CRYSTAL.z) <= INFLUENCE_CONFIG.captureRadius;
+
+  if (!stillHere) {
+    run.capture = null;
+    broadcastCaptureState(null);
+    return;
+  }
+
+  const contested = near.some((entry) => entry.player.influenceFactionId !== capture.factionId);
+  if (contested) {
+    capture.contestedUntil = now + 1500;
+    capture.until += INFLUENCE_TICK_MS;
+    broadcastCaptureState(capture);
+    return;
+  }
+
+  if (now >= capture.until) {
+    completeCapture(capture);
+    return;
+  }
+
+  if (now - (capture.lastBroadcast || 0) > 900) {
+    capture.lastBroadcast = now;
+    broadcastCaptureState(capture);
+  }
+}
+
+function broadcastCaptureState(capture) {
+  broadcastToLocation(INFLUENCE_LOCATION_ID, {
+    type: 'influenceCapture',
+    factionId: capture?.factionId ?? null,
+    factionName: capture?.factionName ?? null,
+    playerId: capture?.playerId ?? null,
+    until: capture?.until ?? 0,
+    duration: INFLUENCE_CONFIG.captureMs,
+    contested: capture ? capture.contestedUntil > Date.now() : false,
+  });
+}
+
+function completeCapture(capture) {
+  const run = influenceRun;
+  if (!run) return;
+
+  influenceState.ownerFactionId = capture.factionId;
+  influenceState.ownerFactionName = capture.factionName;
+  influenceState.ownerFactionSymbol = capture.factionSymbol;
+  influenceState.ownerFactionImage = capture.factionImage;
+  influenceState.feeCurrency = 'none';
+  influenceState.feeAmount = 0;
+  influenceState.feeTokenCa = null;
+  influenceState.feeWallet = null;
+  influenceState.phase = 'owned';
+  influenceState.capturedAt = Date.now();
+  influenceState.crystalHealth = INFLUENCE_CONFIG.crystalMaxHealth;
+  influenceState.nextSiegeAt = influence.scheduleNextSiege(influenceState.nextSiegeAt, Date.now());
+
+  run.capture = null;
+
+  console.log(`[Influence] ${capture.factionName} now controls the ward`);
+  broadcastCaptureState(null);
+  broadcastToLocation(INFLUENCE_LOCATION_ID, {
+    type: 'influenceCaptured',
+    factionId: capture.factionId,
+    factionName: capture.factionName,
+  });
+
+  persistInfluenceState(true);
+  broadcastInfluenceState();
+}
+
+function repairCrystal(now) {
+  if (influenceState.phase !== 'owned') return;
+  if (influenceState.crystalHealth >= INFLUENCE_CONFIG.crystalMaxHealth) return;
+
+  const perTick = (INFLUENCE_CONFIG.crystalRepairPerHour * INFLUENCE_TICK_MS) / (60 * 60 * 1000);
+  influenceState.crystalRepairCarry = (influenceState.crystalRepairCarry || 0) + perTick;
+
+  if (influenceState.crystalRepairCarry < 1) return;
+
+  const healed = Math.floor(influenceState.crystalRepairCarry);
+  influenceState.crystalRepairCarry -= healed;
+  influenceState.crystalHealth = Math.min(
+    INFLUENCE_CONFIG.crystalMaxHealth,
+    influenceState.crystalHealth + healed
+  );
+
+  if (now - (influenceState.lastRepairBroadcast || 0) > 5000) {
+    influenceState.lastRepairBroadcast = now;
+    broadcastCrystalHealth(null);
+    persistInfluenceState();
+  }
+}
+
+function influenceRespawnAmbient(run, occupants, now) {
+  for (const enemy of run.enemies.values()) {
+    if (enemy.alive) continue;
+    if (enemy.role !== 'ambient') continue;
+    if (enemy.respawnAt === 0) {
+      enemy.respawnAt = now + INFLUENCE_CONFIG.ambientRespawnMs;
+      continue;
+    }
+    if (now < enemy.respawnAt) continue;
+
+    let blocked = false;
+    for (const player of occupants) {
+      if (Math.hypot(player.position[0] - enemy.spawnPoint[0], player.position[2] - enemy.spawnPoint[2]) < 34) {
+        blocked = true;
+        break;
+      }
+    }
+    if (blocked) continue;
+
+    enemy.alive = true;
+    enemy.health = enemy.maxHealth;
+    enemy.position = [...enemy.spawnPoint];
+    enemy.respawnAt = 0;
+    enemy.targetId = null;
+    enemy.pendingImpacts = [];
+    enemy.pools = [];
+    enemy.cast = null;
+    if (ENEMY_TYPES[enemy.type].ambush) enemy.ambush = 'hidden';
+  }
+}
+
+function serializeWardEnemies(run, player) {
+  const list = [];
+
+  for (const enemy of run.enemies.values()) {
+    if (!enemy.alive) continue;
+
+    const dx = enemy.position[0] - player.position[0];
+    const dz = enemy.position[2] - player.position[2];
+    if (dx * dx + dz * dz > INFLUENCE_AOI_RADIUS * INFLUENCE_AOI_RADIUS) continue;
+
+    const entry = {
+      id: enemy.id,
+      type: enemy.type,
+      position: [
+        Math.round(enemy.position[0] * 100) / 100,
+        enemy.position[1],
+        Math.round(enemy.position[2] * 100) / 100,
+      ],
+      health: enemy.health,
+      maxHealth: enemy.maxHealth,
+      alive: true,
+      targetId: enemy.targetId,
+    };
+
+    if (enemy.ambush === 'hidden') entry.state = 'hidden';
+    else if (enemy.ambush === 'lunging') entry.state = 'lunge';
+
+    list.push(entry);
+  }
+
+  return list;
+}
+
+function influenceTick() {
+  if (!influenceState.loaded) return;
+
+  const now = Date.now();
+
+  if (influenceOpen() && influenceState.nextSiegeAt > 0 && now >= influenceState.nextSiegeAt
+    && influenceState.phase !== 'siege' && influenceState.phase !== 'collapse') {
+    beginSiege(now);
+  }
+
+  if (!influenceRun) return;
+
+  const run = influenceRun;
+  const occupants = influencePlayersIn();
+
+  if (occupants.length === 0) {
+    if (run.emptySince === 0) run.emptySince = now;
+
+    if (influenceState.phase === 'collapse') {
+      closeBreach('collapse cleared');
+      resetInfluencePoint();
+      persistInfluenceState(true);
+      broadcastInfluenceState();
+      return;
+    }
+
+    if (now - run.emptySince > CAVE_EMPTY_DISPOSE_MS) disposeInfluenceRun();
+    return;
+  }
+
+  run.emptySince = 0;
+
+  if (run.siege) {
+    const collapse = run.siege.mode === 'collapse';
+
+    if (collapse && now - run.collapseStartedAt > INFLUENCE_COLLAPSE_MAX_MS) {
+      closeBreach('collapse timeout');
+      resetInfluencePoint();
+      persistInfluenceState(true);
+      broadcastInfluenceState();
+      return;
+    }
+
+    if (now >= run.siege.nextWaveAt) {
+      if (!collapse && run.siege.wave >= INFLUENCE_CONFIG.siegeWaves && liveSiegeEnemies(run) === 0) {
+        endSiege(run);
+      } else if (!collapse && run.siege.wave >= INFLUENCE_CONFIG.siegeWaves) {
+        run.siege.nextWaveAt = now + 4000;
+      } else {
+        startSiegeWave(run, now);
+      }
+    }
+  }
+
+  updateInfluenceCapture(run, occupants, now);
+  influenceRespawnAmbient(run, occupants, now);
+  repairCrystal(now);
+
+  for (const enemy of run.enemies.values()) {
+    if (!enemy.alive) continue;
+    const cfg = ENEMY_TYPES[enemy.type];
+
+    if (enemy.id === run.bossId) {
+      if (cfg.regenPerSecond && cfg.arena) regenerateWardBoss(enemy, cfg, occupants, now);
+      driveConfessor(occupants, enemy, cfg, now);
+    } else if (cfg.ranged) {
+      driveWardHerald(occupants, enemy, cfg, now);
+    } else {
+      driveWardEnemy(occupants, enemy, cfg, now);
+    }
+
+    enemy.positionHistory.push({ position: [...enemy.position], time: now });
+    enemy.positionHistory = enemy.positionHistory.filter((p) => now - p.time < 1000);
+  }
+
+  for (const player of occupants) {
+    safeSend(player.ws, { type: 'enemyState', enemies: serializeWardEnemies(run, player) });
+  }
+}
+
+function regenerateWardBoss(enemy, cfg, occupants, now) {
+  if (enemy.health >= enemy.maxHealth) return;
+  if (now - (enemy.lastHitAt || 0) < cfg.regenIdleMs) return;
+
+  const arena = cfg.arena;
+  for (const player of occupants) {
+    if (!player.alive) continue;
+    if (Math.hypot(player.position[0] - arena.x, player.position[2] - arena.z) <= arena.radius) return;
+  }
+
+  const healed = Math.min(
+    enemy.maxHealth - enemy.health,
+    Math.ceil((cfg.regenPerSecond * INFLUENCE_TICK_MS) / 1000)
+  );
+  if (healed <= 0) return;
+
+  enemy.health += healed;
+  enemy.provokedBy = null;
+  enemy.provokedUntil = 0;
+
+  if (now - (enemy.regenBroadcastAt || 0) < 500) return;
+  enemy.regenBroadcastAt = now;
+
+  broadcastToLocation(
+    INFLUENCE_LOCATION_ID,
+    { type: 'enemyDamaged', id: enemy.id, health: enemy.health, attackerId: null, point: enemy.position, abilityId: null }
+  );
+}
+
+const INFLUENCE_ENTRY_DENIED = {
+  closed: 'g.err.influence.closed',
+  solo: 'g.err.influence.factionOnly',
+  full: 'g.err.influence.full',
+  ownerFull: 'g.err.influence.ownerFull',
+  collapsing: 'g.err.influence.collapsing',
+  fee: 'g.err.influence.fee',
+  payment: 'g.err.influence.payment',
+};
+
+function playerInfluenceFaction(player) {
+  if (!player.factions?.length) return null;
+
+  const displayed = player.factions.find((f) => f.isDisplayed) || player.factions[0];
+  if (!displayed) return null;
+
+  return {
+    id: displayed.id,
+    name: displayed.name || 'Faction',
+    symbol: displayed.symbol || null,
+    image: displayed.image || null,
+  };
+}
+
+function influenceEntryVerdict(player) {
+  if (!influenceOpen()) return { ok: false, reason: 'closed' };
+  if (influenceState.status === 'collapsing') return { ok: false, reason: 'collapsing' };
+
+  const faction = playerInfluenceFaction(player);
+  if (!faction) return { ok: false, reason: 'solo' };
+
+  const occupants = influencePlayersIn(player.id);
+  if (occupants.length >= INFLUENCE_CONFIG.capacity) return { ok: false, reason: 'full' };
+
+  if (influenceState.ownerFactionId && faction.id === influenceState.ownerFactionId) {
+    if (influenceOwnerCount() >= INFLUENCE_CONFIG.ownerCapacity) return { ok: false, reason: 'ownerFull' };
+  }
+
+  const owned = influenceState.ownerFactionId !== null;
+  const isOwner = owned && faction.id === influenceState.ownerFactionId;
+  const chargeable = owned && !isOwner && influence.feeIsPayable(influenceState);
+
+  return {
+    ok: true,
+    faction,
+    fee: chargeable
+      ? {
+        currency: influenceState.feeCurrency,
+        amount: influenceState.feeAmount,
+        tokenCa: influenceState.feeTokenCa,
+        wallet: influenceState.feeWallet,
+      }
+      : null,
+  };
+}
+
+function sendInfluenceGate(player) {
+  const verdict = influenceEntryVerdict(player);
+
+  safeSend(player.ws, {
+    type: 'influenceGate',
+    allowed: verdict.ok,
+    reason: verdict.ok ? null : verdict.reason,
+    messageKey: verdict.ok ? null : INFLUENCE_ENTRY_DENIED[verdict.reason] || null,
+    fee: verdict.ok ? verdict.fee : null,
+    factionId: verdict.ok ? verdict.faction.id : null,
+    factionName: verdict.ok ? verdict.faction.name : null,
+    ownerFactionId: influenceState.ownerFactionId,
+    ownerFactionName: influenceState.ownerFactionName,
+    occupants: influencePlayersIn().length,
+    capacity: INFLUENCE_CONFIG.capacity,
+    phase: influenceState.phase,
+  });
+}
+
+function onlinePlayerByWallet(wallet) {
+  if (!wallet) return null;
+
+  let found = null;
+  players.forEach((p) => {
+    if (found) return;
+    if (p.authenticated && p.wallet === wallet) found = p;
+  });
+  return found;
+}
+
+async function chargeInfluenceEntry(player, fee, tx) {
+  if (!fee) return { ok: true, paid: 0 };
+
+  if (fee.currency === 'ash') {
+    const amount = Math.ceil(fee.amount);
+    if (player.ash < amount) return { ok: false, reason: 'fee' };
+
+    const recipient = onlinePlayerByWallet(influenceState.feeWallet);
+
+    const result = await callInternalApi('/api/internal/game/influence-entry', {
+      userId: player.userId,
+      gameId: player.gameId,
+      wallet: player.wallet,
+      currency: 'ash',
+      amount,
+      recipientWallet: influenceState.feeWallet,
+      recipientOnline: !!recipient,
+      factionId: influenceState.ownerFactionId,
+    }).catch((err) => {
+      console.error('[Influence] ash entry error:', err.message);
+      return null;
+    });
+
+    if (!result?.success) return { ok: false, reason: 'payment' };
+
+    player.ash -= amount;
+    player.economyChangedAt = Date.now();
+    persistPlayer(player);
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+
+    if (recipient) {
+      recipient.ash += amount;
+      recipient.economyChangedAt = Date.now();
+      persistPlayer(recipient);
+      safeSend(recipient.ws, { type: 'inventoryUpdate', inventory: recipient.inventory, ash: recipient.ash, placeables: recipient.placeables });
+      safeSend(recipient.ws, { type: 'influenceToll', amount, currency: 'ash', payer: player.nickname });
+    }
+
+    return { ok: true, paid: amount };
+  }
+
+  if (typeof tx !== 'string' || tx.length < 32) return { ok: false, reason: 'payment' };
+
+  const result = await callInternalApi('/api/internal/game/influence-entry', {
+    userId: player.userId,
+    gameId: player.gameId,
+    wallet: player.wallet,
+    currency: fee.currency,
+    amount: fee.amount,
+    tokenCa: fee.tokenCa,
+    recipientWallet: influenceState.feeWallet,
+    recipientOnline: !!onlinePlayerByWallet(influenceState.feeWallet),
+    factionId: influenceState.ownerFactionId,
+    tx,
+  }).catch((err) => {
+    console.error('[Influence] onchain entry error:', err.message);
+    return null;
+  });
+
+  if (!result?.success) return { ok: false, reason: 'payment' };
+
+  const recipient = onlinePlayerByWallet(influenceState.feeWallet);
+  if (recipient) {
+    safeSend(recipient.ws, {
+      type: 'influenceToll',
+      amount: fee.amount,
+      currency: fee.currency,
+      payer: player.nickname,
+    });
+  }
+
+  return { ok: true, paid: fee.amount, tx };
+}
+
+function enterInfluence(player) {
+  const run = ensureInfluenceRun();
+  const faction = playerInfluenceFaction(player);
+
+  player.influenceEntryToken = 0;
+
+  player.influenceFactionId = faction?.id ?? null;
+  player.influenceFactionName = faction?.name ?? null;
+  player.influenceLootTaken = 0;
+  player.influenceEnteredAt = Date.now();
+
+  grantSpawnProtection(player, INFLUENCE_CONFIG.spawnProtectionMs);
+
+  safeSend(player.ws, { type: 'enemyState', enemies: serializeWardEnemies(run, player) });
+  safeSend(player.ws, buildInfluenceStatePayload());
+  safeSend(player.ws, {
+    type: 'influenceLootState',
+    opened: Array.from(run.containers.entries())
+      .filter(([, entry]) => entry.openedBy.has(player.userId))
+      .map(([id]) => id),
+    taken: player.influenceLootTaken,
+    perVisit: INFLUENCE_CONFIG.lootPerVisit,
+  });
+
+  broadcastInfluenceState();
+}
+
+function leaveInfluence(player) {
+  safeSend(player.ws, { type: 'enemyState', enemies: [] });
+
+  const run = influenceRun;
+  player.influenceFactionId = null;
+  player.influenceFactionName = null;
+
+  if (run?.capture?.playerId === player.id) {
+    run.capture = null;
+    broadcastCaptureState(null);
+  }
+
+  broadcastInfluenceState();
+}
+
+function influenceCrystalPrompt(player) {
+  const run = influenceRun;
+  if (!run) return;
+
+  const distance = Math.hypot(
+    player.position[0] - INFLUENCE_CRYSTAL.x,
+    player.position[2] - INFLUENCE_CRYSTAL.z
+  );
+
+  const manageable = influenceState.ownerFactionId
+    && player.influenceFactionId === influenceState.ownerFactionId
+    && player.factions?.some((f) => f.id === influenceState.ownerFactionId
+      && (f.founderUserId === player.userId || f.verifiedCreatorUserId === player.userId));
+
+  safeSend(player.ws, {
+    type: 'influenceCrystalPanel',
+    inRange: distance <= INFLUENCE_CONFIG.captureRadius,
+    canCapture: influenceState.bossDefeated
+      && influenceState.phase !== 'collapse'
+      && !!player.influenceFactionId
+      && player.influenceFactionId !== influenceState.ownerFactionId,
+    canManage: !!manageable,
+    bossDefeated: influenceState.bossDefeated,
+    ownerFactionId: influenceState.ownerFactionId,
+    ownerFactionName: influenceState.ownerFactionName,
+    feeCurrency: influenceState.feeCurrency,
+    feeAmount: influenceState.feeAmount,
+    crystalHealth: influenceState.crystalHealth,
+    crystalMaxHealth: INFLUENCE_CONFIG.crystalMaxHealth,
+    nextSiegeAt: influenceState.nextSiegeAt,
+    captureMs: INFLUENCE_CONFIG.captureMs,
+  });
+}
+
+function startInfluenceCapture(player) {
+  const run = influenceRun;
+  if (!run) return;
+  if (!influenceState.bossDefeated) {
+    safeSend(player.ws, { type: 'error', message: 'The crystal is still sealed.', messageKey: 'g.err.influence.sealed' });
+    return;
+  }
+  if (influenceState.phase === 'collapse') return;
+  if (!player.influenceFactionId) {
+    safeSend(player.ws, { type: 'error', message: 'Only faction members can bind the crystal.', messageKey: 'g.err.influence.factionOnly' });
+    return;
+  }
+  if (player.influenceFactionId === influenceState.ownerFactionId) return;
+
+  const distance = Math.hypot(
+    player.position[0] - INFLUENCE_CRYSTAL.x,
+    player.position[2] - INFLUENCE_CRYSTAL.z
+  );
+  if (distance > INFLUENCE_CONFIG.captureRadius) return;
+
+  if (run.capture && run.capture.factionId === player.influenceFactionId) {
+    run.capture.playerId = player.id;
+    return;
+  }
+
+  const faction = playerInfluenceFaction(player);
+  const now = Date.now();
+
+  run.capture = {
+    factionId: player.influenceFactionId,
+    factionName: faction?.name ?? player.influenceFactionName ?? 'Faction',
+    factionSymbol: faction?.symbol ?? null,
+    factionImage: faction?.image ?? null,
+    playerId: player.id,
+    startedAt: now,
+    until: now + INFLUENCE_CONFIG.captureMs,
+    contestedUntil: 0,
+    lastBroadcast: 0,
+  };
+
+  broadcastCaptureState(run.capture);
+}
+
+function cancelInfluenceCapture(player) {
+  const run = influenceRun;
+  if (!run?.capture) return;
+  if (run.capture.playerId !== player.id) return;
+
+  run.capture = null;
+  broadcastCaptureState(null);
+}
+
+async function setInfluenceFee(player, data) {
+  if (!influenceState.ownerFactionId) return;
+  if (player.influenceFactionId !== influenceState.ownerFactionId) return;
+
+  const faction = player.factions?.find((f) => f.id === influenceState.ownerFactionId);
+  if (!faction) return;
+  if (faction.founderUserId !== player.userId && faction.verifiedCreatorUserId !== player.userId) {
+    safeSend(player.ws, { type: 'error', message: 'Only the faction head can set this.', messageKey: 'g.err.influence.leaderOnly' });
+    return;
+  }
+
+  const currency = typeof data.currency === 'string' && influence.FEE_CURRENCIES.has(data.currency)
+    ? data.currency
+    : 'none';
+  const amount = Math.max(0, Math.min(INFLUENCE_CONFIG.entryFeeMax, Math.floor(Number(data.amount) || 0)));
+
+  if (currency === 'faction' && !faction.tokenCa) {
+    safeSend(player.ws, { type: 'error', message: 'This faction has no token.', messageKey: 'g.err.influence.noToken' });
+    return;
+  }
+
+  influenceState.feeCurrency = amount > 0 ? currency : 'none';
+  influenceState.feeAmount = influenceState.feeCurrency === 'none' ? 0 : amount;
+  influenceState.feeTokenCa = currency === 'faction' ? faction.tokenCa : null;
+  influenceState.feeWallet = faction.verifiedCreatorWallet || faction.founderWallet || null;
+
+  persistInfluenceState(true);
+  broadcastInfluenceState();
+  influenceCrystalPrompt(player);
+
+  console.log(`[Influence] ${influenceState.ownerFactionName} set entry ${influenceState.feeCurrency} ${influenceState.feeAmount}`);
+}
+
+async function openInfluenceContainer(player, containerId) {
+  const run = influenceRun;
+  if (!run) return;
+  if (typeof containerId !== 'string') return;
+
+  const container = run.containers.get(containerId);
+  if (!container) return;
+
+  const spot = influenceGeometry.LOOT.find((entry) => entry.id === containerId);
+  if (!spot) return;
+
+  const distance = Math.hypot(player.position[0] - spot.x, player.position[2] - spot.z);
+  if (distance > INFLUENCE_CONFIG.lootReach + 1.5) return;
+
+  const now = Date.now();
+  if (container.reopenAt > 0 && now >= container.reopenAt) {
+    container.openedBy.clear();
+    container.reopenAt = 0;
+  }
+
+  if (container.openedBy.has(player.userId)) {
+    safeSend(player.ws, { type: 'error', message: 'Already searched.', messageKey: 'g.err.chestEmpty' });
+    return;
+  }
+
+  if (player.influenceLootTaken >= INFLUENCE_CONFIG.lootPerVisit) {
+    safeSend(player.ws, { type: 'error', message: 'You cannot carry more from this run.', messageKey: 'g.err.influence.lootCap' });
+    return;
+  }
+
+  container.openedBy.add(player.userId);
+  if (container.reopenAt === 0) container.reopenAt = now + INFLUENCE_CONFIG.lootReopenMs;
+  player.influenceLootTaken += 1;
+
+  const rare = spot.tier >= 2;
+  const ash = rare
+    ? 130 + crypto.randomInt(0, 110)
+    : 45 + crypto.randomInt(0, 45);
+
+  const companionFragments = crypto.randomInt(0, 100) < (rare ? 62 : 26)
+    ? (rare ? 12 + crypto.randomInt(0, 14) : 5 + crypto.randomInt(0, 8))
+    : 0;
+  const cosmeticFragments = crypto.randomInt(0, 100) < (rare ? 62 : 26)
+    ? (rare ? 12 + crypto.randomInt(0, 14) : 5 + crypto.randomInt(0, 8))
+    : 0;
+
+  player.ash += ash;
+  player.economyChangedAt = now;
+  persistPlayer(player);
+
+  if (companionFragments > 0) await grantCanyonBossFragments(player, companionFragments);
+  if (cosmeticFragments > 0) await grantCanyonCosmeticFragments(player, cosmeticFragments);
+
+  broadcastToLocation(INFLUENCE_LOCATION_ID, { type: 'influenceContainerOpened', containerId, playerId: player.id });
+
+  safeSend(player.ws, {
+    type: 'influenceLootResult',
+    containerId,
+    tier: spot.tier,
+    ash,
+    companionFragments,
+    cosmeticFragments,
+    taken: player.influenceLootTaken,
+    perVisit: INFLUENCE_CONFIG.lootPerVisit,
+  });
+  safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+}
+
+async function rewardConfessorKill(killer) {
+  const occupants = influencePlayersIn();
+
+  for (const player of occupants) {
+    if (!player.userId) continue;
+
+    const ash = player.id === killer?.id ? 4000 : 2200;
+    player.ash += ash;
+    player.economyChangedAt = Date.now();
+    persistPlayer(player);
+
+    await grantCanyonBossFragments(player, 45 + crypto.randomInt(0, 30));
+    await grantCanyonCosmeticFragments(player, 45 + crypto.randomInt(0, 30));
+    grantXp(player, 900, 'influence_boss');
+
+    safeSend(player.ws, { type: 'influenceBossReward', ash, killer: player.id === killer?.id });
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+  }
+}
+
+function onConfessorDefeated(killer) {
+  influenceState.bossDefeated = true;
+  influenceState.phase = influenceState.ownerFactionId ? 'owned' : 'claimable';
+
+  if (influenceRun) influenceRun.bossId = null;
+
+  console.log('[Influence] The Pale Confessor has fallen');
+  persistInfluenceState(true);
+  broadcastInfluenceState();
+
+  broadcastToLocation(INFLUENCE_LOCATION_ID, {
+    type: 'influenceBossDown',
+    killerFactionId: killer?.influenceFactionId ?? null,
+    killerFactionName: killer?.influenceFactionName ?? null,
+  });
+
+  rewardConfessorKill(killer).catch((err) => console.error('[Influence] boss reward error:', err.message));
+}
+
+function wardRangedAttack(occupants, enemy, cfg, target, distance, now) {
+  processBossImpacts(occupants, enemy, now);
+  processBossPools(occupants, enemy, now);
+
+  if (enemy.cast) {
+    if (now >= enemy.cast.resolveAt) {
+      resolveBossCast(occupants, enemy, enemy.cast, now);
+      enemy.attackCooldowns[enemy.cast.attack.id] = now;
+      enemy.cast = null;
+    }
+    return true;
+  }
+
+  if (!target) return false;
+  if (abilities.isStunned(enemy, now)) return true;
+  if (now - enemy.lastAttackTime < cfg.attackCooldown) return false;
+
+  const attack = pickBossAttack(enemy, cfg, distance, now);
+  if (!attack) return false;
+
+  enemy.lastAttackTime = now;
+  enemy.cast = {
+    attack,
+    resolveAt: now + attack.windup,
+    aim: [target.position[0], 0, target.position[2]],
+  };
+
+  const castMessage = {
+    type: 'bossCast',
+    enemyId: enemy.id,
+    attack: attack.id,
+    windup: attack.windup,
+    aim: enemy.cast.aim,
+    radius: attack.radius,
+  };
+  for (const spectator of occupants) safeSend(spectator.ws, castMessage);
+  return true;
+}
+
+function driveWardHerald(occupants, enemy, cfg, now) {
+  const chosen = wardTargetFor(occupants, enemy, cfg, now);
+  const target = chosen ? chosen.player : null;
+  const distance = chosen ? chosen.dist : Infinity;
+
+  enemy.targetId = target ? target.id : null;
+
+  const casting = wardRangedAttack(occupants, enemy, cfg, target, distance, now);
+
+  if (target) {
+    const drift = distance - cfg.preferredRange;
+    if (!casting && Math.abs(drift) > 3.5) {
+      const speed = Math.abs(drift) > cfg.chaseNearThreshold ? cfg.chaseSpeedFar : cfg.chaseSpeedNear;
+      const step = speed * (INFLUENCE_TICK_MS / 1000) * Math.sign(drift) * enemySpeedMult(enemy, now);
+      cityStepEnemy(enemy, (target.position[0] - enemy.position[0]) * Math.sign(step), (target.position[2] - enemy.position[2]) * Math.sign(step), Math.abs(step));
+    }
+    nudgeIntoCity(enemy.position);
+    return;
+  }
+
+  if (enemy.role === 'siege') {
+    const crystalDistance = Math.hypot(
+      INFLUENCE_CRYSTAL.x - enemy.position[0],
+      INFLUENCE_CRYSTAL.z - enemy.position[2]
+    );
+
+    if (crystalDistance <= INFLUENCE_CRYSTAL_REACH + 4) {
+      attackCrystal(enemy, cfg, now);
+      nudgeIntoCity(enemy.position);
+      return;
+    }
+
+    const step = cfg.chaseSpeedFar * (INFLUENCE_TICK_MS / 1000) * enemySpeedMult(enemy, now);
+    const dir = crystalDirection(enemy);
+    cityStepEnemy(enemy, dir[0], dir[1], step);
+  }
+
+  nudgeIntoCity(enemy.position);
+}
+
+safeInterval(influenceTick, INFLUENCE_TICK_MS);
+safeInterval(pollInfluenceCommands, INFLUENCE_COMMAND_POLL_MS);
+
 
 function isArenaMemberPresent(run, member) {
   if (!member || !member.authenticated) return false;
@@ -5658,7 +7500,7 @@ const CRATE_CONFIG = {
   pickupRadius: 3,
 };
 
-const CRATE_BLOCKED_LOCATIONS = new Set([ARENA_LOCATION_ID, ...EVENT_ROOM_IDS]);
+const CRATE_BLOCKED_LOCATIONS = new Set([ARENA_LOCATION_ID, INFLUENCE_LOCATION_ID, ...EVENT_ROOM_IDS]);
 
 const deathCrates = new Map();
 let nextCrateId = 0;
@@ -6383,7 +8225,8 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
 
   const shared = player.locationId === 'main-world';
   const inCave = player.locationId === CAVE_LOCATION_ID;
-  const broadcastShared = shared || inCave;
+  const inInfluence = player.locationId === INFLUENCE_LOCATION_ID;
+  const broadcastShared = shared || inCave || inInfluence;
   const arenaRun = player.locationId === ARENA_LOCATION_ID ? arena.runForPlayer(player.id) : null;
   const damagedMessage = {
     type: 'enemyDamaged',
@@ -6398,7 +8241,7 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
   else if (broadcastShared) broadcastToLocation(player.locationId, damagedMessage, null, player.instance);
   else safeSend(player.ws, damagedMessage);
 
-  if (inCave) {
+  if (inCave || inInfluence) {
     enemy.lastHitAt = now;
     const cfg = ENEMY_TYPES[enemy.type];
     if (cfg.arena) {
@@ -6436,6 +8279,20 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
     enemy.pools = [];
     enemy.respawnAt = Date.now() + WARDEN_RESPAWN_MS;
     dropLoot(enemy.position, player.instance, cfg.lootMin, cfg.lootMax);
+    return true;
+  }
+
+  if (inInfluence) {
+    enemy.cast = null;
+    enemy.pendingImpacts = [];
+    enemy.pools = [];
+
+    if (influenceRun && enemy.id === influenceRun.bossId && !influenceState.bossDefeated) {
+      onConfessorDefeated(player);
+    } else if (influenceRun && enemy.role !== 'ambient') {
+      influenceRun.enemies.delete(enemy.id);
+    }
+
     return true;
   }
 
@@ -8540,6 +10397,12 @@ wss.on('connection', (ws) => {
     displayedFactionName: null,
     displayedFactionSymbol: null,
     displayedFactionImage: null,
+    influenceFactionId: null,
+    influenceFactionName: null,
+    influenceEntryToken: 0,
+    influenceLootTaken: 0,
+    influenceEnteredAt: 0,
+    influencePaidAt: 0,
     canyon: {
       inHub: true,
       segment: 1,
@@ -8754,6 +10617,14 @@ wss.on('connection', (ws) => {
         case 'partyDecline': handlePartyDecline(player, data); break;
         case 'partyLeave': handlePartyLeave(player); break;
         case 'partyKick': handlePartyKick(player, data); break;
+        case 'influenceGateQuery': sendInfluenceGate(player); break;
+        case 'influenceEnter': handleInfluenceEnter(player, data); break;
+        case 'influenceLeave': handleInfluenceLeave(player); break;
+        case 'influenceCrystalQuery': influenceCrystalPrompt(player); break;
+        case 'influenceCaptureStart': startInfluenceCapture(player); break;
+        case 'influenceCaptureStop': cancelInfluenceCapture(player); break;
+        case 'influenceFee': setInfluenceFee(player, data); break;
+        case 'influenceLoot': openInfluenceContainer(player, data.containerId); break;
         case 'arenaStart': handleArenaStart(player); break;
         case 'arenaJoin': handleArenaJoin(player); break;
         case 'arenaLeave': handleArenaLeave(player); break;
@@ -8885,6 +10756,15 @@ wss.on('connection', (ws) => {
     removePlayerZone(player);
     clearPlayerAbilityWorld(player.id);
     applyPartyDeparture(party.forgetPlayer(player.id), 'disbanded');
+
+    if (player.locationId === INFLUENCE_LOCATION_ID) {
+      if (influenceRun?.capture?.playerId === player.id) {
+        influenceRun.capture = null;
+        broadcastCaptureState(null);
+      }
+      player.influenceFactionId = null;
+      setTimeout(broadcastInfluenceState, 0);
+    }
 
     const leavingRun = arena.runForPlayer(player.id);
     if (leavingRun) {
@@ -9277,6 +11157,8 @@ wss.on('connection', (ws) => {
     if (player.locationId === GALAXY_LOCATION_ID) {
       safeSend(ws, { type: 'factionGatesState', gates: displayedFactionGatesList, accountCount });
     }
+
+    safeSend(ws, buildInfluenceStatePayload());
 
     sendShardState(player);
 
@@ -12710,6 +14592,68 @@ wss.on('connection', (ws) => {
     persistPlayer(player);
   }
 
+
+  async function handleInfluenceEnter(player, data) {
+    if (player.locationId === INFLUENCE_LOCATION_ID) return;
+
+    if (player.locationId !== GALAXY_LOCATION_ID) {
+      safeSend(player.ws, { type: 'error', message: 'You are not at the breach.', messageKey: 'g.err.influence.notAtBreach' });
+      return;
+    }
+
+    const breach = influenceState.breach;
+    const reach = Math.hypot(
+      player.position[0] - breach.x,
+      player.position[2] - breach.z
+    );
+    const lift = Math.abs(player.position[1] - breach.y);
+
+    if (!influenceOpen() || reach > BREACH_INTERACT_RANGE || lift > BREACH_INTERACT_RANGE) {
+      safeSend(player.ws, { type: 'error', message: 'You are not at the breach.', messageKey: 'g.err.influence.notAtBreach' });
+      return;
+    }
+
+    const verdict = influenceEntryVerdict(player);
+    if (!verdict.ok) {
+      safeSend(player.ws, {
+        type: 'error',
+        message: 'You cannot enter the ward.',
+        messageKey: INFLUENCE_ENTRY_DENIED[verdict.reason] || 'g.err.influence.closed',
+      });
+      sendInfluenceGate(player);
+      return;
+    }
+
+    if (verdict.fee) {
+      const charge = await chargeInfluenceEntry(player, verdict.fee, data.tx);
+      if (!charge.ok) {
+        safeSend(player.ws, {
+          type: 'error',
+          message: 'Entry payment failed.',
+          messageKey: INFLUENCE_ENTRY_DENIED[charge.reason] || 'g.err.influence.payment',
+        });
+        sendInfluenceGate(player);
+        return;
+      }
+      player.influencePaidAt = Date.now();
+    }
+
+    player.influenceEntryToken = Date.now();
+    await handleLocationChange(player, { locationId: INFLUENCE_LOCATION_ID });
+  }
+
+  function handleInfluenceLeave(player) {
+    if (player.locationId !== INFLUENCE_LOCATION_ID) return;
+
+    if (influenceState.phase === 'collapse') {
+      safeSend(player.ws, { type: 'error', message: 'The tear has sealed shut.', messageKey: 'g.err.influence.sealedIn' });
+      return;
+    }
+
+    player.influenceEntryToken = 0;
+    handleLocationChange(player, { locationId: GALAXY_LOCATION_ID });
+  }
+
   async function handleLocationChange(player, data) {
     if (typeof data.locationId !== 'string') return;
 
@@ -12720,6 +14664,12 @@ wss.on('connection', (ws) => {
 
     if (!isKnownLocationId(data.locationId)) {
       console.log(`[!] Invalid location: ${data.locationId} from ${player.id}`);
+      sendLocationSync(player);
+      return;
+    }
+
+    if (data.locationId === INFLUENCE_LOCATION_ID && !player.influenceEntryToken) {
+      safeSend(player.ws, { type: 'error', message: 'You cannot enter the ward.', messageKey: 'g.err.influence.closed' });
       sendLocationSync(player);
       return;
     }
@@ -12885,6 +14835,14 @@ wss.on('connection', (ws) => {
       enterCave(player);
     }
 
+    if (oldLocation === INFLUENCE_LOCATION_ID) {
+      leaveInfluence(player);
+    }
+
+    if (data.locationId === INFLUENCE_LOCATION_ID) {
+      enterInfluence(player);
+    }
+
     if (oldLocation === grinder.GRINDER_CONFIG.locationId) {
       leaveGrinder(player);
     }
@@ -12896,6 +14854,8 @@ wss.on('connection', (ws) => {
     if (data.locationId === GALAXY_LOCATION_ID) {
       safeSend(ws, { type: 'factionGatesState', gates: displayedFactionGatesList, accountCount });
     }
+
+    safeSend(ws, buildInfluenceStatePayload());
 
     if (isOwnRoom(player)) sendStorageState(player);
     sendCrateState(player);
