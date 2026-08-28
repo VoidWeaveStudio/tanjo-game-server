@@ -6,6 +6,7 @@ const https = require('https');
 const crypto = require('crypto');
 const worldTerrain = require('./worldTerrain');
 const { FACTION_TASKS, FACTION_TASKS_BY_KEY } = require('./factionTasks');
+const { FACTION_BOOST_EFFECTS } = require('./factionBoosts');
 const {
   QUEST_LISTING_FEE_ASH,
   QUEST_MIN_SLOTS,
@@ -3059,6 +3060,13 @@ function respawnOptionsFor(player) {
 function damagePlayerByCanyonEnemy(player, enemy) {
   applyPlayerDamage(player, enemy.attackDamage * enemyDamageOutputMult(enemy, Date.now()), {
     attackerId: enemy.id,
+    broadcast: false,
+  });
+}
+
+function applyTurretDamage(player, damage) {
+  applyPlayerDamage(player, damage, {
+    attackerId: 'faction-turret',
     broadcast: false,
   });
 }
@@ -7199,6 +7207,10 @@ function isBuildIndex(value, max) {
   return Number.isInteger(value) && value >= 0 && value <= max;
 }
 
+function isBuildCell(value) {
+  return Number.isInteger(value) && value >= -ROOM_BUILD_CELL_MAX && value <= ROOM_BUILD_CELL_MAX;
+}
+
 function sanitizeRoomBuildOp(op) {
   if (!op || typeof op !== 'object') return null;
 
@@ -7206,7 +7218,7 @@ function sanitizeRoomBuildOp(op) {
     const raw = op.piece;
     if (!raw || typeof raw !== 'object') return null;
     if (typeof raw.t !== 'string' || raw.t.length === 0 || raw.t.length > ROOM_BUILD_TYPE_MAX) return null;
-    if (!isBuildIndex(raw.x, ROOM_BUILD_CELL_MAX) || !isBuildIndex(raw.z, ROOM_BUILD_CELL_MAX)) return null;
+    if (!isBuildCell(raw.x) || !isBuildCell(raw.z)) return null;
     if (!isBuildIndex(raw.l, ROOM_BUILD_LEVEL_MAX) || !isBuildIndex(raw.r, 3)) return null;
 
     const piece = { t: raw.t, x: raw.x, z: raw.z, l: raw.l, r: raw.r };
@@ -7781,6 +7793,7 @@ function weaponConfigFor(player) {
 function computeCombatStats(player) {
   const stats = skills.computeBuildStats(player.progression.skills);
   const percent = (key) => (stats.percent[key] || 0) / 100;
+  const boost = (effect) => playerBoostMult(player, effect);
 
   const isStaff = weaponIdFor(player) === 'staff';
   const damageStat = isStaff ? 'spellDamage' : 'weaponDamage';
@@ -7789,7 +7802,7 @@ function computeCombatStats(player) {
   return {
     stats,
     weapon: isStaff ? 'staff' : 'rifle',
-    maxHealth: Math.round(skills.statValue(stats, 'maxHealth', BASE_MAX_HEALTH)),
+    maxHealth: Math.round(skills.statValue(stats, 'maxHealth', BASE_MAX_HEALTH) * boost('maxHealth')),
     enemyDamage: skills.statValue(stats, damageStat, PLAYER_WEAPON_DAMAGE_TO_ENEMY) * weaponMult,
     pvpDamage: skills.statValue(stats, damageStat, BASE_PVP_DAMAGE) * weaponMult,
     damageTakenMult: Math.max(0.2, 1 + percent('damageTaken')),
@@ -7797,12 +7810,12 @@ function computeCombatStats(player) {
     damageVsUnshielded: Math.max(0, percent('damageVsUnshielded')),
     magSize: Math.max(1, Math.round(skills.statValue(stats, 'magSize', WEAPON_CONFIG.maxAmmo))),
     reloadMs: Math.max(400, Math.round(WEAPON_CONFIG.reloadDurationMs / (1 + percent('reloadSpeed')))),
-    moveSpeedMult: Math.max(1, 1 + percent('moveSpeed')),
+    moveSpeedMult: Math.max(1, 1 + percent('moveSpeed')) * boost('moveSpeed'),
     maxEnergy: Math.round(skills.statValue(stats, 'maxEnergy', progression.ENERGY.base)),
     energyRegen: skills.statValue(stats, 'energyRegen', progression.ENERGY.regenPerSecond),
     healOnKill: stats.add.healOnKill || 0,
     energyOnKill: stats.add.energyOnKill || 0,
-    lootMult: Math.max(1, 1 + percent('lootBonus')),
+    lootMult: Math.max(1, 1 + percent('lootBonus')) * boost('loot'),
     shieldStrength: stats.add.shieldStrength || 0,
     lowHealthDamageTakenMult: Math.max(0.2, 1 + percent('lowHealthDamageTaken')),
     lowHealthThreshold: stats.set.lowHealthThreshold || 0,
@@ -7938,7 +7951,7 @@ function isBossType(type) {
 function grantXp(player, amount, source) {
   if (!player.authenticated) return 0;
 
-  const gain = Math.max(0, Math.floor(amount));
+  const gain = Math.max(0, Math.floor(amount * playerBoostMult(player, 'xp')));
   if (gain <= 0) return 0;
 
   const state = player.progression;
@@ -8037,6 +8050,813 @@ async function hydrateFactionTaskState(factionId, gameId) {
   return state;
 }
 
+
+const factionTreasuryCache = new Map();
+
+function applyTreasuryBalance(factionId, balance) {
+  if (!balance) return;
+
+  const next = {
+    ash: Math.max(0, Math.floor(Number(balance.ash) || 0)),
+    companionFragments: Math.max(0, Math.floor(Number(balance.companionFragments) || 0)),
+    cosmeticFragments: Math.max(0, Math.floor(Number(balance.cosmeticFragments) || 0)),
+  };
+
+  factionTreasuryCache.set(factionId, next);
+
+  for (const player of players.values()) {
+    if (!player.authenticated) continue;
+    const membership = player.factions?.find((f) => f.id === factionId);
+    if (!membership) continue;
+
+    membership.treasuryAsh = next.ash;
+    membership.treasuryCompanionFragments = next.companionFragments;
+    membership.treasuryCosmeticFragments = next.cosmeticFragments;
+  }
+
+  broadcastToFaction(factionId, {
+    type: 'factionTreasury',
+    factionId,
+    ash: next.ash,
+    companionFragments: next.companionFragments,
+    cosmeticFragments: next.cosmeticFragments,
+  });
+}
+
+function forgetFactionTreasury(factionId) {
+  factionTreasuryCache.delete(factionId);
+  factionBoostCache.delete(factionId);
+}
+
+const factionBoostCache = new Map();
+
+function applyFactionBoosts(factionId, active) {
+  const now = Date.now();
+  const map = new Map();
+
+  if (Array.isArray(active)) {
+    for (const row of active) {
+      if (!row || typeof row.boostId !== 'string') continue;
+      if (!FACTION_BOOST_EFFECTS[row.boostId]) continue;
+      const expiresAt = Number(row.expiresAt) || 0;
+      if (expiresAt <= now) continue;
+      map.set(row.boostId, expiresAt);
+    }
+  }
+
+  factionBoostCache.set(factionId, map);
+
+  const payload = Array.from(map.entries()).map(([boostId, expiresAt]) => ({ boostId, expiresAt }));
+  broadcastToFaction(factionId, { type: 'factionBoosts', factionId, active: payload });
+
+  for (const player of players.values()) {
+    if (!player.authenticated) continue;
+    if (!player.factions?.some((f) => f.id === factionId)) continue;
+    refreshCombatStats(player);
+    sendProgressionState(player);
+  }
+}
+
+function factionBoostsPayload(factionId) {
+  const map = factionBoostCache.get(factionId);
+  if (!map) return [];
+
+  const now = Date.now();
+  const out = [];
+
+  for (const [boostId, expiresAt] of map) {
+    if (expiresAt <= now) {
+      map.delete(boostId);
+      continue;
+    }
+    out.push({ boostId, expiresAt });
+  }
+
+  return out;
+}
+
+function playerBoostMult(player, effect) {
+  if (!player?.factions?.length) return 1;
+
+  const now = Date.now();
+  let best = 0;
+
+  for (const membership of player.factions) {
+    const map = factionBoostCache.get(membership.id);
+    if (!map) continue;
+
+    for (const [boostId, expiresAt] of map) {
+      if (expiresAt <= now) {
+        map.delete(boostId);
+        continue;
+      }
+      const def = FACTION_BOOST_EFFECTS[boostId];
+      if (!def || def.effect !== effect) continue;
+      if (def.magnitude > best) best = def.magnitude;
+    }
+  }
+
+  return 1 + best;
+}
+
+async function loadFactionBoosts(factionId, gameId) {
+  if (factionBoostCache.has(factionId)) return;
+  factionBoostCache.set(factionId, new Map());
+
+  const result = await callInternalApi('/api/internal/game/faction/boost', {
+    action: 'list',
+    factionId,
+    gameId,
+  }).catch((err) => {
+    console.error('[FactionBoost] list error:', err.message);
+    return null;
+  });
+
+  if (!result?.success) {
+    const placeholder = factionBoostCache.get(factionId);
+    if (placeholder && placeholder.size === 0) factionBoostCache.delete(factionId);
+    return;
+  }
+
+  applyFactionBoosts(factionId, result.active);
+}
+
+function sweepExpiredFactionBoosts() {
+  const now = Date.now();
+  const lapsed = [];
+
+  for (const [factionId, map] of factionBoostCache) {
+    let changed = false;
+
+    for (const [boostId, expiresAt] of map) {
+      if (expiresAt > now) continue;
+      map.delete(boostId);
+      changed = true;
+    }
+
+    if (changed) lapsed.push(factionId);
+  }
+
+  if (lapsed.length === 0) return;
+
+  for (const factionId of lapsed) {
+    broadcastToFaction(factionId, {
+      type: 'factionBoosts',
+      factionId,
+      active: factionBoostsPayload(factionId),
+    });
+  }
+
+  const touched = new Set(lapsed);
+
+  for (const player of players.values()) {
+    if (!player.authenticated) continue;
+    if (!player.factions?.some((f) => touched.has(f.id))) continue;
+    refreshCombatStats(player);
+    sendProgressionState(player);
+  }
+}
+
+safeInterval(sweepExpiredFactionBoosts, 60000);
+const WAR_FLUSH_MS = 2000;
+const WAR_POLL_MS = 30000;
+const FACTION_HEART_Y = 3.4;
+const FACTION_HEART_REACH = 300;
+const WAR_HEART_REGEN_PER_SEC = 60;
+const WAR_HEART_REGEN_DELAY_MS = 8000;
+
+const WAR_NEUTRALITY_ASH = 5000;
+
+const activeWars = new Map();
+const warByFactionId = new Map();
+const warSides = new Map();
+const warPendingDamage = new Map();
+const warLastHitAt = new Map();
+
+let lastKnownGameId = null;
+let warFlushAt = 0;
+let warPollAt = 0;
+
+function rememberGameId(gameId) {
+  if (typeof gameId === 'string' && gameId.length > 0) lastKnownGameId = gameId;
+}
+
+function warErrorKey(error) {
+  switch (error) {
+    case 'no_war_access': return 'g.err.faction.noWarAccess';
+    case 'level_too_low': return 'g.err.faction.warLevelTooLow';
+    case 'on_cooldown': return 'g.err.faction.warCooldown';
+    case 'already_at_war': return 'g.err.faction.alreadyAtWar';
+    case 'insufficient': return 'g.err.faction.treasuryShort';
+    case 'head_only': return 'g.err.faction.headOnly';
+    case 'war_over': return 'g.err.faction.warOver';
+    default: return 'g.err.faction.warFailed';
+  }
+}
+
+function warSidePayload(war) {
+  return {
+    id: war.id,
+    declarerFactionId: war.declarerFactionId,
+    defenderFactionId: war.defenderFactionId,
+    declarerName: war.declarerName || null,
+    defenderName: war.defenderName || null,
+    declarerHeartHp: Math.round(war.declarerHeartHp),
+    defenderHeartHp: Math.round(war.defenderHeartHp),
+    heartMaxHp: war.heartMaxHp,
+    stakeAsh: war.stakeAsh,
+    declaredAt: war.declaredAt,
+  };
+}
+
+function warRelationsPayload() {
+  return Array.from(activeWars.values()).map(warSidePayload);
+}
+
+function onlineWarSidesPayload() {
+  const out = [];
+
+  for (const player of players.values()) {
+    if (!player.authenticated || !player.userId) continue;
+
+    for (const war of warsTouching(player)) {
+      if (!isTornByWar(war, player)) continue;
+
+      const key = warSideKey(war.id, player.userId);
+      if (!warSides.has(key)) continue;
+
+      out.push({ id: player.id, warId: war.id, sideFactionId: warSides.get(key) });
+    }
+  }
+
+  return out;
+}
+
+function broadcastWarRelations() {
+  broadcast({
+    type: 'factionWarRelations',
+    wars: warRelationsPayload(),
+    playerSides: onlineWarSidesPayload(),
+  });
+}
+
+function adoptWar(summary) {
+  if (!summary || typeof summary.id !== 'string') return null;
+  if (summary.status && summary.status !== 'active') {
+    dropWar(summary.id);
+    return null;
+  }
+
+  const existing = activeWars.get(summary.id);
+  const war = existing || {
+    id: summary.id,
+    declarerFactionId: summary.declarerFactionId,
+    defenderFactionId: summary.defenderFactionId,
+  };
+
+  war.declarerName = summary.declarerName ?? war.declarerName ?? null;
+  war.defenderName = summary.defenderName ?? war.defenderName ?? null;
+  war.heartMaxHp = summary.heartMaxHp || war.heartMaxHp || 0;
+  war.declarerHeartHp = summary.declarerHeartHp ?? war.declarerHeartHp ?? war.heartMaxHp;
+  war.defenderHeartHp = summary.defenderHeartHp ?? war.defenderHeartHp ?? war.heartMaxHp;
+  war.stakeAsh = summary.stakeAsh ?? war.stakeAsh ?? 0;
+  war.declaredAt = summary.declaredAt ?? war.declaredAt ?? Date.now();
+
+  activeWars.set(war.id, war);
+  warByFactionId.set(war.declarerFactionId, war);
+  warByFactionId.set(war.defenderFactionId, war);
+
+  return war;
+}
+
+function dropWar(warId) {
+  const war = activeWars.get(warId);
+  if (!war) return;
+
+  for (const key of Array.from(warSides.keys())) {
+    if (key.startsWith(warId + ':')) warSides.delete(key);
+  }
+
+  activeWars.delete(warId);
+  warPendingDamage.delete(warId);
+  warLastHitAt.delete(warId + ':' + war.declarerFactionId);
+  warLastHitAt.delete(warId + ':' + war.defenderFactionId);
+
+  if (warByFactionId.get(war.declarerFactionId) === war) warByFactionId.delete(war.declarerFactionId);
+  if (warByFactionId.get(war.defenderFactionId) === war) warByFactionId.delete(war.defenderFactionId);
+}
+
+async function refreshWars(gameId) {
+  rememberGameId(gameId);
+  if (!lastKnownGameId || !CONFIG.internalSecret) return;
+
+  const result = await callInternalApi('/api/internal/game/faction/war', {
+    action: 'list',
+    gameId: lastKnownGameId,
+  }).catch((err) => {
+    console.error('[FactionWar] list error:', err.message);
+    return null;
+  });
+
+  if (!result?.success || !Array.isArray(result.wars)) return;
+
+  const seen = new Set();
+  for (const summary of result.wars) {
+    const war = adoptWar(summary);
+    if (war) seen.add(war.id);
+  }
+
+  for (const warId of Array.from(activeWars.keys())) {
+    if (!seen.has(warId)) dropWar(warId);
+  }
+
+  await refreshWarSides();
+  broadcastWarRelations();
+  promptTornPlayers();
+}
+
+async function refreshWarSides() {
+  if (!lastKnownGameId || activeWars.size === 0) {
+    warSides.clear();
+    return;
+  }
+
+  const result = await callInternalApi('/api/internal/game/faction/war-side', {
+    action: 'list',
+    gameId: lastKnownGameId,
+  }).catch((err) => {
+    console.error('[FactionWar] side list error:', err.message);
+    return null;
+  });
+
+  if (!result?.success || !Array.isArray(result.sides)) return;
+
+  warSides.clear();
+  for (const row of result.sides) {
+    if (!row || typeof row.warId !== 'string' || typeof row.userId !== 'string') continue;
+    warSides.set(warSideKey(row.warId, row.userId), row.sideFactionId || null);
+  }
+}
+
+function promptTornPlayers() {
+  for (const player of players.values()) {
+    if (!player.authenticated) continue;
+    sendWarChoicePrompt(player);
+  }
+}
+
+function sendWarChoicePrompt(player) {
+  const pending = pendingWarChoices(player);
+  if (pending.length === 0) return;
+
+  safeSend(player.ws, {
+    type: 'factionWarSidePrompt',
+    choices: pending.map((war) => ({
+      warId: war.id,
+      declarerFactionId: war.declarerFactionId,
+      defenderFactionId: war.defenderFactionId,
+      declarerName: war.declarerName || null,
+      defenderName: war.defenderName || null,
+      neutralityAsh: WAR_NEUTRALITY_ASH,
+    })),
+  });
+}
+
+function playerFactionIds(player) {
+  if (!player?.factions?.length) return [];
+  return player.factions.map((f) => f.id).filter((id) => typeof id === 'string');
+}
+
+function sharesFaction(a, b) {
+  const mine = playerFactionIds(a);
+  if (mine.length === 0) return false;
+
+  const theirs = playerFactionIds(b);
+  if (theirs.length === 0) return false;
+
+  return mine.some((id) => theirs.includes(id));
+}
+
+function warSideKey(warId, userId) {
+  return warId + ':' + userId;
+}
+
+function tornFactionsFor(war, factionIds) {
+  const sides = [];
+  if (factionIds.includes(war.declarerFactionId)) sides.push(war.declarerFactionId);
+  if (factionIds.includes(war.defenderFactionId)) sides.push(war.defenderFactionId);
+  return sides;
+}
+
+function warSideOf(war, player) {
+  if (!player?.userId) return null;
+
+  const factionIds = playerFactionIds(player);
+  const torn = tornFactionsFor(war, factionIds);
+
+  if (torn.length === 0) return null;
+  if (torn.length === 1) return torn[0];
+
+  const chosen = warSides.get(warSideKey(war.id, player.userId));
+  return chosen === undefined ? null : chosen;
+}
+
+function isTornByWar(war, player) {
+  return tornFactionsFor(war, playerFactionIds(player)).length === 2;
+}
+
+function warsTouching(player) {
+  const seen = new Set();
+  const out = [];
+
+  for (const factionId of playerFactionIds(player)) {
+    const war = warByFactionId.get(factionId);
+    if (!war || seen.has(war.id)) continue;
+    seen.add(war.id);
+    out.push(war);
+  }
+
+  return out;
+}
+
+function pendingWarChoices(player) {
+  return warsTouching(player).filter(
+    (war) => isTornByWar(war, player) && !warSides.has(warSideKey(war.id, player.userId))
+  );
+}
+
+function warBetweenFactions(aId, bId) {
+  if (!aId || !bId || aId === bId) return null;
+
+  const war = warByFactionId.get(aId);
+  if (!war) return null;
+
+  const sidesMatch = (war.declarerFactionId === aId && war.defenderFactionId === bId)
+    || (war.defenderFactionId === aId && war.declarerFactionId === bId);
+
+  return sidesMatch ? war : null;
+}
+
+function warBetweenPlayers(a, b) {
+  const mine = playerFactionIds(a);
+  const theirs = playerFactionIds(b);
+
+  for (const aId of mine) {
+    for (const bId of theirs) {
+      const war = warBetweenFactions(aId, bId);
+      if (!war) continue;
+
+      const mySide = warSideOf(war, a);
+      const theirSide = warSideOf(war, b);
+
+      if (!mySide || !theirSide) continue;
+      if (mySide === theirSide) continue;
+
+      return war;
+    }
+  }
+
+  return null;
+}
+
+function inCompetitiveMatch(playerId) {
+  if (grinder.matchOf(playerId)) return true;
+  if (defusal.matchOf(playerId)) return true;
+  return false;
+}
+
+function arePlayersFriendly(a, b) {
+  if (!a || !b || a.id === b.id) return false;
+  if (party.areAllies(a.id, b.id)) return true;
+  if (inCompetitiveMatch(a.id) || inCompetitiveMatch(b.id)) return false;
+  if (warBetweenPlayers(a, b)) return false;
+  return sharesFaction(a, b);
+}
+
+function factionIdOfRoom(locationId) {
+  if (typeof locationId !== 'string' || !locationId.startsWith(FACTION_ROOM_PREFIX)) return null;
+  return locationId.slice(FACTION_ROOM_PREFIX.length) || null;
+}
+
+function heartHpOfWar(war, factionId) {
+  return war.declarerFactionId === factionId ? war.declarerHeartHp : war.defenderHeartHp;
+}
+
+function setHeartHpOfWar(war, factionId, value) {
+  const clamped = Math.max(0, Math.min(war.heartMaxHp, value));
+  if (war.declarerFactionId === factionId) war.declarerHeartHp = clamped;
+  else war.defenderHeartHp = clamped;
+  return clamped;
+}
+
+function broadcastHeartState(war, factionId) {
+  broadcastToLocation(FACTION_ROOM_PREFIX + factionId, {
+    type: 'factionHeartState',
+    warId: war.id,
+    factionId,
+    hp: Math.round(heartHpOfWar(war, factionId)),
+    maxHp: war.heartMaxHp,
+  });
+}
+
+function applyHeartDamage(player, war, ownerFactionId, damage) {
+  const dealt = Math.max(0, Math.round(damage));
+  if (dealt <= 0) return;
+
+  const key = war.id + ':' + ownerFactionId;
+  warLastHitAt.set(key, Date.now());
+
+  setHeartHpOfWar(war, ownerFactionId, heartHpOfWar(war, ownerFactionId) - dealt);
+
+  const pending = warPendingDamage.get(war.id) || new Map();
+  pending.set(ownerFactionId, (pending.get(ownerFactionId) || 0) + dealt);
+  warPendingDamage.set(war.id, pending);
+
+  broadcastHeartState(war, ownerFactionId);
+}
+
+function regenHearts(delta) {
+  const now = Date.now();
+
+  for (const war of activeWars.values()) {
+    for (const factionId of [war.declarerFactionId, war.defenderFactionId]) {
+      const hp = heartHpOfWar(war, factionId);
+      if (hp >= war.heartMaxHp || hp <= 0) continue;
+
+      const lastHit = warLastHitAt.get(war.id + ':' + factionId) || 0;
+      if (now - lastHit < WAR_HEART_REGEN_DELAY_MS) continue;
+
+      const healed = setHeartHpOfWar(war, factionId, hp + WAR_HEART_REGEN_PER_SEC * delta);
+      const pending = warPendingDamage.get(war.id) || new Map();
+      pending.set(factionId, (pending.get(factionId) || 0) - (healed - hp));
+      warPendingDamage.set(war.id, pending);
+    }
+  }
+}
+
+async function flushWarDamage() {
+  if (!lastKnownGameId || warPendingDamage.size === 0) return;
+
+  const batch = Array.from(warPendingDamage.entries());
+  warPendingDamage.clear();
+
+  for (const [warId, byFaction] of batch) {
+    const war = activeWars.get(warId);
+    if (!war) continue;
+
+    for (const [ownerFactionId, amount] of byFaction) {
+      const rounded = Math.round(amount);
+      if (rounded === 0) continue;
+
+      const attackerFactionId = ownerFactionId === war.declarerFactionId
+        ? war.defenderFactionId
+        : war.declarerFactionId;
+
+      const result = await callInternalApi('/api/internal/game/faction/war', {
+        action: 'heartDamage',
+        gameId: lastKnownGameId,
+        warId,
+        factionId: attackerFactionId,
+        userId: war.declaredByUserId || null,
+        damage: rounded,
+      }).catch((err) => {
+        console.error('[FactionWar] heart damage error:', err.message);
+        return null;
+      });
+
+      if (!result?.success) {
+        if (result?.error === 'war_over') dropWar(warId);
+        continue;
+      }
+
+      if (result.war) adoptWar(result.war);
+
+      if (result.winnerFactionId) {
+        announceWarEnd(result.war, result.winnerFactionId, result.spoils);
+        dropWar(warId);
+        broadcastWarRelations();
+      }
+    }
+  }
+}
+
+function announceWarEnd(summary, winnerFactionId, spoils) {
+  if (!summary) return;
+
+  const loserFactionId = winnerFactionId === summary.declarerFactionId
+    ? summary.defenderFactionId
+    : summary.declarerFactionId;
+
+  const payload = {
+    type: 'factionWarEnded',
+    warId: summary.id,
+    winnerFactionId,
+    loserFactionId,
+    endedBy: summary.endedBy || null,
+    spoilsAsh: spoils?.ash || 0,
+    spoilsCompanionFragments: spoils?.companionFragments || 0,
+    spoilsCosmeticFragments: spoils?.cosmeticFragments || 0,
+  };
+
+  broadcastToFaction(winnerFactionId, payload);
+  broadcastToFaction(loserFactionId, payload);
+
+  forgetFactionTreasury(winnerFactionId);
+  forgetFactionTreasury(loserFactionId);
+}
+
+function warTick() {
+  const now = Date.now();
+
+  if (now - warPollAt >= WAR_POLL_MS) {
+    warPollAt = now;
+    refreshWars(lastKnownGameId);
+  }
+
+  if (activeWars.size === 0) return;
+
+  regenHearts(WAR_FLUSH_MS / 1000);
+
+  if (now - warFlushAt >= WAR_FLUSH_MS) {
+    warFlushAt = now;
+    flushWarDamage();
+  }
+}
+
+safeInterval(warTick, WAR_FLUSH_MS);
+const TURRET_TICK_MS = 500;
+const TURRET_RANGE = 34;
+const TURRET_DAMAGE = 16;
+const TURRET_COOLDOWN_MS = 1400;
+const TURRET_AGGRO_MS = 45000;
+const TURRET_REFRESH_MS = 20000;
+
+const factionTurretCache = new Map();
+const turretCooldowns = new Map();
+const bubbleAggressors = new Map();
+
+function aggressorKey(factionId, playerId) {
+  return factionId + ':' + playerId;
+}
+
+function tagBubbleAggressor(attacker, victim) {
+  if (!attacker || !victim || attacker.id === victim.id) return;
+
+  const ownerFactionId = factionIdOfRoom(attacker.locationId);
+  if (!ownerFactionId) return;
+  if (attacker.locationId !== victim.locationId) return;
+
+  if (!playerFactionIds(victim).includes(ownerFactionId)) return;
+  if (playerFactionIds(attacker).includes(ownerFactionId)) return;
+
+  bubbleAggressors.set(aggressorKey(ownerFactionId, attacker.id), Date.now() + TURRET_AGGRO_MS);
+}
+
+function isBubbleAggressor(ownerFactionId, player) {
+  const until = bubbleAggressors.get(aggressorKey(ownerFactionId, player.id));
+  if (!until) return false;
+
+  if (until <= Date.now()) {
+    bubbleAggressors.delete(aggressorKey(ownerFactionId, player.id));
+    return false;
+  }
+
+  return true;
+}
+
+function isTurretTarget(ownerFactionId, player) {
+  if (!player.authenticated || !player.alive) return false;
+
+  const war = warByFactionId.get(ownerFactionId);
+  if (war) {
+    const theirSide = warSideOf(war, player);
+    if (theirSide === ownerFactionId) return false;
+    if (theirSide) return true;
+  }
+
+  if (playerFactionIds(player).includes(ownerFactionId)) return false;
+
+  return isBubbleAggressor(ownerFactionId, player);
+}
+
+async function loadFactionTurrets(factionId, gameId) {
+  const cached = factionTurretCache.get(factionId);
+  const now = Date.now();
+  if (cached && now - cached.at < TURRET_REFRESH_MS) return cached.turrets;
+
+  factionTurretCache.set(factionId, { at: now, turrets: cached?.turrets || [] });
+
+  const result = await callInternalApi('/api/internal/game/faction/turrets', {
+    gameId,
+    factionId,
+  }).catch((err) => {
+    console.error('[FactionTurret] load error:', err.message);
+    return null;
+  });
+
+  if (!result?.success || !Array.isArray(result.turrets)) return cached?.turrets || [];
+
+  factionTurretCache.set(factionId, { at: now, turrets: result.turrets });
+  return result.turrets;
+}
+
+function forgetFactionTurrets(factionId) {
+  factionTurretCache.delete(factionId);
+}
+
+function turretTick() {
+  const now = Date.now();
+  const occupied = new Map();
+
+  for (const player of players.values()) {
+    if (!player.authenticated) continue;
+
+    const ownerFactionId = factionIdOfRoom(player.locationId);
+    if (!ownerFactionId) continue;
+
+    const bucket = occupied.get(ownerFactionId) || [];
+    bucket.push(player);
+    occupied.set(ownerFactionId, bucket);
+  }
+
+  for (const [ownerFactionId, present] of occupied) {
+    const gameId = present[0]?.gameId || lastKnownGameId;
+    if (!gameId) continue;
+
+    const turrets = loadFactionTurretsSync(ownerFactionId, gameId);
+    if (turrets.length === 0) continue;
+
+    const targets = present.filter((player) => isTurretTarget(ownerFactionId, player));
+    if (targets.length === 0) continue;
+
+    for (const turret of turrets) {
+      const readyAt = turretCooldowns.get(turret.id) || 0;
+      if (now < readyAt) continue;
+
+      let best = null;
+      let bestDistance = TURRET_RANGE;
+
+      for (const target of targets) {
+        const [tx, ty, tz] = target.position;
+        const distance = Math.hypot(turret.x - tx, turret.y - ty, turret.z - tz);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          best = target;
+        }
+      }
+
+      if (!best) continue;
+
+      turretCooldowns.set(turret.id, now + TURRET_COOLDOWN_MS);
+      fireTurret(ownerFactionId, turret, best);
+    }
+  }
+}
+
+function loadFactionTurretsSync(factionId, gameId) {
+  const cached = factionTurretCache.get(factionId);
+  if (!cached || Date.now() - cached.at >= TURRET_REFRESH_MS) loadFactionTurrets(factionId, gameId);
+  return cached?.turrets || [];
+}
+
+function fireTurret(ownerFactionId, turret, target) {
+  broadcastToLocation(FACTION_ROOM_PREFIX + ownerFactionId, {
+    type: 'turretFire',
+    turretId: turret.id,
+    from: [turret.x, turret.y, turret.z],
+    to: target.position.slice(),
+  });
+
+  applyTurretDamage(target, TURRET_DAMAGE);
+}
+
+safeInterval(turretTick, TURRET_TICK_MS);
+
+
+
+async function sendFactionLedger(player, factionId) {
+  if (!player.factions?.some((f) => f.id === factionId)) return;
+
+  const result = await callInternalApi('/api/internal/game/faction/treasury', {
+    action: 'ledger',
+    factionId,
+    gameId: player.gameId,
+  }).catch((err) => {
+    console.error('[FactionTreasury] ledger error:', err.message);
+    return null;
+  });
+
+  if (!result?.success) return;
+
+  if (result.treasury) applyTreasuryBalance(factionId, result.treasury);
+
+  safeSend(player.ws, {
+    type: 'factionLedger',
+    factionId,
+    entries: Array.isArray(result.entries) ? result.entries : [],
+  });
+}
+
 async function completeFactionTask(factionId, taskKey, gameId, contributions) {
   factionTaskState.delete(factionId);
 
@@ -8044,8 +8864,14 @@ async function completeFactionTask(factionId, taskKey, gameId, contributions) {
     ? Array.from(contributions.entries()).map(([userId, amount]) => ({ userId, amount }))
     : [];
 
+  const def = FACTION_TASKS_BY_KEY.get(taskKey);
+
   const result = await callInternalApi('/api/internal/game/faction/complete-task', {
-    factionId, taskKey, contributions: contributionsPayload,
+    factionId,
+    taskKey,
+    contributions: contributionsPayload,
+    companionFragments: def?.rewardCompanionFragments ?? 0,
+    cosmeticFragments: def?.rewardCosmeticFragments ?? 0,
   }).catch((err) => {
     console.error('[FactionTask] complete error:', err.message);
     return null;
@@ -8053,19 +8879,15 @@ async function completeFactionTask(factionId, taskKey, gameId, contributions) {
 
   if (!result || !result.success) return;
 
-  const recipient = userIdToPlayer.get(result.rewardUserId);
-  if (recipient) {
-    recipient.ash += result.rewardAsh;
-    safeSend(recipient.ws, { type: 'inventoryUpdate', inventory: recipient.inventory, ash: recipient.ash });
-  }
+  if (result.treasury) applyTreasuryBalance(factionId, result.treasury);
 
-  const def = FACTION_TASKS_BY_KEY.get(taskKey);
   broadcastToFaction(factionId, {
     type: 'factionTaskCompleted',
     taskKey,
     label: def ? def.label : taskKey,
     rewardAsh: result.rewardAsh,
-    rewardNickname: result.rewardNickname,
+    companionFragments: result.companionFragments ?? 0,
+    cosmeticFragments: result.cosmeticFragments ?? 0,
   });
 
   const fresh = await callInternalApi('/api/internal/game/faction/get-by-id', {
@@ -8567,7 +9389,7 @@ function enemySpeedMult(enemy, now) {
 function canAbilityHitPlayer(caster, target) {
   if (!target.authenticated || !target.alive) return false;
   if (target.id === caster.id) return false;
-  if (party.areAllies(caster.id, target.id)) return false;
+  if (arePlayersFriendly(caster, target)) return false;
   if (!sameShard(caster, target)) return false;
   if (isInProtectedZone(caster) || isInProtectedZone(target)) return false;
   if (isSpawnProtected(target)) return false;
@@ -8642,6 +9464,8 @@ function shotPassiveDamage(player, shot, targetKind) {
 }
 
 function applyBulletDamage(player, target, damage, options = {}) {
+  tagBubbleAggressor(player, target);
+
   const shielded = abilities.shieldRemaining(target.ability, Date.now()) > 0;
   const scaled = shielded ? damage : damage * (1 + player.combat.damageVsUnshielded);
 
@@ -10694,7 +11518,18 @@ wss.on('connection', (ws) => {
         case 'factionList': handleFactionList(player, data); break;
         case 'factionInfo': handleFactionInfo(player, data); break;
         case 'factionTaskListRequest': handleFactionTaskListRequest(player); break;
+        case 'factionLedgerRequest': sendFactionLedger(player, data.factionId); break;
         case 'factionAcceptTask': handleFactionAcceptTask(player, data); break;
+        case 'factionSetPermissions': handleFactionSetPermissions(player, data); break;
+        case 'factionHeartHit': handleFactionHeartHit(player, data); break;
+        case 'factionDeclareWar': handleFactionDeclareWar(player, data); break;
+        case 'factionCapitulate': handleFactionWarExit(player, data, 'capitulate'); break;
+        case 'factionSettleWar': handleFactionWarExit(player, data, 'settle'); break;
+        case 'factionWarListRequest': sendFactionWars(player); break;
+        case 'factionChooseWarSide': handleFactionChooseWarSide(player, data); break;
+        case 'factionBoostListRequest': sendFactionBoosts(player, data.factionId); break;
+        case 'factionBuyBoost': handleFactionBuyBoost(player, data); break;
+        case 'factionGrantFragments': handleFactionGrantFragments(player, data); break;
         case 'factionClaimCreator': handleFactionClaimCreator(player, data); break;
         case 'factionQuestCreate': handleFactionQuestCreate(player, data); break;
         case 'factionQuestListRequest': handleFactionQuestListRequest(player); break;
@@ -11594,7 +12429,7 @@ wss.on('connection', (ws) => {
     if (grinderMatch) {
       if (grinderMatch.phase !== 'live') return;
       if (!grinderMatch.members.has(data.target)) return;
-    } else if (party.areAllies(playerId, data.target)) {
+    } else if (arePlayersFriendly(player, target)) {
       return;
     }
 
@@ -12197,6 +13032,12 @@ wss.on('connection', (ws) => {
 
   function applyPlayerFactions(player, factionsList) {
     player.factions = factionsList || [];
+
+    rememberGameId(player.gameId);
+
+    for (const membership of player.factions) {
+      if (membership?.id) loadFactionBoosts(membership.id, player.gameId);
+    }
     const displayed = player.factions.find((f) => f.isDisplayed) || null;
     player.displayedFactionId = displayed?.id || null;
     player.displayedFactionName = displayed?.name || null;
@@ -12212,6 +13053,7 @@ wss.on('connection', (ws) => {
       factionSymbol: player.displayedFactionSymbol,
       factionImage: player.displayedFactionImage,
       isFactionCreator: player.isFactionCreator,
+      factionIds: playerFactionIds(player),
     }, player.id, true, player);
   }
 
@@ -12246,6 +13088,357 @@ wss.on('connection', (ws) => {
 
   function handleFactionTaskListRequest(player) {
     safeSend(player.ws, { type: 'factionTaskListResult', tasks: FACTION_TASKS });
+  }
+
+
+  function handleFactionHeartHit(player, data) {
+    if (!player.alive) return;
+    if (!Array.isArray(data.point) || data.point.length !== 3) return;
+
+    const ownerFactionId = factionIdOfRoom(player.locationId);
+    if (!ownerFactionId) return;
+
+    const mine = playerFactionIds(player);
+    if (mine.includes(ownerFactionId)) return;
+
+    let war = null;
+    for (const attackerFactionId of mine) {
+      const found = warBetweenFactions(attackerFactionId, ownerFactionId);
+      if (found) {
+        war = found;
+        break;
+      }
+    }
+
+    if (!war) return;
+    if (heartHpOfWar(war, ownerFactionId) <= 0) return;
+
+    const heartPos = [0, FACTION_HEART_Y, 0];
+    const [px, , pz] = player.position;
+    const dist = Math.hypot(heartPos[0] - px, heartPos[2] - pz);
+    if (dist > FACTION_HEART_REACH) return;
+
+    const matchedShot = findMatchingShot(player, heartPos, Date.now(), CANYON_CONFIG.hitTolerance);
+    if (!matchedShot) return;
+
+    applyHeartDamage(player, war, ownerFactionId, player.combat.enemyDamage * matchedShot.damageMult);
+  }
+
+  async function handleFactionDeclareWar(player, data) {
+    if (typeof data.factionId !== 'string' || typeof data.targetFactionId !== 'string') return;
+    if (!player.factions?.some((f) => f.id === data.factionId)) return;
+
+    const result = await callInternalApi('/api/internal/game/faction/war', {
+      action: 'declare',
+      gameId: player.gameId,
+      factionId: data.factionId,
+      userId: player.userId,
+      targetFactionId: data.targetFactionId,
+    }).catch((err) => {
+      console.error('[FactionWar] declare error:', err.message);
+      return null;
+    });
+
+    if (!result?.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not declare war', messageKey: warErrorKey(result?.error) });
+      return;
+    }
+
+    if (result.treasury) applyTreasuryBalance(data.factionId, result.treasury);
+
+    const war = adoptWar(result.war);
+    broadcastWarRelations();
+
+    if (war) {
+      const payload = { type: 'factionWarDeclared', war: warSidePayload(war) };
+      broadcastToFaction(war.declarerFactionId, payload);
+      broadcastToFaction(war.defenderFactionId, payload);
+    }
+  }
+
+  async function handleFactionWarExit(player, data, action) {
+    if (typeof data.factionId !== 'string' || typeof data.warId !== 'string') return;
+    if (!player.factions?.some((f) => f.id === data.factionId)) return;
+
+    const result = await callInternalApi('/api/internal/game/faction/war', {
+      action,
+      gameId: player.gameId,
+      factionId: data.factionId,
+      userId: player.userId,
+      warId: data.warId,
+    }).catch((err) => {
+      console.error('[FactionWar] ' + action + ' error:', err.message);
+      return null;
+    });
+
+    if (!result?.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not end the war', messageKey: warErrorKey(result?.error) });
+      return;
+    }
+
+    if (result.treasury) applyTreasuryBalance(data.factionId, result.treasury);
+
+    if (result.winnerFactionId) {
+      announceWarEnd(result.war, result.winnerFactionId, result.spoils);
+    } else if (result.war) {
+      const payload = {
+        type: 'factionWarEnded',
+        warId: result.war.id,
+        winnerFactionId: null,
+        loserFactionId: null,
+        endedBy: result.war.endedBy || 'indemnity',
+        spoilsAsh: 0,
+        spoilsCompanionFragments: 0,
+        spoilsCosmeticFragments: 0,
+      };
+      broadcastToFaction(result.war.declarerFactionId, payload);
+      broadcastToFaction(result.war.defenderFactionId, payload);
+      forgetFactionTreasury(result.war.declarerFactionId);
+      forgetFactionTreasury(result.war.defenderFactionId);
+    }
+
+    dropWar(data.warId);
+    broadcastWarRelations();
+  }
+
+  function sendFactionWars(player) {
+    safeSend(player.ws, {
+      type: 'factionWarRelations',
+      wars: warRelationsPayload(),
+      playerSides: onlineWarSidesPayload(),
+    });
+    sendWarChoicePrompt(player);
+  }
+
+  async function handleFactionChooseWarSide(player, data) {
+    if (typeof data.warId !== 'string') return;
+
+    const war = activeWars.get(data.warId);
+    if (!war) return;
+    if (!isTornByWar(war, player)) return;
+
+    const wantsNeutral = data.sideFactionId === null || data.sideFactionId === undefined;
+    const sideFactionId = wantsNeutral ? null : data.sideFactionId;
+
+    if (!wantsNeutral && sideFactionId !== war.declarerFactionId && sideFactionId !== war.defenderFactionId) {
+      return;
+    }
+
+    if (warSides.has(warSideKey(war.id, player.userId))) {
+      safeSend(player.ws, { type: 'error', message: 'Side already chosen', messageKey: 'g.err.faction.sideLocked' });
+      return;
+    }
+
+    const cost = wantsNeutral ? WAR_NEUTRALITY_ASH : 0;
+
+    if (cost > 0 && player.ash < cost) {
+      safeSend(player.ws, {
+        type: 'error',
+        message: `Neutrality costs ${cost} Ash`,
+        messageKey: 'g.err.faction.neutralityCost',
+        messageVars: { amount: cost },
+      });
+      return;
+    }
+
+    const result = await callInternalApi('/api/internal/game/faction/war-side', {
+      action: 'choose',
+      gameId: player.gameId,
+      warId: war.id,
+      userId: player.userId,
+      sideFactionId,
+      paidAsh: cost,
+    }).catch((err) => {
+      console.error('[FactionWar] choose side error:', err.message);
+      return null;
+    });
+
+    if (!result?.success) {
+      safeSend(player.ws, { type: 'error', message: 'Could not pick a side', messageKey: 'g.err.faction.sideFailed' });
+      return;
+    }
+
+    if (cost > 0) {
+      player.ash -= cost;
+      player.economyChangedAt = Date.now();
+      persistPlayer(player);
+      safeSend(player.ws, {
+        type: 'inventoryUpdate',
+        inventory: player.inventory,
+        ash: player.ash,
+        placeables: player.placeables,
+      });
+    }
+
+    warSides.set(warSideKey(war.id, player.userId), sideFactionId);
+
+    safeSend(player.ws, {
+      type: 'factionWarSideChosen',
+      warId: war.id,
+      sideFactionId,
+      paidAsh: cost,
+    });
+
+    broadcastWarSide(war, player, sideFactionId);
+  }
+
+  function broadcastWarSide(war, player, sideFactionId) {
+    broadcast({
+      type: 'playerWarSide',
+      id: player.id,
+      warId: war.id,
+      sideFactionId,
+    });
+  }
+
+  async function sendFactionBoosts(player, factionId) {
+    if (typeof factionId !== 'string') return;
+    if (!player.factions?.some((f) => f.id === factionId)) return;
+
+    await loadFactionBoosts(factionId, player.gameId);
+
+    safeSend(player.ws, {
+      type: 'factionBoosts',
+      factionId,
+      active: factionBoostsPayload(factionId),
+    });
+  }
+
+  async function handleFactionBuyBoost(player, data) {
+    if (typeof data.factionId !== 'string' || typeof data.boostId !== 'string') return;
+    if (!player.factions?.some((f) => f.id === data.factionId)) return;
+
+    const result = await callInternalApi('/api/internal/game/faction/boost', {
+      action: 'buy',
+      factionId: data.factionId,
+      gameId: player.gameId,
+      userId: player.userId,
+      boostId: data.boostId,
+      duration: data.duration,
+    }).catch((err) => {
+      console.error('[FactionBoost] buy error:', err.message);
+      return null;
+    });
+
+    if (!result?.success) {
+      const messageKey = result?.error === 'no_treasury_access'
+        ? 'g.err.faction.noTreasuryAccess'
+        : result?.error === 'insufficient'
+          ? 'g.err.faction.treasuryShort'
+          : 'g.err.faction.boostFailed';
+
+      safeSend(player.ws, { type: 'error', message: 'Could not buy boost', messageKey });
+      return;
+    }
+
+    if (result.treasury) applyTreasuryBalance(data.factionId, result.treasury);
+    applyFactionBoosts(data.factionId, result.active);
+  }
+
+  async function handleFactionGrantFragments(player, data) {
+    if (typeof data.factionId !== 'string' || typeof data.targetUserId !== 'string') return;
+    if (!player.factions?.some((f) => f.id === data.factionId)) return;
+
+    const result = await callInternalApi('/api/internal/game/faction/grant', {
+      factionId: data.factionId,
+      gameId: player.gameId,
+      userId: player.userId,
+      targetUserId: data.targetUserId,
+      companionFragments: data.companionFragments,
+      cosmeticFragments: data.cosmeticFragments,
+    }).catch((err) => {
+      console.error('[FactionGrant] error:', err.message);
+      return null;
+    });
+
+    if (!result?.success) {
+      const messageKey = result?.error === 'head_only'
+        ? 'g.err.faction.headOnly'
+        : result?.error === 'insufficient'
+          ? 'g.err.faction.treasuryShort'
+          : result?.error === 'not_a_member'
+            ? 'g.err.faction.notMember'
+            : 'g.err.faction.grantFailed';
+
+      safeSend(player.ws, { type: 'error', message: 'Could not grant fragments', messageKey });
+      return;
+    }
+
+    if (result.treasury) applyTreasuryBalance(data.factionId, result.treasury);
+
+    safeSend(player.ws, {
+      type: 'factionGrantResult',
+      factionId: data.factionId,
+      targetUserId: result.targetUserId,
+      companionFragments: result.companionFragments,
+      cosmeticFragments: result.cosmeticFragments,
+    });
+
+    const target = userIdToPlayer.get(result.targetUserId);
+    if (target) {
+      safeSend(target.ws, {
+        type: 'factionGrantReceived',
+        factionId: data.factionId,
+        companionFragments: result.companionFragments,
+        cosmeticFragments: result.cosmeticFragments,
+      });
+    }
+  }
+
+  async function handleFactionSetPermissions(player, data) {
+    if (typeof data.factionId !== 'string' || typeof data.targetUserId !== 'string') return;
+    if (!player.factions?.some((f) => f.id === data.factionId)) return;
+
+    const result = await callInternalApi('/api/internal/game/faction/permissions', {
+      actorUserId: player.userId,
+      gameId: player.gameId,
+      factionId: data.factionId,
+      targetUserId: data.targetUserId,
+      permissions: data.permissions,
+      roleTitle: data.roleTitle ?? null,
+    }).catch((err) => {
+      console.error('[FactionPerms] set error:', err.message);
+      return null;
+    });
+
+    if (!result?.success) {
+      const messageKey = result?.error === 'not_authorized'
+        ? 'g.err.faction.headOnly'
+        : result?.error === 'cannot_edit_head'
+          ? 'g.err.faction.cannotEditHead'
+          : result?.error === 'not_a_member'
+            ? 'g.err.faction.notMember'
+            : 'g.err.faction.permsFailed';
+
+      safeSend(player.ws, { type: 'error', message: 'Could not change permissions', messageKey });
+      return;
+    }
+
+    broadcastToFaction(data.factionId, {
+      type: 'factionPermissions',
+      factionId: data.factionId,
+      targetUserId: result.targetUserId,
+      permissions: result.permissions,
+      roleTitle: result.roleTitle,
+    });
+
+    const target = userIdToPlayer.get(result.targetUserId);
+    if (target) {
+      const membership = target.factions?.find((f) => f.id === data.factionId);
+      if (membership) {
+        membership.permissions = result.permissions;
+        membership.roleTitle = result.roleTitle;
+      }
+      safeSend(target.ws, { type: 'factionMyListResult', factions: target.factions });
+    }
+
+    const fresh = await callInternalApi('/api/internal/game/faction/get-by-id', {
+      gameId: player.gameId,
+      factionId: data.factionId,
+      viewerUserId: player.userId,
+    }).catch(() => null);
+
+    if (fresh?.faction) safeSend(player.ws, { type: 'factionInfo', faction: fresh.faction });
   }
 
   async function handleFactionAcceptTask(player, data) {
