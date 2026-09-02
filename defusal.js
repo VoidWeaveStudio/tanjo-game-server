@@ -132,14 +132,8 @@ function takeFromQueue() {
   return taken;
 }
 
-function createMatch(instance, now = Date.now()) {
-  const entries = takeFromQueue();
-  if (entries.length === 0) return null;
-
-  const { t, ct } = splitTeams(entries);
-  const members = new Map();
-
-  const blank = (team, slot) => ({
+function blankMember(team, slot) {
+  return {
     team,
     slot,
     alive: false,
@@ -154,10 +148,14 @@ function createMatch(instance, now = Date.now()) {
     held: 'pistol',
     armorPoints: 0,
     helmet: false,
-  });
+  };
+}
 
-  t.forEach((id, index) => members.set(id, blank('t', index)));
-  ct.forEach((id, index) => members.set(id, blank('ct', index)));
+function assembleMatch(instance, t, ct, now) {
+  const members = new Map();
+
+  t.forEach((id, index) => members.set(id, blankMember('t', index)));
+  ct.forEach((id, index) => members.set(id, blankMember('ct', index)));
 
   const match = {
     id: `defusal-${nextMatchSeq++}`,
@@ -178,6 +176,41 @@ function createMatch(instance, now = Date.now()) {
   for (const id of members.keys()) matchByPlayer.set(id, match.id);
 
   return match;
+}
+
+function createMatch(instance, now = Date.now()) {
+  const entries = takeFromQueue();
+  if (entries.length === 0) return null;
+
+  const { t, ct } = splitTeams(entries);
+  return assembleMatch(instance, t, ct, now);
+}
+
+function createDirectMatch(instance, ids, now = Date.now()) {
+  const fresh = ids.filter((id) => !matchByPlayer.has(id));
+  if (fresh.length === 0) return null;
+
+  for (const id of fresh) dequeue(id);
+
+  const { t, ct } = splitTeams([{ ids: fresh, joinedAt: now }]);
+  return assembleMatch(instance, t, ct, now);
+}
+
+function addMember(match, id, team) {
+  if (match.members.has(id)) return match.members.get(id);
+
+  const slot = membersOfTeam(match, team).length;
+  const member = blankMember(team, slot);
+  match.members.set(id, member);
+  matchByPlayer.set(id, match.id);
+  return member;
+}
+
+function teamShortfall(match) {
+  return {
+    t: Math.max(0, DEFUSAL_CONFIG.teamSize - membersOfTeam(match, 't').length),
+    ct: Math.max(0, DEFUSAL_CONFIG.teamSize - membersOfTeam(match, 'ct').length),
+  };
 }
 
 function matchOf(playerId) {
@@ -682,6 +715,9 @@ module.exports = {
   isQueued,
   enqueue,
   dequeue,
+  createDirectMatch,
+  addMember,
+  teamShortfall,
   forgetQueued,
   shouldFormMatch,
   createMatch,

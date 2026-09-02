@@ -27,6 +27,7 @@ const eventSchedule = require('./eventSchedule');
 const defusal = require('./defusal');
 const defusalArsenal = require('./defusalArsenal');
 const grinder = require('./grinder');
+const dust2Bots = require('./dust2Bots');
 const caveGeometry = require('./caveGeometry');
 const influenceGeometry = require('./influenceGeometry');
 const influence = require('./influence');
@@ -3005,9 +3006,8 @@ function markPlayerDead(target, killerId, position) {
 
   const defusalMatch = defusal.matchOf(target.id);
   if (defusalMatch) {
-    const killer = killerId ? players.get(killerId) : null;
-    const killerMember = killer ? defusalMatch.members.get(killer.id) : null;
-    if (killerMember && defusal.sideOf(defusalMatch, killer.id) !== defusal.sideOf(defusalMatch, target.id)) {
+    const killerMember = killerId ? defusalMatch.members.get(killerId) : null;
+    if (killerMember && defusal.sideOf(defusalMatch, killerId) !== defusal.sideOf(defusalMatch, target.id)) {
       const weapon = defusal.heldItem(killerMember);
       defusal.award(killerMember, weapon?.killReward ?? 300);
     }
@@ -3033,7 +3033,7 @@ function markPlayerDead(target, killerId, position) {
     safeSend(target.ws, {
       type: 'grinderDeath',
       killerId,
-      killerName: killerId ? players.get(killerId)?.nickname ?? null : null,
+      killerName: combatantName(killerId),
     });
   } else {
     safeSend(target.ws, { ...deathMessage, options: respawnOptionsFor(target), loot });
@@ -6431,6 +6431,8 @@ function respawnForRound(match, now) {
     });
     broadcast({ type: 'playerRespawn', id, position: player.position, health: player.health }, id, true, player);
   }
+
+  respawnBotsForRound(match, now);
 }
 
 function finishDefusalRound(match, outcome, now) {
@@ -6524,12 +6526,14 @@ function detonateGrenade(match, grenade, now) {
 
 function tickDefusalMatch(match, now) {
   for (const id of Array.from(match.members.keys())) {
+    if (dust2Bots.isBot(id)) continue;
     const player = players.get(id);
     const present = player && player.authenticated && player.locationId === defusal.DEFUSAL_CONFIG.locationId;
     if (!present) defusal.dropMember(match, id);
   }
 
-  if (match.members.size === 0) {
+  if (matchHumanIds(match).length === 0) {
+    for (const bot of dust2Bots.releaseMatch(match.id)) defusal.dropMember(match, bot.id);
     defusal.endMatch(match);
     return;
   }
@@ -6595,6 +6599,10 @@ function tickDefusalMatch(match, now) {
         score: { t: match.score.t, ct: match.score.ct },
       });
       for (const id of match.members.keys()) clearDefusalLoadout(players.get(id));
+      for (const bot of dust2Bots.botsOfMatch(match.id)) {
+        broadcastMatchPlayers(match, { type: 'playerLeave', playerId: bot.id });
+      }
+      dust2Bots.releaseMatch(match.id);
       defusal.endMatch(match);
       return;
     }
@@ -6670,8 +6678,8 @@ function livingGrinderPositions(match) {
   const entries = [];
   for (const [id, member] of match.members) {
     if (!member.alive) continue;
-    const player = players.get(id);
-    if (player) entries.push({ id, position: player.position });
+    const combatant = players.get(id) ?? dust2Bots.get(id);
+    if (combatant) entries.push({ id, position: combatant.position });
   }
   return entries;
 }
@@ -6714,6 +6722,8 @@ function enterGrinder(player, now = Date.now()) {
   const match = grinder.ensureMatch(player.instance, now);
   grinder.join(match, player.id, now);
   respawnInGrinder(match, player, now);
+  announceBotsTo(player, match, grinder.GRINDER_CONFIG.locationId);
+  topUpGrinderBots(match, now);
   broadcastGrinderState(match);
 }
 
@@ -6722,8 +6732,14 @@ function leaveGrinder(player) {
   clearDefusalLoadout(player);
   if (!match) return;
 
-  if (match.members.size === 0) grinder.closeMatch(match);
-  else broadcastGrinderState(match);
+  if (matchHumanIds(match).length === 0) {
+    for (const bot of dust2Bots.releaseMatch(match.id)) grinder.leave(bot.id);
+    grinder.closeMatch(match);
+    return;
+  }
+
+  topUpGrinderBots(match, Date.now());
+  broadcastGrinderState(match);
 }
 
 function detonateGrinderGrenade(match, grenade, now) {
@@ -6780,12 +6796,14 @@ function detonateGrinderGrenade(match, grenade, now) {
 
 function tickGrinderMatch(match, now) {
   for (const id of Array.from(match.members.keys())) {
+    if (dust2Bots.isBot(id)) continue;
     const player = players.get(id);
     const present = player && player.authenticated && player.locationId === grinder.GRINDER_CONFIG.locationId;
     if (!present) grinder.leave(id);
   }
 
-  if (match.members.size === 0) {
+  if (matchHumanIds(match).length === 0) {
+    for (const bot of dust2Bots.releaseMatch(match.id)) grinder.leave(bot.id);
     grinder.closeMatch(match);
     return;
   }
@@ -6795,7 +6813,7 @@ function tickGrinderMatch(match, now) {
     broadcastGrinder(match, { type: 'defusalGrenades', grenades: defusal.serializeGrenades(match) });
   }
 
-  let changed = false;
+  let changed = topUpGrinderBots(match, now);
 
   if (match.phase === 'live' && now >= match.phaseUntil) {
     const winner = grinder.finishRound(match, now);
@@ -6816,6 +6834,19 @@ function tickGrinderMatch(match, now) {
   }
 
   for (const id of grinder.readyToRespawn(match, now)) {
+    const bot = dust2Bots.get(id);
+    if (bot) {
+      spawnGrinderBot(match, bot, now);
+      broadcastMatchPlayers(match, {
+        type: 'playerRespawn',
+        id: bot.id,
+        position: bot.position,
+        health: bot.health,
+      });
+      changed = true;
+      continue;
+    }
+
     const player = players.get(id);
     if (!player) continue;
     respawnInGrinder(match, player, now);
@@ -6831,6 +6862,481 @@ function grinderTick() {
 }
 
 safeInterval(grinderTick, 100);
+
+const DUST2_BOT_TICK_MS = 50;
+const DUST2_BOT_STATE_MS = 70;
+const GRINDER_BOT_TARGET = 8;
+const DEFUSAL_BOT_INSTANCE_BASE = 100;
+
+let nextDefusalBotInstance = DEFUSAL_BOT_INSTANCE_BASE;
+let lastBotTickAt = Date.now();
+let lastBotStateAt = 0;
+
+function combatantName(id) {
+  if (!id) return null;
+  return players.get(id)?.nickname ?? dust2Bots.get(id)?.nickname ?? null;
+}
+
+function broadcastMatchPlayers(match, payload) {
+  for (const id of match.members.keys()) {
+    const player = players.get(id);
+    if (player) safeSend(player.ws, payload);
+  }
+}
+
+function matchHumanIds(match) {
+  const ids = [];
+  for (const id of match.members.keys()) {
+    if (players.has(id)) ids.push(id);
+  }
+  return ids;
+}
+
+function playerIsMoving(player, now) {
+  const history = player.positionHistory || [];
+  if (history.length < 2) return false;
+
+  const latest = history[history.length - 1];
+  for (let i = history.length - 2; i >= 0; i--) {
+    if (now - history[i].time < 250) continue;
+    const moved = Math.hypot(
+      latest.position[0] - history[i].position[0],
+      latest.position[2] - history[i].position[2]
+    );
+    return moved > 0.35;
+  }
+  return false;
+}
+
+function dust2Actors(match, mode) {
+  const now = Date.now();
+  const actors = [];
+
+  for (const [id, member] of match.members) {
+    const bot = dust2Bots.get(id);
+    if (bot) {
+      actors.push({
+        id,
+        isBot: true,
+        alive: bot.alive && member.alive,
+        position: bot.position,
+        side: mode === 'defusal' ? defusal.sideOf(match, id) : null,
+        lastShotAt: bot.lastShotAt,
+        moving: bot.lastMoveDistance > 0.05,
+      });
+      continue;
+    }
+
+    const player = players.get(id);
+    if (!player) continue;
+
+    actors.push({
+      id,
+      isBot: false,
+      alive: player.alive && member.alive && !isSpawnProtected(player),
+      position: player.position,
+      side: mode === 'defusal' ? defusal.sideOf(match, id) : null,
+      lastShotAt: player.lastShotAt || 0,
+      moving: playerIsMoving(player, now),
+    });
+  }
+
+  return actors;
+}
+
+function announceBot(match, bot, locationId) {
+  broadcastMatchPlayers(match, dust2Bots.joinPayload(bot, locationId));
+}
+
+function announceBotsTo(player, match, locationId) {
+  for (const bot of dust2Bots.botsOfMatch(match.id)) {
+    if (!match.members.has(bot.id)) continue;
+    safeSend(player.ws, dust2Bots.joinPayload(bot, locationId));
+  }
+}
+
+function retireBot(match, bot) {
+  broadcastMatchPlayers(match, { type: 'playerLeave', playerId: bot.id });
+  dust2Bots.removeBot(bot.id);
+}
+
+function spawnDefusalBot(match, bot, now) {
+  const spawn = defusal.spawnFor(match, bot.id) ?? [0, 0, 0];
+  const grounded = dust2Bots.grounded(spawn[0], spawn[2]);
+  dust2Bots.resetForRound(bot, grounded, now);
+  bot.locationId = defusal.DEFUSAL_CONFIG.locationId;
+  bot.instance = match.instance;
+
+  const member = match.members.get(bot.id);
+  if (member) {
+    member.alive = true;
+    defusal.normaliseHeld(member);
+  }
+}
+
+function fillDefusalBots(match, now) {
+  const shortfall = defusal.teamShortfall(match);
+  const created = [];
+
+  for (const team of ['t', 'ct']) {
+    for (let i = 0; i < shortfall[team]; i++) {
+      const bot = dust2Bots.createBot(match.id, 'defusal');
+      defusal.addMember(match, bot.id, team);
+      spawnDefusalBot(match, bot, now);
+      created.push(bot);
+    }
+  }
+
+  return created;
+}
+
+function respawnBotsForRound(match, now) {
+  for (const bot of dust2Bots.botsOfMatch(match.id)) {
+    if (!match.members.has(bot.id)) continue;
+    spawnDefusalBot(match, bot, now);
+    broadcastMatchPlayers(match, {
+      type: 'playerRespawn',
+      id: bot.id,
+      position: bot.position,
+      health: bot.health,
+    });
+  }
+}
+
+function grinderBotLoadout(member) {
+  member.primary = grinder.GRINDER_CONFIG.startPrimary;
+  member.armor = grinder.GRINDER_CONFIG.startArmor;
+  member.armorPoints = grinder.GRINDER_CONFIG.armorPoints;
+  member.helmet = true;
+  member.held = 'primary';
+  defusal.normaliseHeld(member);
+}
+
+function spawnGrinderBot(match, bot, now) {
+  const member = match.members.get(bot.id);
+  if (!member) return;
+
+  grinder.respawn(member);
+  grinderBotLoadout(member);
+
+  const spawn = grinder.pickSpawn(match, bot.id, livingGrinderPositions(match));
+  const grounded = dust2Bots.grounded(spawn[0], spawn[2]);
+  dust2Bots.resetForRound(bot, grounded, now);
+  bot.locationId = grinder.GRINDER_CONFIG.locationId;
+  bot.instance = match.instance;
+}
+
+function topUpGrinderBots(match, now) {
+  const humans = matchHumanIds(match).length;
+  if (humans === 0) return false;
+
+  const existing = dust2Bots.botsOfMatch(match.id).filter((bot) => match.members.has(bot.id));
+  const wanted = Math.max(0, Math.min(GRINDER_BOT_TARGET - humans, GRINDER_BOT_TARGET - 1));
+  let changed = false;
+
+  for (let i = existing.length; i < wanted; i++) {
+    const bot = dust2Bots.createBot(match.id, 'grinder');
+    grinder.join(match, bot.id, now);
+    spawnGrinderBot(match, bot, now);
+    announceBot(match, bot, grinder.GRINDER_CONFIG.locationId);
+    changed = true;
+  }
+
+  for (let i = wanted; i < existing.length; i++) {
+    const bot = existing[i];
+    grinder.leave(bot.id);
+    retireBot(match, bot);
+    changed = true;
+  }
+
+  return changed;
+}
+
+function applyBotDamage(match, mode, bot, damage, attackerId, point, now) {
+  if (!bot.alive || damage <= 0) return;
+
+  bot.health = Math.max(0, bot.health - damage);
+
+  broadcastMatchPlayers(match, {
+    type: 'playerDamaged',
+    targetId: bot.id,
+    attackerId: attackerId ?? null,
+    damage,
+    absorbed: 0,
+    health: bot.health,
+    point: point ?? bot.position,
+    historicalPosition: point ?? bot.position,
+    abilityId: null,
+  });
+
+  if (bot.health > 0) return;
+
+  dust2Bots.markDead(bot);
+
+  if (mode === 'defusal') {
+    const killerMember = attackerId ? match.members.get(attackerId) : null;
+    if (killerMember && defusal.sideOf(match, attackerId) !== defusal.sideOf(match, bot.id)) {
+      const weapon = defusal.heldItem(killerMember);
+      defusal.award(killerMember, weapon?.killReward ?? 300);
+    }
+    defusal.markDead(match, bot.id);
+    broadcastDefusalState(match);
+  } else {
+    grinder.markDead(match, bot.id, attackerId, now);
+    broadcastGrinderState(match);
+  }
+
+  broadcastMatchPlayers(match, {
+    type: 'playerDeath',
+    playerId: bot.id,
+    killerId: attackerId ?? null,
+    position: point ?? bot.position,
+  });
+}
+
+function botHitTarget(match, mode, bot, event, now) {
+  if (mode === 'defusal') {
+    if (match.phase !== 'live' && match.phase !== 'planted') return;
+    if (defusal.sideOf(match, bot.id) === defusal.sideOf(match, event.targetId)) return;
+  } else if (match.phase !== 'live') {
+    return;
+  }
+
+  const targetBot = dust2Bots.get(event.targetId);
+  if (targetBot) {
+    if (!targetBot.alive) return;
+    const damage = arsenalDamage(bot, targetBot, event.zone, event.distance);
+    applyBotDamage(match, mode, targetBot, damage, bot.id, event.point, now);
+    return;
+  }
+
+  const target = players.get(event.targetId);
+  if (!target || !target.alive || isSpawnProtected(target)) return;
+
+  const damage = arsenalDamage(bot, target, event.zone, event.distance);
+  if (damage <= 0) return;
+
+  applyPlayerDamage(target, damage, {
+    attackerId: bot.id,
+    point: event.point,
+  });
+}
+
+function botPlant(match, bot) {
+  if (match.phase !== 'live') return;
+
+  const bomb = match.bomb;
+  if (!bomb || bomb.state !== 'carried' || bomb.carrierId !== bot.id || bomb.planting) return;
+
+  const site = defusal.siteAt(bot.position[0], bot.position[2]);
+  if (!site) return;
+
+  bomb.planting = {
+    playerId: bot.id,
+    site,
+    x: bot.position[0],
+    z: bot.position[2],
+    until: Date.now() + defusal.DEFUSAL_CONFIG.plantMs,
+  };
+  broadcastDefusalState(match);
+}
+
+function botDefuse(match, bot) {
+  const bomb = match.bomb;
+  if (!bomb || bomb.state !== 'planted' || bomb.defusing) return;
+  if (defusal.sideOf(match, bot.id) !== 'ct') return;
+
+  const distance = Math.hypot(bot.position[0] - bomb.x, bot.position[2] - bomb.z);
+  if (distance > defusal.DEFUSAL_CONFIG.defuseReach) return;
+
+  bomb.defusing = { playerId: bot.id, until: Date.now() + defusal.DEFUSAL_CONFIG.defuseMs };
+  broadcastDefusalState(match);
+}
+
+function applyBotEvents(match, mode, events, now) {
+  let rosterDirty = false;
+
+  for (const event of events) {
+    const bot = dust2Bots.get(event.botId);
+    if (!bot || !match.members.has(bot.id)) continue;
+
+    if (event.kind === 'shoot') {
+      broadcastMatchPlayers(match, {
+        type: 'shoot',
+        id: bot.id,
+        origin: event.origin,
+        direction: event.direction,
+        directions: [event.direction],
+        weapon: 'rifle',
+        mode: 'single',
+        speed: 0,
+      });
+      continue;
+    }
+
+    if (event.kind === 'hit') {
+      botHitTarget(match, mode, bot, event, now);
+      continue;
+    }
+
+    if (event.kind === 'buy') {
+      const result = defusal.applyPurchase(match, bot.id, event.itemId);
+      if (result.ok) {
+        refillArsenalAmmo(result.member, result.item.id);
+        rosterDirty = true;
+      }
+      continue;
+    }
+
+    if (event.kind === 'plant') {
+      botPlant(match, bot);
+      continue;
+    }
+
+    if (event.kind === 'defuse') {
+      botDefuse(match, bot);
+    }
+  }
+
+  if (rosterDirty) {
+    if (mode === 'defusal') broadcastDefusalState(match);
+    else broadcastGrinderState(match);
+  }
+}
+
+function broadcastBotStates(match) {
+  const payloads = [];
+  for (const bot of dust2Bots.botsOfMatch(match.id)) {
+    if (!match.members.has(bot.id)) continue;
+    payloads.push(dust2Bots.statePayload(bot));
+  }
+  if (payloads.length === 0) return;
+
+  broadcastMatchPlayers(match, { type: 'snapshot', players: payloads });
+}
+
+function dust2BotTick() {
+  const now = Date.now();
+  const deltaMs = Math.min(400, now - lastBotTickAt);
+  lastBotTickAt = now;
+
+  const pushState = now - lastBotStateAt >= DUST2_BOT_STATE_MS;
+  if (pushState) lastBotStateAt = now;
+
+  for (const match of defusal.allMatches()) {
+    if (dust2Bots.botsOfMatch(match.id).length === 0) continue;
+    if (matchHumanIds(match).length === 0) continue;
+
+    const actors = dust2Actors(match, 'defusal');
+    const events = dust2Bots.tick(match, 'defusal', { actors }, now, deltaMs);
+    applyBotEvents(match, 'defusal', events, now);
+    if (pushState) broadcastBotStates(match);
+  }
+
+  for (const match of grinder.allMatches()) {
+    if (dust2Bots.botsOfMatch(match.id).length === 0) continue;
+    if (matchHumanIds(match).length === 0) continue;
+
+    const actors = dust2Actors(match, 'grinder');
+    const events = dust2Bots.tick(match, 'grinder', { actors }, now, deltaMs);
+    applyBotEvents(match, 'grinder', events, now);
+    if (pushState) broadcastBotStates(match);
+  }
+}
+
+safeInterval(dust2BotTick, DUST2_BOT_TICK_MS);
+
+function dust2MatchOfBot(bot) {
+  const grinderMatch = grinder.matchOf(bot.id);
+  if (grinderMatch) return { mode: 'grinder', match: grinderMatch };
+
+  const defusalMatch = defusal.matchOf(bot.id);
+  if (defusalMatch) return { mode: 'defusal', match: defusalMatch };
+
+  return null;
+}
+
+function resolvePlayerHitOnBot(player, bot, data) {
+  if (!bot.alive) return;
+
+  const entry = dust2MatchOfBot(bot);
+  if (!entry) return;
+
+  const { mode, match } = entry;
+  if (!match.members.has(player.id)) return;
+
+  if (mode === 'grinder') {
+    if (match.phase !== 'live') return;
+  } else {
+    if (match.phase !== 'live' && match.phase !== 'planted') return;
+    if (defusal.sideOf(match, player.id) === defusal.sideOf(match, bot.id)) return;
+  }
+
+  if (player.locationId !== bot.locationId) return;
+  if (player.instance !== bot.instance) return;
+
+  const now = Date.now();
+  const shotTime = now - Math.min(player.rtt, MAX_LAG_COMPENSATION_MS);
+  const historicalPos = getHistoricalPosition(bot, shotTime);
+
+  const distance = Math.hypot(
+    historicalPos[0] - player.position[0],
+    historicalPos[2] - player.position[2]
+  );
+  if (distance > 300) return;
+
+  const matchedShot = findMatchingShot(player, historicalPos, now);
+  if (!matchedShot) {
+    console.log(`[!] Hit hack: no matching recent shot from ${player.id} explains hit on bot ${bot.id}`);
+    return;
+  }
+
+  const damage = arsenalDamage(player, bot, dust2HitZone(data.point, historicalPos), distance);
+  applyBotDamage(match, mode, bot, damage, player.id, data.point, now);
+}
+
+function startDefusalBotMatch(player) {
+  const now = Date.now();
+
+  const group = party.partyOf(player.id);
+  const ids = group
+    ? group.memberIds.filter((id) => {
+      const member = players.get(id);
+      return member && member.authenticated && member.locationId === EVENTS_LOBBY_ID;
+    })
+    : [player.id];
+
+  const roster = ids.length > 0 ? ids : [player.id];
+  for (const id of roster) defusal.forgetQueued(id);
+
+  const instance = nextDefusalBotInstance++;
+  const match = defusal.createDirectMatch(instance, roster, now);
+  if (!match) return null;
+
+  fillDefusalBots(match, now);
+
+  for (const id of match.members.keys()) {
+    const human = players.get(id);
+    if (!human) continue;
+
+    human.locationId = defusal.DEFUSAL_CONFIG.locationId;
+    human.instance = instance;
+    human.position = defusal.spawnFor(match, id) ?? [0, 0, 0];
+    human.weaponEquipped = true;
+    applyDefusalLoadout(human);
+
+    safeSend(human.ws, {
+      type: 'forceTeleport',
+      locationId: defusal.DEFUSAL_CONFIG.locationId,
+      position: human.position,
+    });
+  }
+
+  broadcastDefusalState(match);
+  broadcastQueueState();
+  return match;
+}
+
 
 const GRINDER_PICK_ERRORS = {
   buy_closed: 'The round is over — wait for the next one.',
@@ -11577,7 +12083,7 @@ wss.on('connection', (ws) => {
         if (!checkRateLimit(playerId, 'crate', CONFIG.network.crateRateLimit)) return;
       } else if (data.type === 'partyInvite' || data.type === 'partyAccept' || data.type === 'partyDecline' || data.type === 'partyLeave' || data.type === 'partyKick') {
         if (!checkRateLimit(playerId, 'party', CONFIG.network.partyRateLimit)) return;
-      } else if (data.type === 'defusalQueue' || data.type === 'defusalLeaveQueue' || data.type === 'defusalPlant' || data.type === 'defusalDefuse' || data.type === 'defusalCancel' || data.type === 'defusalBuy' || data.type === 'defusalSwitch' || data.type === 'defusalThrow' || data.type === 'defusalMelee') {
+      } else if (data.type === 'defusalQueue' || data.type === 'defusalBotMatch' || data.type === 'defusalLeaveQueue' || data.type === 'defusalPlant' || data.type === 'defusalDefuse' || data.type === 'defusalCancel' || data.type === 'defusalBuy' || data.type === 'defusalSwitch' || data.type === 'defusalThrow' || data.type === 'defusalMelee') {
         if (!checkRateLimit(playerId, 'arena', CONFIG.network.arenaRateLimit)) return;
       } else if (data.type === 'arenaStart' || data.type === 'arenaJoin' || data.type === 'arenaLeave' || data.type === 'arenaRevive') {
         if (!checkRateLimit(playerId, 'arena', CONFIG.network.arenaRateLimit)) return;
@@ -11644,6 +12150,7 @@ wss.on('connection', (ws) => {
         case 'arenaLeave': handleArenaLeave(player); break;
         case 'arenaRevive': handleArenaRevive(player, data); break;
         case 'defusalQueue': handleDefusalQueue(player); break;
+        case 'defusalBotMatch': handleDefusalBotMatch(player); break;
         case 'defusalLeaveQueue': handleDefusalLeaveQueue(player); break;
         case 'defusalPlant': handleDefusalPlant(player); break;
         case 'defusalDefuse': handleDefusalDefuse(player); break;
@@ -12604,6 +13111,12 @@ wss.on('connection', (ws) => {
 
     if (!data.target || typeof data.target !== 'string') return;
     if (!Array.isArray(data.point) || data.point.length !== 3) return;
+
+    const targetBot = dust2Bots.get(data.target);
+    if (targetBot) {
+      resolvePlayerHitOnBot(player, targetBot, data);
+      return;
+    }
 
     const target = players.get(data.target);
     if (!target || !target.authenticated || !target.alive) return;
@@ -15415,6 +15928,23 @@ wss.on('connection', (ws) => {
     broadcastQueueState();
   }
 
+  function handleDefusalBotMatch(player) {
+    if (player.locationId !== EVENTS_LOBBY_ID) {
+      safeSend(player.ws, { type: 'error', message: 'Queue from the Events Hall.', messageKey: 'g.err.queueFromEventsHall' });
+      return;
+    }
+    if (!isEventOpen(defusal.DEFUSAL_CONFIG.eventId)) {
+      safeSend(player.ws, { type: 'error', message: 'Dust II is sealed right now.', messageKey: 'g.err.dust2Sealed' });
+      return;
+    }
+    if (defusal.matchOf(player.id)) return;
+
+    const match = startDefusalBotMatch(player);
+    if (!match) {
+      safeSend(player.ws, { type: 'error', message: 'Could not open a bot match.', messageKey: 'g.err.botMatchFailed' });
+    }
+  }
+
   function handleDefusalLeaveQueue(player) {
     if (defusal.dequeue(player.id)) broadcastQueueState();
   }
@@ -16320,6 +16850,11 @@ wss.on('connection', (ws) => {
 
     if (data.locationId === grinder.GRINDER_CONFIG.locationId) {
       enterGrinder(player);
+    }
+
+    if (data.locationId === defusal.DEFUSAL_CONFIG.locationId) {
+      const botMatch = defusal.matchOf(player.id);
+      if (botMatch) announceBotsTo(player, botMatch, defusal.DEFUSAL_CONFIG.locationId);
     }
 
     if (data.locationId === GALAXY_LOCATION_ID) {

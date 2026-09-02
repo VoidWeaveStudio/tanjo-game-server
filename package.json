@@ -12,7 +12,9 @@
     "check:terrain": "node scripts/checkTerrain.js",
     "check:abilities": "node scripts/check-abilities.js",
     "check:party": "node scripts/check-party.js",
-    "check:arena": "node scripts/check-arena.js"
+    "check:arena": "node scripts/check-arena.js",
+    "check:dust2-nav": "node scripts/check-dust2-nav.js",
+    "check:dust2-bots": "node scripts/check-dust2-bots.js"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
