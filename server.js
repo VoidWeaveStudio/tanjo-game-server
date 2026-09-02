@@ -366,7 +366,9 @@ const QUESTS = {
     npc: 'sola',
     order: 1,
     title: 'Getting Your Bearings',
+    titleKey: 'g.questDef.sola_orientation.title',
     description: 'Meet every steward in the tower, then come back to me. I will make sure the effort counts.',
+    descriptionKey: 'g.questDef.sola_orientation.description',
     type: 'visit_npcs',
     targets: ORIENTATION_TARGETS,
     targetCount: ORIENTATION_TARGETS.length,
@@ -377,12 +379,87 @@ const QUESTS = {
     npc: 'sola',
     order: 2,
     title: 'Pest Control',
+    titleKey: 'g.questDef.sola_kill_10.title',
     description: 'Kill 10 slimes in Slime Valley.',
+    descriptionKey: 'g.questDef.sola_kill_10.description',
     type: 'kill_enemies',
     locationId: 'tower-first-floor',
     targetCount: 10,
     rewardAsh: 30,
     requiresQuest: 'sola_orientation',
+  },
+  alfredo_first_skin: {
+    id: 'alfredo_first_skin',
+    npc: 'alfredo',
+    order: 10,
+    title: 'A Face of Your Own',
+    titleKey: 'g.questDef.alfredo_first_skin.title',
+    description: 'Open my editor and paint your first skin. Save it and the shades are yours.',
+    descriptionKey: 'g.questDef.alfredo_first_skin.description',
+    type: 'paint_skin',
+    targetCount: 1,
+    rewardAsh: 0,
+    reward: { kind: 'cosmetic', itemId: 'deal_shades' },
+    requiresQuest: 'sola_orientation',
+  },
+  tony_sell_loot: {
+    id: 'tony_sell_loot',
+    npc: 'tony',
+    order: 10,
+    title: 'Coin Counting',
+    titleKey: 'g.questDef.tony_sell_loot.title',
+    description: 'Coins drop off mobs, and the canyon is thick with them — the dispatcher on the first floor sends you down. Bring me five and sell them at my counter.',
+    descriptionKey: 'g.questDef.tony_sell_loot.description',
+    type: 'sell_tokens',
+    targetCount: 5,
+    rewardAsh: 0,
+    requiresQuest: 'sola_orientation',
+  },
+  alaric_found_faction: {
+    id: 'alaric_found_faction',
+    npc: 'alaric',
+    order: 10,
+    title: 'Raise a Banner',
+    titleKey: 'g.questDef.alaric_found_faction.title',
+    description: 'Found a faction of your own. Do it and the first ten thousand Ash land in its treasury.',
+    descriptionKey: 'g.questDef.alaric_found_faction.description',
+    type: 'found_faction',
+    targetCount: 1,
+    rewardAsh: 0,
+    reward: { kind: 'factionTreasuryAsh', amount: 10000 },
+    requiresQuest: 'sola_orientation',
+  },
+  dispatcher_canyon_1_5: {
+    id: 'dispatcher_canyon_1_5',
+    npc: 'dispatcher',
+    order: 10,
+    title: 'Down the Canyon',
+    titleKey: 'g.questDef.dispatcher_canyon_1_5.title',
+    description: 'Clear canyon segments 1 through 5. Bring the boss of each one down.',
+    descriptionKey: 'g.questDef.dispatcher_canyon_1_5.description',
+    type: 'canyon_segments',
+    segmentFrom: 1,
+    segmentTo: 5,
+    targetCount: 5,
+    rewardAsh: 0,
+    reward: { kind: 'companionFragments', amount: 100 },
+    requiresQuest: 'sola_orientation',
+  },
+  dispatcher_canyon_6_10: {
+    id: 'dispatcher_canyon_6_10',
+    npc: 'dispatcher',
+    order: 11,
+    title: 'Deeper Still',
+    titleKey: 'g.questDef.dispatcher_canyon_6_10.title',
+    description: 'Clear canyon segments 6 through 10. The deep ones bite back.',
+    descriptionKey: 'g.questDef.dispatcher_canyon_6_10.description',
+    type: 'canyon_segments',
+    segmentFrom: 6,
+    segmentTo: 10,
+    targetCount: 5,
+    rewardAsh: 0,
+    reward: { kind: 'cosmeticFragments', amount: 100 },
+    requiresQuest: 'dispatcher_canyon_1_5',
   },
 };
 
@@ -1157,6 +1234,7 @@ function buildPlayerStatePayload(p) {
     rotation: p.rotation,
     pitch: p.pitch,
     headYaw: p.headYaw,
+    headPitch: p.headPitch,
     state: p.state,
     jumping: p.jumping,
     velocityY: p.velocityY,
@@ -1179,6 +1257,7 @@ function buildPlayerJoinPayload(p) {
     rotation: p.rotation,
     pitch: p.pitch,
     headYaw: p.headYaw,
+    headPitch: p.headPitch,
     state: p.state || 'idle',
     jumping: p.jumping || false,
     velocityY: p.velocityY || 0,
@@ -1308,6 +1387,7 @@ function notifyLocationTransition(player, oldLocationId, newLocationId) {
       rotation: player.rotation,
       pitch: player.pitch,
       headYaw: player.headYaw,
+      headPitch: player.headPitch,
       state: player.state || 'idle',
       jumping: player.jumping || false,
       velocityY: player.velocityY || 0,
@@ -1333,6 +1413,7 @@ function notifyLocationTransition(player, oldLocationId, newLocationId) {
       rotation: other.rotation,
       pitch: other.pitch,
       headYaw: other.headYaw,
+      headPitch: other.headPitch,
       state: other.state || 'idle',
       jumping: other.jumping || false,
       velocityY: other.velocityY || 0,
@@ -1833,11 +1914,20 @@ function applyMarketCap(mc) {
   broadcastWorldStatus();
 }
 
+// Node's fetch has no default timeout: a site request that never answers would
+// otherwise hang its caller forever. The sell queue is the worst case, since it
+// is drained one job at a time and a stuck job locks the player out of selling.
+const SITE_FETCH_TIMEOUT_MS = 10000;
+
+function siteFetch(url) {
+  return fetch(url, { signal: AbortSignal.timeout(SITE_FETCH_TIMEOUT_MS) });
+}
+
 async function fetchTokenMarketCap(address) {
   const url = new URL('/api/token-by-ca', CONFIG.siteUrl);
   url.searchParams.set('ca', address);
 
-  const res = await fetch(url.toString());
+  const res = await siteFetch(url.toString());
   const json = await res.json();
   return Number(json?.mc) || 0;
 }
@@ -5416,6 +5506,14 @@ async function chargeInfluenceEntry(player, fee, tx) {
 
     const recipient = onlinePlayerByWallet(influenceState.feeWallet);
 
+    // Charged before the await, refunded if the call fails. Deducting after it
+    // would let two gate crossings sent back to back both clear the balance
+    // check and both pay the toll holder, minting Ash out of one player's fee.
+    player.ash -= amount;
+    player.economyChangedAt = Date.now();
+    persistPlayer(player);
+    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+
     const result = await callInternalApi('/api/internal/game/influence-entry', {
       userId: player.userId,
       gameId: player.gameId,
@@ -5430,12 +5528,13 @@ async function chargeInfluenceEntry(player, fee, tx) {
       return null;
     });
 
-    if (!result?.success) return { ok: false, reason: 'payment' };
-
-    player.ash -= amount;
-    player.economyChangedAt = Date.now();
-    persistPlayer(player);
-    safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+    if (!result?.success) {
+      player.ash += amount;
+      player.economyChangedAt = Date.now();
+      persistPlayer(player);
+      safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
+      return { ok: false, reason: 'payment' };
+    }
 
     if (recipient) {
       recipient.ash += amount;
@@ -6984,9 +7083,7 @@ async function companionEscrowCall(session, action, userId) {
   return !!(result && result.success);
 }
 
-async function holdTradeEscrow(session) {
-  if (session.escrowed) return true;
-
+async function runTradeEscrowHold(session) {
   if (session.itemKind === 'companion') {
     const held = await companionEscrowCall(session, 'hold', session.sellerId);
     if (held) session.escrowed = true;
@@ -7004,7 +7101,32 @@ async function holdTradeEscrow(session) {
   return true;
 }
 
+// Both sides readying at the same instant used to run two holds: the companion
+// path awaits the escrow API before setting `escrowed`, so the seller's stack
+// was debited twice and only one unit ever came back. Concurrent callers now
+// share the first hold's promise.
+async function holdTradeEscrow(session) {
+  if (session.escrowed) return true;
+  if (session.escrowHold) return session.escrowHold;
+
+  const hold = runTradeEscrowHold(session);
+  session.escrowHold = hold;
+
+  const clear = () => { if (session.escrowHold === hold) session.escrowHold = null; };
+  hold.then(clear, clear);
+
+  return hold;
+}
+
 function releaseTradeEscrow(session) {
+  // A hold still in flight sets `escrowed` after this call, so waiting for it
+  // beats reading a flag that is about to flip: a trade cancelled mid-hold used
+  // to return here on `!escrowed` and leave the seller's item in escrow for good.
+  if (session.escrowHold) {
+    session.escrowHold.then(() => releaseTradeEscrow(session), () => {});
+    return;
+  }
+
   if (!session.escrowed) return;
   session.escrowed = false;
 
@@ -7119,7 +7241,7 @@ safeInterval(refreshFactionGates, 15000);
 async function refreshTokenPool() {
   try {
     const url = new URL('/api/new-tokens', CONFIG.siteUrl).toString();
-    const res = await fetch(url);
+    const res = await siteFetch(url);
     if (!res.ok) return;
     const tokens = await res.json();
     if (Array.isArray(tokens) && tokens.length > 0) {
@@ -8942,28 +9064,94 @@ function getQuestState(player, questId) {
   return player.quests[questId] || { status: 'not_started', progress: 0, visited: [] };
 }
 
+function sendQuestProgress(player, quest, state) {
+  safeSend(player.ws, {
+    type: 'questUpdate',
+    questId: quest.id,
+    npc: quest.npc,
+    title: quest.title,
+    titleKey: quest.titleKey || null,
+    status: state.status,
+    progress: state.progress,
+    targetCount: quest.targetCount,
+  });
+}
+
+// Writes an absolute progress value onto an active quest and flips it to
+// ready_to_turn_in once the target is met. Returns true when anything moved, so
+// the callers can skip the persist + send on a no-op.
+function setQuestProgress(player, quest, progress) {
+  const state = getQuestState(player, quest.id);
+  if (state.status !== 'active') return false;
+
+  const clamped = Math.max(0, Math.min(quest.targetCount, Math.floor(progress)));
+  const status = clamped >= quest.targetCount ? 'ready_to_turn_in' : 'active';
+  if (clamped === state.progress && status === state.status) return false;
+
+  state.progress = clamped;
+  state.status = status;
+  player.quests[quest.id] = state;
+  return true;
+}
+
+function advanceQuests(player, type, amount = 1, accept = null) {
+  if (amount <= 0) return;
+
+  for (const quest of QUEST_LIST) {
+    if (quest.type !== type) continue;
+    if (accept && !accept(quest)) continue;
+
+    const state = getQuestState(player, quest.id);
+    if (state.status !== 'active') continue;
+    if (!setQuestProgress(player, quest, state.progress + amount)) continue;
+
+    persistPlayer(player);
+    sendQuestProgress(player, quest, player.quests[quest.id]);
+  }
+}
+
 function incrementKillQuests(player) {
-  for (const quest of Object.values(QUESTS)) {
-    if (quest.type !== 'kill_enemies') continue;
-    if (quest.locationId && player.locationId !== quest.locationId) continue;
+  advanceQuests(player, 'kill_enemies', 1, (quest) => !quest.locationId || player.locationId === quest.locationId);
+}
+
+// Progress for these types is derived from state the player already carries
+// rather than from a one-off event, so it is recomputed on accept, on the
+// events that can change it, and on join.
+function questDerivedProgress(player, quest) {
+  if (quest.type === 'canyon_segments') {
+    const cleared = player.canyon?.clearedSegments;
+    if (!cleared) return 0;
+    let done = 0;
+    for (let segment = quest.segmentFrom; segment <= quest.segmentTo; segment++) {
+      if (cleared.has(segment)) done++;
+    }
+    return done;
+  }
+
+  if (quest.type === 'found_faction') {
+    return (player.factions || []).some((f) => f.role === 'founder' || f.founderUserId === player.userId) ? 1 : 0;
+  }
+
+  if (quest.type === 'paint_skin') {
+    return player.skinTextureUrl ? 1 : 0;
+  }
+
+  return null;
+}
+
+function syncDerivedQuests(player, type = null) {
+  for (const quest of QUEST_LIST) {
+    if (type && quest.type !== type) continue;
 
     const state = getQuestState(player, quest.id);
     if (state.status !== 'active') continue;
 
-    state.progress = Math.min(quest.targetCount, state.progress + 1);
-    if (state.progress >= quest.targetCount) {
-      state.status = 'ready_to_turn_in';
-    }
-    player.quests[quest.id] = state;
-    persistPlayer(player);
+    const derived = questDerivedProgress(player, quest);
+    if (derived === null || derived <= state.progress) continue;
+    if (!setQuestProgress(player, quest, derived)) continue;
 
-    safeSend(player.ws, {
-      type: 'questUpdate',
-      questId: quest.id,
-      status: state.status,
-      progress: state.progress,
-      targetCount: quest.targetCount,
-    });
+    persistPlayer(player);
+    sendQuestProgress(player, quest, player.quests[quest.id]);
   }
 }
 
@@ -8985,7 +9173,7 @@ function applyKillRewards(player) {
 
 // Every canyon boss drops exactly one meme fragment. Fired and forgotten: a
 // failed grant must never block the kill from resolving, so it only logs.
-async function grantCanyonCosmeticFragments(player, amount) {
+async function grantCanyonCosmeticFragments(player, amount, source = 'canyon_boss_cosmetic') {
   const result = await callInternalApi('/api/internal/game/cosmetic-crates/grant-fragments', {
     userId: player.userId, gameId: player.gameId, fragments: amount,
   }).catch((err) => {
@@ -9005,10 +9193,10 @@ async function grantCanyonCosmeticFragments(player, amount) {
     fragments: player.cosmeticCrates.fragments,
     crates: player.cosmeticCrates.crates,
   });
-  safeSend(player.ws, { type: 'fragmentsGranted', amount: result.granted, source: 'canyon_boss_cosmetic' });
+  safeSend(player.ws, { type: 'fragmentsGranted', amount: result.granted, source });
 }
 
-async function grantCanyonBossFragments(player, amount) {
+async function grantCanyonBossFragments(player, amount, source = 'canyon_boss') {
   const result = await callInternalApi('/api/internal/game/companions/grant-fragments', {
     userId: player.userId, gameId: player.gameId, fragments: amount,
   }).catch((err) => {
@@ -9033,7 +9221,7 @@ async function grantCanyonBossFragments(player, amount) {
     fragments: player.companions.fragments,
     crates: player.companions.crates,
   });
-  safeSend(player.ws, { type: 'fragmentsGranted', amount: result.granted, source: 'canyon_boss' });
+  safeSend(player.ws, { type: 'fragmentsGranted', amount: result.granted, source });
 }
 
 function applyEnemyDamage(player, enemy, amount, options = {}) {
@@ -9174,6 +9362,7 @@ function applyEnemyDamage(player, enemy, amount, options = {}) {
     if (clearedSegment >= CANYON_COSMETIC_FRAGMENT_FROM) {
       grantCanyonCosmeticFragments(player, CANYON_BOSS_FRAGMENTS);
     }
+    syncDerivedQuests(player, 'canyon_segments');
 
     player.canyon.pendingSegment = nextSegment;
 
@@ -11136,6 +11325,7 @@ wss.on('connection', (ws) => {
     rotation: 0,
     pitch: 0,
     headYaw: 0,
+    headPitch: 0,
     animation: 'idle',
     state: 'idle',
     jumping: false,
@@ -12010,16 +12200,8 @@ wss.on('connection', (ws) => {
       });
     }
 
-    let hasRunningQuest = false;
-    for (const quest of QUEST_LIST) {
-      const state = getQuestState(player, quest.id);
-      if (state.status === 'active' || state.status === 'ready_to_turn_in') {
-        hasRunningQuest = true;
-        safeSend(ws, buildQuestInfoPayload(player, quest));
-      }
-    }
-
-    if (!hasRunningQuest) sendOfferedQuests(player);
+    syncDerivedQuests(player);
+    sendOfferedQuests(player);
 
     broadcastCount();
   }
@@ -12067,6 +12249,7 @@ wss.on('connection', (ws) => {
     player.rotation = typeof data.rotation === 'number' ? data.rotation : 0;
     player.pitch = typeof data.pitch === 'number' ? data.pitch : 0;
     player.headYaw = typeof data.headYaw === 'number' ? data.headYaw : 0;
+    player.headPitch = typeof data.headPitch === 'number' ? data.headPitch : -player.pitch;
 
     player.state = VALID_STATES.has(data.state) ? data.state : 'idle';
 
@@ -12293,6 +12476,7 @@ wss.on('connection', (ws) => {
     player.skinTextureUrl = data.url;
     player.skinTextureUrlChangedAt = Date.now();
     persistPlayer(player);
+    advanceQuests(player, 'paint_skin', 1);
 
     broadcast({
       type: 'skinUpdate',
@@ -13084,6 +13268,7 @@ wss.on('connection', (ws) => {
       return null;
     });
     applyPlayerFactions(player, result?.factions);
+    syncDerivedQuests(player, 'found_faction');
   }
 
   function handleFactionTaskListRequest(player) {
@@ -13241,6 +13426,12 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // The chosen-side guard is only written after the call returns, so the seat
+    // is claimed here instead: without it two clicks sent together both pass the
+    // check above and both pay for the same neutrality.
+    const sideKey = warSideKey(war.id, player.userId);
+    warSides.set(sideKey, sideFactionId);
+
     const result = await callInternalApi('/api/internal/game/faction/war-side', {
       action: 'choose',
       gameId: player.gameId,
@@ -13254,6 +13445,7 @@ wss.on('connection', (ws) => {
     });
 
     if (!result?.success) {
+      warSides.delete(sideKey);
       safeSend(player.ws, { type: 'error', message: 'Could not pick a side', messageKey: 'g.err.faction.sideFailed' });
       return;
     }
@@ -13269,8 +13461,6 @@ wss.on('connection', (ws) => {
         placeables: player.placeables,
       });
     }
-
-    warSides.set(warSideKey(war.id, player.userId), sideFactionId);
 
     safeSend(player.ws, {
       type: 'factionWarSideChosen',
@@ -14389,10 +14579,13 @@ wss.on('connection', (ws) => {
       npc: quest.npc,
       questType: quest.type,
       title: quest.title,
+      titleKey: quest.titleKey || null,
       description: quest.description,
+      descriptionKey: quest.descriptionKey || null,
       targetCount: quest.targetCount,
       rewardAsh: quest.rewardAsh,
       rewardXp: progression.questXp(quest.id),
+      reward: quest.reward || null,
       status: state.status,
       progress: state.progress,
       targets: quest.targets || null,
@@ -14440,6 +14633,9 @@ wss.on('connection', (ws) => {
       safeSend(player.ws, {
         type: 'questUpdate',
         questId: quest.id,
+        npc: quest.npc,
+        title: quest.title,
+        titleKey: quest.titleKey || null,
         status: state.status,
         progress: state.progress,
         targetCount: quest.targetCount,
@@ -14844,10 +15040,82 @@ wss.on('connection', (ws) => {
     safeSend(player.ws, {
       type: 'questUpdate',
       questId: quest.id,
+      npc: quest.npc,
+      title: quest.title,
+      titleKey: quest.titleKey || null,
       status: 'active',
       progress: 0,
       targetCount: quest.targetCount,
     });
+
+    // Work the player already did before taking the quest still counts, so a
+    // cleared canyon or a faction founded earlier does not have to be redone.
+    syncDerivedQuests(player, quest.type);
+  }
+
+  async function grantQuestCosmetic(player, itemId) {
+    const result = await callInternalApi('/api/internal/game/cosmetics/grant', {
+      userId: player.userId, gameId: player.gameId, itemId,
+    }).catch((err) => {
+      console.error('[Quest] cosmetic grant error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) return;
+
+    if (!player.cosmeticsOwned) player.cosmeticsOwned = new Set();
+    player.cosmeticsOwned.add(itemId);
+    sendCosmeticState(player);
+  }
+
+  // The founder's own faction is the one that gets paid; a player who founded
+  // several keeps the first, which is the one Alaric's quest was taken for.
+  async function grantQuestFactionAsh(player, amount) {
+    const owned = (player.factions || []).find((f) => f.role === 'founder' || f.founderUserId === player.userId);
+    if (!owned) return;
+
+    const result = await callInternalApi('/api/internal/game/faction/treasury', {
+      action: 'move',
+      factionId: owned.id,
+      gameId: player.gameId,
+      userId: player.userId,
+      kind: 'quest',
+      ash: amount,
+      note: 'Alaric founding grant',
+    }).catch((err) => {
+      console.error('[Quest] treasury grant error:', err.message);
+      return null;
+    });
+
+    if (!result || !result.success) return;
+
+    safeSend(player.ws, {
+      type: 'questRewardGranted',
+      kind: 'factionTreasuryAsh',
+      amount,
+      factionId: owned.id,
+      factionName: owned.name || null,
+    });
+  }
+
+  // Fired and forgotten, like the canyon grants: the quest is already recorded
+  // as completed, so a failed payout must never take the turn-in down with it.
+  function payQuestReward(player, quest) {
+    const reward = quest.reward;
+    if (!reward) return;
+
+    let pending = null;
+    if (reward.kind === 'cosmetic') {
+      pending = grantQuestCosmetic(player, reward.itemId);
+    } else if (reward.kind === 'companionFragments') {
+      pending = grantCanyonBossFragments(player, reward.amount, 'quest');
+    } else if (reward.kind === 'cosmeticFragments') {
+      pending = grantCanyonCosmeticFragments(player, reward.amount, 'quest');
+    } else if (reward.kind === 'factionTreasuryAsh') {
+      pending = grantQuestFactionAsh(player, reward.amount);
+    }
+
+    pending?.catch((err) => console.error(`[Quest] reward ${reward.kind} failed:`, err.message));
   }
 
   function handleQuestTurnIn(player, data) {
@@ -14866,22 +15134,31 @@ wss.on('connection', (ws) => {
     player.ash += quest.rewardAsh;
     player.economyChangedAt = Date.now();
     const rewardXp = grantXp(player, progression.questXp(quest.id), `quest:${quest.id}`);
-    bumpFactionTaskProgress(player, 'ash', quest.rewardAsh).catch((err) => console.error('[FactionTask] bump error:', err.message));
+    if (quest.rewardAsh > 0) {
+      bumpFactionTaskProgress(player, 'ash', quest.rewardAsh).catch((err) => console.error('[FactionTask] bump error:', err.message));
+    }
     persistPlayer(player);
+
+    payQuestReward(player, quest);
 
     safeSend(player.ws, {
       type: 'questUpdate',
       questId: quest.id,
+      npc: quest.npc,
+      title: quest.title,
+      titleKey: quest.titleKey || null,
       status: 'completed',
       progress: quest.targetCount,
       targetCount: quest.targetCount,
       rewardAsh: quest.rewardAsh,
       rewardXp,
+      reward: quest.reward || null,
     });
     safeSend(player.ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
 
-    const nextQuest = activeQuestForNpc(player, quest.npc);
-    if (nextQuest) safeSend(player.ws, buildQuestInfoPayload(player, nextQuest));
+    // Finishing one quest can unlock quests on other NPCs, so refresh the whole
+    // board rather than only this giver's next step.
+    sendOfferedQuests(player);
   }
 
   function handleBranchSelect(player, data) {
@@ -15542,7 +15819,7 @@ wss.on('connection', (ws) => {
     try {
       const url = new URL('/api/token-by-ca', CONFIG.siteUrl);
       url.searchParams.set('ca', job.address);
-      const res = await fetch(url.toString());
+      const res = await siteFetch(url.toString());
       const json = await res.json();
       marketCap = Number(json?.mc) || 0;
     } catch (err) {
@@ -15565,6 +15842,7 @@ wss.on('connection', (ws) => {
     bumpFactionTaskProgress(player, 'ash', ashEarned).catch((err) => console.error('[FactionTask] bump error:', err.message));
 
     persistPlayer(player);
+    advanceQuests(player, 'sell_tokens', finalQty);
 
     safeSend(ws, { type: 'inventoryUpdate', inventory: player.inventory, ash: player.ash, placeables: player.placeables });
     safeSend(ws, {

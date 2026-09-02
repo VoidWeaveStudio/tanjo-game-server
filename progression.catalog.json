@@ -57,7 +57,12 @@
   },
   "questXp": {
     "sola_orientation": 110,
-    "sola_kill_10": 250
+    "sola_kill_10": 250,
+    "alfredo_first_skin": 150,
+    "tony_sell_loot": 200,
+    "alaric_found_faction": 600,
+    "dispatcher_canyon_1_5": 900,
+    "dispatcher_canyon_6_10": 1800
   },
   "pvpScaling": {
     "singleHit": 0.25,

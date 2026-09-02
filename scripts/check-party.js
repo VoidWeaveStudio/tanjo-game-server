@@ -16,9 +16,16 @@ function check(name, condition) {
   failures += 1;
 }
 
+const ROSTER = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'X', 'Y', 'Z', 'Q'];
+
 function reset() {
-  for (const id of ['A', 'B', 'C', 'D', 'E', 'F', 'X', 'Y']) party.forgetPlayer(id);
+  for (const id of ROSTER) party.forgetPlayer(id);
   party.pruneInvites(Date.now() + party.INVITE_TTL_MS * 2);
+}
+
+// Everyone but the leader, enough to leave exactly one open seat.
+function fillersFor(seatsToLeave) {
+  return ROSTER.slice(1, party.MAX_PARTY_SIZE - seatsToLeave);
 }
 
 section('forming a party');
@@ -42,29 +49,35 @@ check('declining removes the invite', party.decline('B', 'C').ok === false);
 
 section('size limit');
 reset();
-party.invite('A', 'B'); party.accept('B', 'A');
-party.invite('A', 'C'); party.accept('C', 'A');
+for (const id of fillersFor(1)) {
+  party.invite('A', id);
+  party.accept(id, 'A');
+}
 
-party.invite('A', 'D');
-party.invite('A', 'E');
-check('two invites go out while there is room', party.accept('D', 'A').ok === true);
+party.invite('A', 'Y');
+party.invite('A', 'Z');
+check('two invites go out while there is room', party.accept('Y', 'A').ok === true);
 check(`party holds ${party.MAX_PARTY_SIZE}`, party.membersOf('A').length === party.MAX_PARTY_SIZE);
-check('the last invite cannot squeeze in a fifth', party.accept('E', 'A').error === 'full');
-check('a full party cannot invite', party.invite('A', 'F').error === 'full');
+check('the invite left over cannot take a seat that filled up', party.accept('Z', 'A').error === 'full');
+check('a full party cannot invite', party.invite('A', 'Q').error === 'full');
 
 section('allies');
-check('members are allies', party.areAllies('B', 'D') === true);
-check('outsiders are not', party.areAllies('B', 'E') === false);
+check('members are allies', party.areAllies('B', 'Y') === true);
+check('outsiders are not', party.areAllies('B', 'Z') === false);
 check('nobody is their own ally', party.areAllies('B', 'B') === false);
 
 section('leaving and kicking');
-check('a member cannot kick', party.kick('B', 'C').error === 'not_leader');
+check('a member cannot kick', party.kick('B', 'Y').error === 'not_leader');
 check('the leader cannot kick themselves', party.kick('A', 'A').error === 'self');
-check('the leader kicks', party.kick('A', 'D').ok === true);
-check('the kicked player is free', party.areAllies('A', 'D') === false);
+check('the leader kicks', party.kick('A', 'Y').ok === true);
+check('the kicked player is free', party.areAllies('A', 'Y') === false);
 check('leaving passes leadership', party.leave('A').party.leaderId === 'B');
+
+reset();
+party.invite('A', 'B');
+party.accept('B', 'A');
 check('the last two shrink to nothing', party.leave('B').disbanded === true);
-check('the survivor has no party', party.partyOf('C') === null);
+check('the survivor has no party', party.partyOf('A') === null);
 
 section('disconnects and stale invites');
 reset();
