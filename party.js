@@ -15,7 +15,7 @@ function inviteKey(targetId, fromId) {
 function partyOf(playerId) {
   const partyId = partyByPlayer.get(playerId);
   return partyId ? parties.get(partyId) || null : null;
-}
+} 
 
 function membersOf(playerId) {
   const party = partyOf(playerId);

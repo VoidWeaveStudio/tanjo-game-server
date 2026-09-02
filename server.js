@@ -4865,7 +4865,7 @@ function wardPatrol(enemy, cfg, now) {
       return;
     }
   }
-
+ 
   const dx = enemy.patrolTarget[0] - enemy.position[0];
   const dz = enemy.patrolTarget[1] - enemy.position[2];
 
