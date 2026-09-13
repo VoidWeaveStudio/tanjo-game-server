@@ -590,6 +590,18 @@ function eventSealedReason(eventId) {
   return window.state === 'upcoming' ? 'not_started' : 'window_closed';
 }
 
+const SHOWCASE_LOCATION_RADIUS = {
+  'show-church': 68,
+  'show-war': 94,
+  'show-garden': 80,
+  'show-graveyard': 72,
+  'show-casino': 64,
+  'show-moon': 84,
+  'show-bazaar': 68,
+};
+
+const SHOWCASE_LOCATION_IDS = Object.keys(SHOWCASE_LOCATION_RADIUS);
+
 const VALID_LOCATIONS = new Set([
   'main-world',
   'cave',
@@ -601,6 +613,7 @@ const VALID_LOCATIONS = new Set([
   EVENTS_LOBBY_ID,
   'open-world-canyon',
   ...EVENT_ROOM_IDS,
+  ...SHOWCASE_LOCATION_IDS,
 ]);
 
 const FACTION_GATE_LOCATION_PATTERN = /^faction-gate-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -613,7 +626,7 @@ function isKnownLocationId(locationId) {
 }
 
 const GALAXY_LOCATION_ID = 'tower-basement';
-const SEALED_LOCATIONS = new Set(['tower-token-gates']);
+const SEALED_LOCATIONS = new Set([]);
 const DEFAULT_SPAWN_LOCATION_ID = 'tower-main-hall';
 const PRIVATE_LOCATION_PREFIXES = ['faction-gate-', 'player-room-'];
 const SHARD_CAPACITY = 50;
@@ -631,7 +644,7 @@ const PLAYER_ROOM_PREFIX = 'player-room-';
 
 const LOCATION_MAX_RADIUS = {
   'tower-main-hall': 140,
-  'tower-token-gates': 80,
+  'tower-token-gates': GALAXY_MAX_RADIUS,
   'tower-basement': GALAXY_MAX_RADIUS,
   [EVENTS_LOBBY_ID]: 58,
   cave: caveGeometry.OUTER_RADIUS + 12,
@@ -641,6 +654,10 @@ const LOCATION_MAX_RADIUS = {
 
 for (const [locationId, room] of Object.entries(EVENT_ROOMS)) {
   LOCATION_MAX_RADIUS[locationId] = room.radius;
+}
+
+for (const [locationId, radius] of Object.entries(SHOWCASE_LOCATION_RADIUS)) {
+  LOCATION_MAX_RADIUS[locationId] = radius;
 }
 const CAVE_LOCATION_ID = 'cave';
 const CAVE_CHEST_REWARD = 1000;
@@ -12644,6 +12661,7 @@ wss.on('connection', (ws) => {
       type: 'auth_success',
       playerId,
       nickname: player.nickname,
+      isAdmin: !!player.isAdmin,
       userId: player.userId,
       wallet: player.wallet,
       gameId: player.gameId,
