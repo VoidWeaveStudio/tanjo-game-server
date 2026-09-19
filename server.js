@@ -602,6 +602,14 @@ const SHOWCASE_LOCATION_RADIUS = {
 
 const SHOWCASE_LOCATION_IDS = Object.keys(SHOWCASE_LOCATION_RADIUS);
 
+// Faction gates themed as one of the showcase sets (see themedFactions.ts on the
+// client) reuse that set's real geometry instead of the generic build-plot's 25.
+// Keyed by the full `faction-gate-<factionId>` location id; add one entry here
+// each time a faction gets moved into its themed bubble.
+const THEMED_FACTION_GATE_RADIUS = {
+  'faction-gate-9731dc93-b97a-4a94-b458-b9254873b255': SHOWCASE_LOCATION_RADIUS['show-war'], // Endless WAR
+};
+
 const VALID_LOCATIONS = new Set([
   'main-world',
   'cave',
@@ -657,6 +665,10 @@ for (const [locationId, room] of Object.entries(EVENT_ROOMS)) {
 }
 
 for (const [locationId, radius] of Object.entries(SHOWCASE_LOCATION_RADIUS)) {
+  LOCATION_MAX_RADIUS[locationId] = radius;
+}
+
+for (const [locationId, radius] of Object.entries(THEMED_FACTION_GATE_RADIUS)) {
   LOCATION_MAX_RADIUS[locationId] = radius;
 }
 const CAVE_LOCATION_ID = 'cave';
