@@ -591,6 +591,7 @@ function eventSealedReason(eventId) {
 }
 
 const SHOWCASE_LOCATION_RADIUS = {
+  'show-launch': 94,
   'show-church': 68,
   'show-war': 132,
   'show-garden': 80,
