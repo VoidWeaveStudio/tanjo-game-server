@@ -31,6 +31,7 @@ const dust2Bots = require('./dust2Bots');
 const caveGeometry = require('./caveGeometry');
 const influenceGeometry = require('./influenceGeometry');
 const influence = require('./influence');
+const googleTTS = require('./googleTTS');
 
 const PORT = process.env.PORT || 3001;
 const MAX_CONNECTIONS = 2000;
@@ -83,6 +84,7 @@ const CONFIG = {
     skinUpdateRateLimit: 3,
     saveProgressRateLimit: 5,
     questRateLimit: 10,
+    newsSpeakRateLimit: 2,
     progressionRateLimit: 10,
     abilityRateLimit: 8,
     memeRateLimit: 3,
@@ -122,6 +124,8 @@ const CONFIG = {
   siteUrl: process.env.SITE_URL || 'https://theadvenjo.online',
   internalSecret: process.env.INTERNAL_API_SECRET,
   gameTokenSecret: process.env.GAME_TOKEN_SECRET || process.env.JWT_SECRET,
+  googleTtsApiKey: process.env.GOOGLE_TTS_API_KEY,
+  newsVoice: process.env.GOOGLE_TTS_VOICE || googleTTS.DEFAULT_VOICE,
   autoSaveInterval: 30000,
 };
 
@@ -478,6 +482,9 @@ if (!CONFIG.internalSecret) {
 if (!CONFIG.gameTokenSecret) {
   console.error('[!] GAME_TOKEN_SECRET/JWT_SECRET not set. Auth will fail.');
 }
+if (!CONFIG.googleTtsApiKey) {
+  console.warn('[!] GOOGLE_TTS_API_KEY not set. The news anchor will stay silent.');
+}
 
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
@@ -592,6 +599,7 @@ function eventSealedReason(eventId) {
 
 const SHOWCASE_LOCATION_RADIUS = {
   'show-launch': 94,
+  'show-news': 48,
   'show-church': 68,
   'show-war': 132,
   'show-garden': 80,
@@ -634,6 +642,7 @@ function isKnownLocationId(locationId) {
     PLAYER_ROOM_LOCATION_PATTERN.test(locationId);
 }
 
+const NEWS_LOCATION_ID = 'show-news';
 const GALAXY_LOCATION_ID = 'tower-basement';
 const SEALED_LOCATIONS = new Set([]);
 const DEFAULT_SPAWN_LOCATION_ID = 'tower-main-hall';
@@ -12143,6 +12152,8 @@ wss.on('connection', (ws) => {
           safeSend(ws, { type: 'error', message: 'Chat rate limit exceeded', messageKey: 'g.err.rateChat' });
           return;
         }
+      } else if (data.type === 'newsSpeak') {
+        if (!checkRateLimit(playerId, 'newsSpeak', CONFIG.network.newsSpeakRateLimit)) return;
       } else if (data.type === 'factionInvite') {
         if (!checkRateLimit(playerId, 'factionInvite', CONFIG.network.factionInviteRateLimit)) return;
       } else if (data.type === 'tradeInvite' || data.type === 'tradeInviteRespond' || data.type === 'tradeSetOffer' || data.type === 'tradeSetReady' || data.type === 'tradeSubmitPayment' || data.type === 'tradeCancel') {
@@ -12158,6 +12169,7 @@ wss.on('connection', (ws) => {
         case 'nicknameChange': handleNicknameChange(player, data); break;
         case 'skinUpdate': handleSkinUpdate(player, data); break;
         case 'chat': handleChat(player, data); break;
+        case 'newsSpeak': handleNewsSpeak(player, data); break;
         case 'hit': handleHit(player, data); break;
         case 'enemyHit': handleEnemyHit(player, data); break;
         case 'lootPickup': handleLootPickup(player, data); break;
@@ -13059,6 +13071,43 @@ wss.on('connection', (ws) => {
     }, null, false, player, true);
 
     logChatMessage(player, msg, null);
+  }
+
+  // The news set's anchor reads whatever an admin types at the desk. Google TTS is
+  // called server-side so the key never reaches a client, and the audio goes to
+  // everyone standing in the set, not just the author.
+  async function handleNewsSpeak(player, data) {
+    if (!player.isAdmin) return;
+    if (typeof data.text !== 'string') return;
+    if (player.locationId !== NEWS_LOCATION_ID) return;
+
+    const text = sanitizeMessage(data.text.trim()).slice(0, googleTTS.MAX_TEXT_LENGTH);
+    if (text.length === 0) return;
+
+    if (!CONFIG.googleTtsApiKey) {
+      safeSend(player.ws, { type: 'error', message: 'Google TTS key is not configured on the server', messageKey: 'g.err.newsNoVoice' });
+      return;
+    }
+
+    let speech;
+    try {
+      speech = await googleTTS.synthesize({
+        apiKey: CONFIG.googleTtsApiKey,
+        text,
+        voiceName: CONFIG.newsVoice,
+      });
+    } catch (err) {
+      console.error('[News] TTS error:', err.message);
+      safeSend(player.ws, { type: 'error', message: 'The anchor could not be voiced', messageKey: 'g.err.newsVoiceFailed' });
+      return;
+    }
+
+    broadcastToLocation(NEWS_LOCATION_ID, {
+      type: 'newsAudio',
+      text,
+      audio: speech.audioBase64,
+      mime: speech.mimeType,
+    }, null, player.instance);
   }
 
   function handleFactionChat(player, data) {
