@@ -19,6 +19,7 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "jsonwebtoken": "^9.0.2",
+    "kokoro-js": "^1.2.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
